@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // scripts/sync-version.mjs — keep src/shared/version.ts in sync with the
-// package.json version, run by `npm run build` BEFORE tsc. A stale
+// package.json version, run by `npm run build` before compilation. A stale
 // hand-maintained copy made /mesh broker and the peer version-skew
 // detection lie after releases (0.5.3 shown while shipping 0.7.0);
 // generating at build time removes the human-bump failure mode entirely.

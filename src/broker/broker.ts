@@ -885,8 +885,8 @@ function lockHeldByUs(lockPath: string): boolean {
   }
 }
 
-/** Acquire lock, stale-pid tolerant. Returns false if a live broker holds it. */
-export function acquireLock(dir: string): boolean {
+/** Acquire lock, allowing only the launching parent's explicit PID handoff. */
+export function acquireLock(dir: string, starterPid?: number): boolean {
   mkdirSync(dir, { recursive: true });
   const lockPath = brokerLockPath(dir);
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -902,7 +902,9 @@ export function acquireLock(dir: string): boolean {
     }
     try {
       const pid = Number(readFileSync(lockPath, "utf8").trim());
-      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && pidAlive(pid)) return false;
+      const starterOwnsLock = pid === starterPid && pid === process.ppid;
+      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && pidAlive(pid) &&
+        !starterOwnsLock) return false;
     } catch {
   // unreadable → treat as stale
     }
@@ -938,7 +940,8 @@ export async function main(): Promise<void> {
   const dir = runtimeDir();
   const sDir = stateDir();
   mkdirSync(dir, { recursive: true });
-  if (!acquireLock(dir)) {
+  const starterPid = Number(process.env.MESH_BROKER_STARTER_PID);
+  if (!acquireLock(dir, starterPid)) {
     process.stderr.write("mesh broker: lock held by a live process\n");
     process.exit(1);
   }

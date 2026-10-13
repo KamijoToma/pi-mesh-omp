@@ -1,0 +1,30 @@
+import type { MeshClient } from "../client/client.js";
+import type { MeshFrame } from "../protocol/envelope.js";
+import type { MeshHud } from "./hud.js";
+import { type FormatOpts } from "./inbound.js";
+import { ReplyHintTracker } from "./reply-hints.js";
+import type { ExtensionAPI, SessionContext } from "./pi-types.js";
+import type { MeshRuntime } from "./tools.js";
+/** Format opts for one inbound frame (compact mode + gated hints). */
+export declare function formatOptsFor(frame: MeshFrame, verbose: boolean, homeRoom: string, hints: ReplyHintTracker): FormatOpts;
+/** Compact reconnect diff line (~30 tokens vs ~500 for the full block). */
+export declare function buildReconnectDiff(prev: readonly string[], next: readonly string[]): string;
+/** Public, process-local identity bridge for other extensions. */
+export declare function exposeAlias(pi: ExtensionAPI, alias: string, rooms: readonly string[]): void;
+/**
+ * name the pi session so /resume and the session selector show the mesh
+ * identity AND the conversation: `mesh @agent-1 · cs-room — <first message>`.
+ * A user-defined name is NEVER overwritten; the mesh name is refreshed on
+ * ready/rename/join/leave. The first message is kept exactly like pi's
+ * default display (session.name ?? session.firstMessage) so nothing is lost.
+ */
+export declare function updateSessionName(pi: ExtensionAPI, rt: MeshRuntime): void;
+/**
+ * Attach every client event handler to `client`. `rt` is the CURRENT runtime
+ * object (its `.client` field may be replaced later by /mesh reset — the
+ * handlers always read the runtime they were attached with, so the reset path
+ * re-attaches on the new client).
+ */
+export declare function attachClientListeners(pi: ExtensionAPI, rt: MeshRuntime, getHud: () => MeshHud | null, ctx: SessionContext, client: MeshClient, saveIdentity: (rt: MeshRuntime) => void, 
+/** min gap between two live entries of the SAME agent (anti-flood). */
+liveCooldownMs?: number, isCurrent?: () => boolean): void;

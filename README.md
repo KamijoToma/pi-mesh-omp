@@ -1,16 +1,19 @@
-# pi-mesh — live agent-to-agent communication for Pi
+# pi-mesh — live agent-to-agent communication for Pi and omp
 
-![CI](https://github.com/cgarrot/pi-mesh/actions/workflows/ci.yml/badge.svg)
-![Release](https://github.com/cgarrot/pi-mesh/actions/workflows/release.yml/badge.svg)
-![npm](https://img.shields.io/npm/v/pi-mesh-extension)
+![CI](https://github.com/KamijoToma/pi-mesh-omp/actions/workflows/ci.yml/badge.svg)
+![Release](https://github.com/KamijoToma/pi-mesh-omp/actions/workflows/release.yml/badge.svg)
 ![License](https://img.shields.io/npm/l/pi-mesh-extension)
 
-**pi-mesh** is a standalone **Pi extension** for live agent-to-agent
-communication. Local Pi agents talk to each other in < 50 ms through a tiny
+**pi-mesh** is a standalone **Pi/omp extension** for live agent-to-agent
+communication. Local agents talk to each other through a tiny
 local broker (NDJSON frames over a unix socket or named pipe, protocol
 `mesh.v1`). Presence is **observed** (live sockets), statuses are **honest**
 (`delivered` ≠ `read` ≠ `answered`), and the durable ledger is **hash-only**
 (message bodies are never persisted). Zero runtime dependencies, Node ≥ 20.
+
+Compatibility fork of [cgarrot/pi-mesh](https://github.com/cgarrot/pi-mesh).
+This repository distributes the omp-compatible build through GitHub, not the
+upstream npm package.
 
 ```
                 ┌────────────────────────────────────────────┐
@@ -81,17 +84,28 @@ local broker (NDJSON frames over a unix socket or named pipe, protocol
 
 ## Install
 
-**As a Pi package** (recommended — the extension auto-loads):
+Install the GitHub fork directly; the extension auto-loads on the next session:
 
 ```bash
-pi install npm:pi-mesh-extension
+omp install github:KamijoToma/pi-mesh-omp
 ```
+
+For a pinned release:
+
+```bash
+omp install 'github:KamijoToma/pi-mesh-omp#v0.7.2-omp.1'
+```
+
+The package keeps the `pi-mesh-extension` identity, so use this fork instead of
+the upstream npm install rather than loading both copies. Git checkouts contain
+prebuilt `dist/src` modules, the broker and CLI, and the declared skills: no
+dependency build hook or host SDK installation is needed.
 
 **From source:**
 
 ```bash
-git clone git@github.com:cgarrot/pi-mesh.git
-cd pi-mesh
+git clone https://github.com/KamijoToma/pi-mesh-omp.git
+cd pi-mesh-omp
 npm install
 npm run build
 ```
@@ -123,7 +137,62 @@ The broker **auto-spawns** on first use (lockfile in `$TMPDIR/mesh-<uid>/`).
 No daemon management needed. Try `npm run smoke` for a full headless demo
 (2 clients, mailbox, broker-kill recovery).
 
-## Tools (Pi extension)
+## omp compatibility
+
+This compatibility fork preserves modern Pi's native lifecycle and
+uses omp's public session, model and managed-timer APIs. It does not import
+omp's private IRC/mesh implementation or change the `mesh.v1` protocol.
+
+Build the checkout, then load its entry explicitly:
+
+```bash
+npm install
+bun check
+npm run build
+omp --no-extensions -e /absolute/path/to/pi-mesh-omp/index.ts
+```
+
+This explicit-only command avoids loading an already-installed upstream copy
+at the same time. For normal use with other extensions, replace or disable the
+old mesh entry before configuring the fork.
+
+Open a second omp or Pi session with the same `MESH_RUNTIME_DIR` and
+`MESH_ROOMS` to share a broker. `MESH_STATE_DIR` controls per-session identity
+and ledger storage; defaults are unchanged. Pi's normal package manifest and
+entry remain supported.
+
+**Broker executable:** Node and source Bun hosts reuse their JS runtime.
+Bun-compiled applications instead locate a real `node`, then `bun`, on PATH;
+the compiled application itself is never used as a script interpreter.
+Override selection when required:
+
+```bash
+MESH_BROKER_EXEC_PATH=/absolute/path/to/node \
+  omp --no-extensions -e /absolute/path/to/pi-mesh-omp/index.ts
+```
+
+`MESH_BROKER_EXEC_PATH` selects the executable; `MESH_BROKER_ENTRY` selects
+the broker script. Both automatic startup and `pimesh broker start` use the
+same readiness check. Missing runtimes, script failures and startup timeouts
+return actionable diagnostics, not success based only on a child PID.
+
+**Session behavior:** `/mesh new --history` transfers alias, rooms,
+reservations and recent history to the new session ID. Ordinary new sessions
+start with their own identity; resume restores the target session's identity,
+and fork/branch handoffs preserve the outgoing identity. Outgoing callbacks,
+deferred messages and provider
+holds cannot leak into the replacement session. Model observation is active
+only during an omp provider-error hold; switching to a working model releases
+the queued messages without requiring another human prompt.
+
+Verified with standalone omp 18.10.3, an omp source checkout reporting 18.4.2,
+and Pi 1.2.0. Modern Pi's `agent_settled`, `model_select` and replacement
+contexts remain native; older Pi versions are not covered by this matrix.
+omp versions without `registerEntryRenderer` omit Pi's display-only live
+entry previews, while final inbound rendering and the HUD remain available.
+
+
+## Tools (Pi/omp extension)
 
 | tool | params | returns (honest one-liner + `details`) |
 |---|---|---|
@@ -322,6 +391,13 @@ deliver it twice). If prompt preflight is cancelled after input, messages
 already handed to Pi remain queued for the next successful prompt, not
 re-sent by flush. Deferred state is session-local and cleared on reset,
 reload, or shutdown; use the existing mesh history for older frames.
+
+### v0.7.2-omp.1 compatibility changes
+
+- Added omp session and model integration while retaining modern Pi behavior.
+- Fixed automatic broker startup in compiled hosts and exposed startup failures ([#8](https://github.com/cgarrot/pi-mesh/issues/8)).
+- Fixed session identity handoff and release of queued messages after model recovery.
+- Fixed file reservations being bypassed by omp multi-file hashline edits.
 
 v0.7 highlights:
 
@@ -524,27 +600,31 @@ MESH_BROKER_URL=tcp://<machine-A>:8712 MESH_BROKER_TOKEN=change-me pi
 - Aliases are unique mesh-wide by convention (prefix per machine) — no
   cross-machine collision detection beyond the broker's live check.
 - The broker is a single process — no clustering or failover.
+- File reservations are coordination guards on `edit`/`write`, not a sandbox;
+  shell commands and other mutation tools can bypass them.
 
 ## Development
 
 ```bash
-npm run build   # strict tsc (ESM, NodeNext)
-npm test        # build + node --test dist/test/*.test.js (405 tests)
-npm run smoke   # E2E without Pi: broker + 2 headless clients
+bun check       # strict type check with native TypeScript
+npm run build   # ESM/NodeNext output with native TypeScript
+npm test        # build + the package-local Node test suite
+npm run smoke   # E2E broker/client behavior
 ```
 
 CI runs the full suite on Node 24 (GitHub Actions); the suite is verified on
-Node 20 as well. Publishing is automatic on `v*` tags (see
-`.github/workflows/release.yml`, needs the `NPM_TOKEN` secret):
+Node 20 as well. Tags matching `v*-omp.*` publish a GitHub Release tarball using
+the repository's `GITHUB_TOKEN`; this fork never publishes the upstream npm name.
+The GitHub install command uses the checked-in distribution without waiting
+for release workflow execution.
 
-```bash
-npm version patch && git push && git push --tags
-```
+Rebuild and include `dist/src` whenever runtime source changes. Do not include
+`dist/test` or local dependencies in a published commit.
 
 Layout: `src/protocol` (frames, envelope) · `src/broker` (server, rooms,
 mailbox, ratelimit, policy) · `src/client` (MeshClient, pending, reconnect) ·
-`src/extension` (Pi adapter: tools, commands, inbound, guards, ledger,
-transcript) · `src/cli` · `test/` · `scripts/mesh-smoke.mjs`.
+`src/extension` (Pi/omp host boundary, tools, commands, inbound, guards,
+ledger, transcript) · `src/cli` · `test/` · `scripts/mesh-smoke.mjs`.
 
 ## License
 

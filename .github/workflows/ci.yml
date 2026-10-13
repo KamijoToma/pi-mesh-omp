@@ -1,11 +1,10 @@
 name: CI
 
-# Runs the full suite (build + tests + smoke) on every push to main and on
-# pull requests — same as the other pi packages (pi-voice-stt, …).
+# Runs the full suite and packaging checks for the published compatibility branch.
 # Matrix: ubuntu + windows (Windows is first-class — named pipes broker).
 on:
   push:
-    branches: [main]
+    branches: [main, omp-compat]
   pull_request:
 
 jobs:
@@ -21,7 +20,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run ci
 
   # Packaging gate: the `pimesh` bin must survive npm pack + a clean install
@@ -33,11 +32,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run build
       - name: pack + install + bin smoke
         run: |
-          npm pack
+          npm pack --ignore-scripts
           INSTALL=$(mktemp -d)
           cd "$INSTALL"
           npm init -y > /dev/null

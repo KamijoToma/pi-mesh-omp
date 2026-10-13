@@ -1,12 +1,14 @@
 {
   "name": "pi-mesh-extension",
-  "version": "0.7.2",
-  "description": "Live agent-to-agent communication for Pi — local broker, mesh.v1 protocol, honest delivered/read/answered statuses, hash-only ledger. Zero runtime dependencies. Published as pi-mesh-extension on npm (the plain pi-mesh name is taken by another project).",
+  "version": "0.7.2-omp.1",
+  "description": "Pi and omp agent mesh with compiled-host broker startup, session-safe messaging, and file reservations. GitHub-distributed compatibility fork of pi-mesh-extension.",
   "type": "module",
   "license": "MIT",
   "author": "Clément Garrot <clement.garrot.dev@gmail.com> (https://github.com/cgarrot)",
   "keywords": [
     "pi",
+    "omp",
+    "oh-my-pi",
     "pi-package",
     "pi-extension",
     "mesh",
@@ -22,20 +24,28 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cgarrot/pi-mesh.git"
+    "url": "git+https://github.com/KamijoToma/pi-mesh-omp.git"
   },
-  "homepage": "https://github.com/cgarrot/pi-mesh#readme",
+  "homepage": "https://github.com/KamijoToma/pi-mesh-omp#readme",
   "bugs": {
-    "url": "https://github.com/cgarrot/pi-mesh/issues"
+    "url": "https://github.com/KamijoToma/pi-mesh-omp/issues"
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./dist/src/extension/index.js"
     ],
     "skills": [
       "./skills"
     ],
-    "image": "https://raw.githubusercontent.com/cgarrot/pi-mesh/main/assets/preview.jpg"
+    "image": "https://raw.githubusercontent.com/KamijoToma/pi-mesh-omp/omp-compat/assets/preview.jpg"
+  },
+  "omp": {
+    "extensions": [
+      "./dist/src/extension/index.js"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "bin": {
     "pimesh": "dist/src/cli/mesh.js"
@@ -44,6 +54,7 @@
     "src",
     "dist",
     "!dist/test",
+    "skills",
     "index.ts",
     "README.md",
     "LICENSE"
@@ -52,16 +63,19 @@
     "access": "public"
   },
   "scripts": {
-    "build": "node scripts/sync-version.mjs && tsc -p tsconfig.json",
+    "build": "node scripts/sync-version.mjs && tsgo -p tsconfig.json",
+    "check": "tsgo --noEmit -p tsconfig.json",
     "test": "npm run build && node scripts/run-tests.mjs",
     "smoke": "node scripts/mesh-smoke.mjs",
     "ci": "npm run build && node scripts/run-tests.mjs && npm run smoke",
     "prepublishOnly": "npm test"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@oh-my-pi/pi-coding-agent": "18.10.3",
+    "@typescript/native-preview": "7.0.0-dev.20260707.2",
     "@mariozechner/pi-tui": "^0.73.1",
-    "@types/node": "^22.10.0",
-    "typescript": "^5.6.0"
+    "@types/node": "^22.10.0"
   },
   "peerDependencies": {
     "@mariozechner/pi-tui": "*"

@@ -96,6 +96,7 @@ describe("attached inbound policy", () => {
         appendEntry: () => {},
       };
       attachClientListeners(pi as never, rt, () => null, ctx, client, () => {});
+      assert.equal(hooks.size, 0, "attachment does not register session lifecycle handlers");
       try {
         client.emit("inbound", frame);
         client.emit("inbound", { ...frame, broadcast: false, body: "direct" });
@@ -106,16 +107,16 @@ describe("attached inbound policy", () => {
         assert.equal(rt.deferredInbox?.count, 1);
         if (mode === "tui") assert.equal(statuses.at(-1), "mesh:deferred 1");
         else assert.equal(statuses.length, 0);
-        await hooks.get("agent_start")!({}, ctx);
+        rt.deferredInbox?.agentStarting();
         assert.equal(rt.deferredInbox?.count, 1);
-        await hooks.get("input")!({}, ctx);
+        rt.deferredInbox?.queueForPrompt();
         assert.deepEqual(sent.at(-1)!.opts, { deliverAs: "nextTurn" });
-        await hooks.get("before_agent_start")!({}, ctx);
-        await hooks.get("agent_start")!({}, ctx);
+        rt.deferredInbox?.promptStarting();
+        rt.deferredInbox?.agentStarting();
         assert.equal(rt.deferredInbox?.count, 0);
         rt.markDetached?.();
         client.emit("inbound", frame);
-        await hooks.get("input")!({}, ctx);
+        rt.deferredInbox?.queueForPrompt();
         assert.equal(sent.length, 4);
       } finally {
         await client.close();

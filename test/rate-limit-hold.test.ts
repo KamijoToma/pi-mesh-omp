@@ -3,7 +3,7 @@
 // when the hold expires (flushHeld).
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import * as fs from "node:fs";
 import { MeshClient } from "../src/client/client.js";
 import { attachClientListeners } from "../src/extension/attach.js";
 import { makeTempDirs, startTestBroker, type TempDirs } from "./helpers.js";
@@ -42,7 +42,7 @@ describe("rate-limited inbound hold", () => {
   after(async () => {
     await sender.close().catch(() => {});
     await broker.close();
-    rmSync(dirs.root, { recursive: true, force: true });
+    fs.rmSync(dirs.root, { recursive: true, force: true });
   });
 
   it("frames are held while rate-limited and delivered on flushHeld", async () => {
@@ -54,6 +54,7 @@ describe("rate-limited inbound hold", () => {
     });
     await me.connect();
     const rt = {
+      client: me,
       ctx: { isIdle: () => true },
       rateLimitedUntil: Date.now() + 60_000, // provider is rejecting turns
     } as never;
@@ -84,7 +85,7 @@ describe("rate-limited inbound hold", () => {
       config: { inboundBatchMs: 0 },
     });
     await me.connect();
-    attachClientListeners(pi as never, { ctx: { isIdle: () => true } } as never, () => null, { isIdle: () => true } as never, me, () => {}, 0);
+    attachClientListeners(pi as never, { client: me, ctx: { isIdle: () => true } } as never, () => null, { isIdle: () => true } as never, me, () => {}, 0);
     await sender.send({ to: "rl-me2", message: "free" });
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(sent.length, 1, "normal delivery when not rate-limited");

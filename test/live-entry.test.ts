@@ -3,7 +3,7 @@
 // the batch carries the full set at the end).
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import * as fs from "node:fs";
 import { MeshClient } from "../src/client/client.js";
 import { attachClientListeners } from "../src/extension/attach.js";
 import { makeTempDirs, startTestBroker, type TempDirs } from "./helpers.js";
@@ -52,7 +52,7 @@ describe("live inbound entries (D43/B9)", () => {
   after(async () => {
     await sender.close().catch(() => {});
     await broker.close();
-    rmSync(dirs.root, { recursive: true, force: true });
+    fs.rmSync(dirs.root, { recursive: true, force: true });
   });
 
   it("busy agent gets live entries; cooldown merges the burst per agent", async () => {
@@ -67,7 +67,7 @@ describe("live inbound entries (D43/B9)", () => {
     idle.value = false;
     attachClientListeners(
       pi as never,
-      { ctx: { isIdle: () => idle.value } } as never,
+      { client: me, ctx: { isIdle: () => idle.value } } as never,
       () => null,
       { isIdle: () => idle.value } as never,
       me,
@@ -102,7 +102,7 @@ describe("live inbound entries (D43/B9)", () => {
     idle.value = false; // busy → live entries
     attachClientListeners(
       pi as never,
-      { ctx: { isIdle: () => idle.value } } as never,
+      { client: me, ctx: { isIdle: () => idle.value } } as never,
       () => null,
       { isIdle: () => idle.value } as never,
       me,

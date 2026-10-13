@@ -1,6 +1,7 @@
-// extension/pi-types.ts — minimal LOCAL interfaces for the Pi ExtensionAPI surface.
-// ZERO imports from Pi packages: the extension is a thin adapter.
+// extension/pi-types.ts — shared Pi-compatible extension surface.
+// Host-specific capabilities are type-only and stay in the extension adapter.
 // Tool parameters are plain JSON Schema objects (zero-dependency: NO typebox).
+import type { ExtensionContext as OmpExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 /** JSON Schema object (plain, zero-dependency constraint). */
 export type JsonSchema = Record<string, unknown>;
@@ -76,7 +77,7 @@ export interface SessionContext {
   /** Pi session manager (read-only surface) — stable sessionId across reloads. */
   sessionManager?: {
     getSessionId(): string;
-    getSessionFile?(): string;
+    getSessionFile?(): string | undefined;
   };
   /** Pi command actions — newSession lets /mesh new open a fresh session.
   *  Direct method on the command context (not under actions). Post-replacement
@@ -86,7 +87,7 @@ export interface SessionContext {
     withSession?(ctx: SessionContext): Promise<void>;
   }): Promise<{ cancelled: boolean }>;
   ui: {
-    notify(message: string, opts?: { level?: string }): void;
+    notify(message: string, severity?: "info" | "warning" | "error"): void;
   /**
   * Footer-widget above the editor by default; undefined clears it.
   * SAFE form ONLY: string[] (pi wraps each line in a Text component and
@@ -103,6 +104,13 @@ export interface SessionContext {
   abort?(): void;
   /** True when the agent is idle (no running turn). Optional. */
   isIdle?(): boolean;
+  /** Omp public model facade and managed timers; absent on Pi. */
+  models?: OmpExtensionContext["models"];
+  agent?: OmpExtensionContext["agent"];
+  setTimeout?: OmpExtensionContext["setTimeout"];
+  clearTimer?: OmpExtensionContext["clearTimer"];
+  /** Pi exposes the current model directly. */
+  model?: { provider: string; id: string };
 }
 
 export type ToolExecuteFn = (

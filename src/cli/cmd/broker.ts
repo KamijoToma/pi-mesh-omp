@@ -1,10 +1,10 @@
 // cli/cmd/broker.ts — local broker lifecycle (spawn detached / SIGTERM / probe).
-import { readFileSync } from "node:fs";
+import * as fs from "node:fs";
 import { say, sayErr } from "../out.js";
 import { EXIT_OK, EXIT_MESH_FAILURE, EXIT_USAGE } from "../codes.js";
 import { STATUS_REQ_TIMEOUT_MS } from "../../shared/config.js";
 import { brokerLockPath, brokerSocketPath, runtimeDir } from "../../shared/paths.js";
-import { connectProbe } from "../../client/reconnect.js";
+import { connectProbe, ensureBroker } from "../../client/reconnect.js";
 
 function pidAlive(pid: number): boolean {
   try {
@@ -20,21 +20,30 @@ export async function cmdBroker(sub: string | undefined): Promise<number> {
   const sock = brokerSocketPath(dir);
   switch (sub) {
     case "start": {
-      const { spawn } = await import("node:child_process");
-      const { brokerEntryPath } = await import("../../client/reconnect.js");
-      const child = spawn(process.execPath, [brokerEntryPath()], {
-        detached: true,
-        stdio: "ignore",
-        env: { ...process.env, MESH_RUNTIME_DIR: dir },
-      });
-      child.unref();
-      say(`broker spawned pid=${child.pid ?? "?"} sock=${sock}`);
-      return EXIT_OK;
+      try {
+        await ensureBroker(dir);
+        let pid = "?";
+        try {
+          pid = fs.readFileSync(brokerLockPath(dir), "utf8").trim();
+        } catch {
+          // Socket readiness also works for an externally managed broker.
+        }
+        say(`broker ready pid=${pid} sock=${sock}`);
+        return EXIT_OK;
+      } catch (error) {
+        sayErr(error instanceof Error ? error.message : String(error));
+        return EXIT_MESH_FAILURE;
+      }
     }
     case "stop": {
+      // A startup lock can still belong to the host; never signal it as a broker.
+      if (!(await connectProbe(sock, STATUS_REQ_TIMEOUT_MS))) {
+        say("no ready broker found");
+        return EXIT_MESH_FAILURE;
+      }
       try {
-        const pid = Number(readFileSync(brokerLockPath(dir), "utf8").trim());
-        if (Number.isFinite(pid) && pidAlive(pid)) {
+        const pid = Number(fs.readFileSync(brokerLockPath(dir), "utf8").trim());
+        if (Number.isInteger(pid) && pid > 0 && pidAlive(pid)) {
           process.kill(pid, "SIGTERM");
           say(`SIGTERM sent to broker pid=${pid}`);
           return EXIT_OK;
@@ -49,7 +58,7 @@ export async function cmdBroker(sub: string | undefined): Promise<number> {
       const alive = await connectProbe(sock, STATUS_REQ_TIMEOUT_MS);
       let pid = "?";
       try {
-        pid = readFileSync(brokerLockPath(dir), "utf8").trim();
+        pid = fs.readFileSync(brokerLockPath(dir), "utf8").trim();
       } catch {
         // no lock
       }

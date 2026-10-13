@@ -6,6 +6,12 @@
 // the EXACT same matching semantics as the edit/write guards (V4 kept).
 import type { FileReservation } from "../protocol/envelope.js";
 
+export interface ReservationConflict {
+  path: string;
+  alias: string;
+  reservation: FileReservation;
+}
+
 /** Normalize a path/pattern for comparison: forward slashes, no "./", and
  *  case-folded on Windows (NTFS is case-insensitive). */
 export function normalizePath(p: string): string {
@@ -46,15 +52,37 @@ export function findConflict(
   reservationsByPeer: ReadonlyMap<string, readonly FileReservation[]>,
   selfAlias: string,
   ttlMs: number = 0,
-): { alias: string; reservation: FileReservation } | undefined {
+): ReservationConflict | undefined {
   for (const [alias, reservations] of reservationsByPeer) {
     if (alias === selfAlias) continue;
     for (const reservation of reservations) {
       if (isReservationExpired(reservation, ttlMs)) continue;
       if (pathMatchesReservation(filePath, reservation.pattern)) {
-        return { alias, reservation };
+        return { path: filePath, alias, reservation };
       }
     }
+  }
+  return undefined;
+}
+
+/** Check every mutation target exposed by a host's tool event. */
+export function findToolConflict(
+  input: Readonly<Record<string, unknown>>,
+  reservationsByPeer: ReadonlyMap<string, readonly FileReservation[]>,
+  selfAlias: string,
+  ttlMs: number = 0,
+): ReservationConflict | undefined {
+  const path = input.path;
+  if (typeof path === "string" && path !== "") {
+    const conflict = findConflict(path, reservationsByPeer, selfAlias, ttlMs);
+    if (conflict !== undefined) return conflict;
+  }
+  if (!Array.isArray(input.paths)) return undefined;
+  const paths: readonly unknown[] = input.paths;
+  for (const target of paths) {
+    if (typeof target !== "string" || target === "" || target === path) continue;
+    const conflict = findConflict(target, reservationsByPeer, selfAlias, ttlMs);
+    if (conflict !== undefined) return conflict;
   }
   return undefined;
 }

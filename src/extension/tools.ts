@@ -84,6 +84,12 @@ function sendDetails(
   return { schema: SEND_RESULT_SCHEMA, bodyStored: false, ...partial };
 }
 
+function brokerUnavailableResult(error: unknown, details: Record<string, unknown>): ToolResult {
+  const message = error instanceof Error ? error.message : String(error);
+  details.error = message;
+  return textResult(`blocked: broker_unavailable: ${message}`, details);
+}
+
 function str(v: unknown): string | undefined {
   return typeof v === "string" && v.trim() !== "" ? v : undefined;
 }
@@ -349,9 +355,9 @@ async function execMeshSend(
   // broker absent → tools answer blocked, never crash the session.
     try {
       await rt.client.connect();
-    } catch {
+    } catch (error) {
       safeLedger(rt, { event: "blocked", from: rt.client.alias, to, room, priority, bodyHash, refs, code: "broker_unavailable" });
-      return textResult("blocked: broker_unavailable", sendDetails({ status: "blocked", reason: "broker_unavailable", to, room, priority, bodyHash }));
+      return brokerUnavailableResult(error, sendDetails({ status: "blocked", reason: "broker_unavailable", to, room, priority, bodyHash }));
     }
   }
 
@@ -470,8 +476,8 @@ async function execMeshReply(
   if (!rt.client.isOnline()) {
     try {
       await rt.client.connect();
-    } catch {
-      return textResult("blocked: broker_unavailable", sendDetails({ status: "blocked", reason: "broker_unavailable", msgId, bodyHash }));
+    } catch (error) {
+      return brokerUnavailableResult(error, sendDetails({ status: "blocked", reason: "broker_unavailable", msgId, bodyHash }));
     }
   }
 
@@ -570,8 +576,8 @@ async function execMeshStatus(
   if (!rt.client.isOnline()) {
     try {
       await rt.client.connect();
-    } catch {
-      return textResult("blocked: broker_unavailable", sendDetails({ status: "blocked", reason: "broker_unavailable" }));
+    } catch (error) {
+      return brokerUnavailableResult(error, sendDetails({ status: "blocked", reason: "broker_unavailable" }));
     }
   }
   const snap = await rt.client.status(room);

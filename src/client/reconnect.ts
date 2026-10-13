@@ -1,10 +1,14 @@
 // client/reconnect.ts — ensureBroker auto-spawn, connect probe, backoff.
-import { fork } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { once } from "node:events";
+import { setTimeout as sleep } from "node:timers/promises";
+import * as fs from "node:fs";
 import net from "node:net";
-import path from "node:path";
+import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  BROKER_STARTUP_DIAGNOSTIC_MAX_BYTES,
   ENSURE_BROKER_MAX_POLLS,
   ENSURE_BROKER_POLL_MS,
   LOCK_RETRY_MAX,
@@ -12,6 +16,7 @@ import {
   RECONNECT_MAX_MS,
 } from "../shared/config.js";
 import { brokerLockPath, brokerSocketPath } from "../shared/paths.js";
+import { brokerLaunch } from "../shared/broker-launch.js";
 
 const BROKER_ENTRY_REL = "../broker/broker.js";
 const ENV_BROKER_ENTRY = "MESH_BROKER_ENTRY";
@@ -20,7 +25,7 @@ const ENV_BROKER_ENTRY = "MESH_BROKER_ENTRY";
 function findPackageRoot(startDir: string): string | undefined {
   let dir = path.resolve(startDir);
   for (;;) {
-    if (existsSync(path.join(dir, "package.json"))) return dir;
+    if (fs.existsSync(path.join(dir, "package.json"))) return dir;
     const parent = path.dirname(dir);
     if (parent === dir) return undefined;
     dir = parent;
@@ -44,11 +49,11 @@ export function brokerEntryPath(
   const override = env[ENV_BROKER_ENTRY];
   if (override && override.trim() !== "") return override;
   const sibling = path.resolve(moduleDir, BROKER_ENTRY_REL);
-  if (existsSync(sibling)) return sibling;
+  if (fs.existsSync(sibling)) return sibling;
   const root = findPackageRoot(moduleDir);
   const distFallback =
     root === undefined ? undefined : path.join(root, "dist", "src", "broker", "broker.js");
-  if (distFallback !== undefined && existsSync(distFallback)) return distFallback;
+  if (distFallback !== undefined && fs.existsSync(distFallback)) return distFallback;
   const tried = [sibling, ...(distFallback === undefined ? [] : [distFallback])];
   throw new Error(
     `broker entry not found: run \`npm run build\` or set ${ENV_BROKER_ENTRY} (tried: ${tried.join(", ")})`,
@@ -93,12 +98,6 @@ export function connectProbeTcp(host: string, port: number, timeoutMs: number): 
   });
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => {
-    const t = setTimeout(r, ms);
-    t.unref();
-  });
-}
 
 function pidAlive(pid: number): boolean {
   try {
@@ -109,32 +108,110 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-function spawnBroker(runtimeDir: string, lockPath: string, entry: string): void {
-  const child = fork(entry, [], {
-    detached: true,
-    stdio: "ignore",
-    env: { ...process.env, MESH_RUNTIME_DIR: runtimeDir },
-  });
-  child.unref();
-  if (child.pid !== undefined) {
-    try {
-      writeFileSync(lockPath, String(child.pid));
-    } catch {
-  // broker rewrites the lock itself at startup
-    }
+/** Remove only our launch lock, never one belonging to a concurrent broker. */
+function removeLaunchLock(lockPath: string, pid: number): void {
+  try {
+    const currentPid = Number(fs.readFileSync(lockPath, "utf8").trim());
+    if (currentPid === pid || currentPid === process.pid) fs.unlinkSync(lockPath);
+  } catch {
+    // Already removed or replaced.
   }
 }
 
-/**
- * ensureBroker
- * 1. connect OK → return.
- * 2. open(lock,"wx"): success → fork detached broker → poll connect 50ms × 60.
- *  EEXIST → pid alive ? poll wait : unlink + retry (× LOCK_RETRY_MAX).
- */
-export async function ensureBroker(runtimeDir: string): Promise<string> {
+async function startBroker(runtimeDir: string, lockPath: string, sockPath: string): Promise<void> {
+  let ownerPid = process.pid;
+  let child: ChildProcess | undefined;
+  let startupFailure: string | undefined;
+  let diagnostics = Buffer.alloc(0);
+  let captureDiagnostics = true;
+  let entry: string | undefined;
+  let executable: string | undefined;
+  let childClosed: Promise<void> | undefined;
+  try {
+    entry = brokerEntryPath();
+    const launch = brokerLaunch(entry);
+    executable = launch.executable;
+    child = spawn(launch.executable, launch.args, {
+      detached: true,
+      stdio: ["ignore", "ignore", "pipe"],
+      env: {
+        ...process.env,
+        MESH_RUNTIME_DIR: runtimeDir,
+        MESH_BROKER_STARTER_PID: String(process.pid),
+      },
+    });
+    childClosed = once(child, "close").then(
+      () => {},
+      (error: unknown) => {
+        startupFailure = error instanceof Error ? error.message : String(error);
+      },
+    );
+    child.on("error", (error: Error) => {
+      startupFailure = error.message;
+    });
+    child.once("close", (code, signal) => {
+      startupFailure ??= `process exited ${signal === null ? `with code ${code}` : `on ${signal}`}`;
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (captureDiagnostics && diagnostics.length < BROKER_STARTUP_DIAGNOSTIC_MAX_BYTES) {
+        diagnostics = Buffer.concat([diagnostics, chunk.subarray(0, BROKER_STARTUP_DIAGNOSTIC_MAX_BYTES - diagnostics.length)]);
+      }
+    });
+    child.stderr?.on("error", (error: Error) => {
+      startupFailure ??= error.message;
+    });
+    if (child.pid !== undefined) {
+      ownerPid = child.pid;
+    }
+    for (let i = 0; i < ENSURE_BROKER_MAX_POLLS; i += 1) {
+      await sleep(ENSURE_BROKER_POLL_MS);
+      if (await connectProbe(sockPath, ENSURE_BROKER_POLL_MS)) {
+        captureDiagnostics = false;
+        diagnostics = Buffer.alloc(0);
+        child.unref();
+        // Keep draining stderr without retaining output or holding the host open.
+        const stderr = child.stderr as typeof child.stderr & { unref?: () => void };
+        stderr?.unref?.();
+        return;
+      }
+      if (startupFailure !== undefined) throw new Error(startupFailure);
+    }
+    throw new Error("socket did not become ready within the startup window");
+  } catch (error) {
+    if (child !== undefined) {
+      if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      await childClosed;
+    }
+    const detail = error instanceof Error ? error.message : String(error);
+    const stderr = diagnostics.length === 0 ? "" : `; startup stderr: ${JSON.stringify(diagnostics.toString("utf8"))}`;
+    throw new Error(
+      `broker_unavailable: ${detail}${executable === undefined ? "" : ` (executable: ${executable})`}${entry === undefined ? "" : ` (entry: ${entry})`}${stderr}; check MESH_BROKER_EXEC_PATH and MESH_BROKER_ENTRY`,
+    );
+  } finally {
+    if (captureDiagnostics) removeLaunchLock(lockPath, ownerPid);
+  }
+}
+
+const brokerStarts = new Map<string, Promise<string>>();
+
+/** Share in-flight startup within a host; the PID lock coordinates other hosts. */
+export function ensureBroker(runtimeDir: string): Promise<string> {
+  const key = path.resolve(runtimeDir);
+  const pending = brokerStarts.get(key);
+  if (pending !== undefined) return pending;
+  const starting = ensureBrokerReady(runtimeDir).finally(() => {
+    brokerStarts.delete(key);
+  });
+  brokerStarts.set(key, starting);
+  return starting;
+}
+
+async function ensureBrokerReady(runtimeDir: string): Promise<string> {
   const sockPath = brokerSocketPath(runtimeDir);
   const lockPath = brokerLockPath(runtimeDir);
-  mkdirSync(runtimeDir, { recursive: true });
+  fs.mkdirSync(runtimeDir, { recursive: true });
 
   for (let attempt = 0; attempt < LOCK_RETRY_MAX; attempt += 1) {
     if (await connectProbe(sockPath, ENSURE_BROKER_POLL_MS * ENSURE_BROKER_MAX_POLLS)) {
@@ -142,61 +219,39 @@ export async function ensureBroker(runtimeDir: string): Promise<string> {
     }
     let lockCreated = false;
     try {
-      writeFileSync(lockPath, "", { flag: "wx" });
+      // Keep a positive live owner for compatibility with concurrent older clients.
+      // The child alone replaces this lock through its explicit starter handshake.
+      fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
       lockCreated = true;
-    } catch {
-      lockCreated = false;
+    } catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") {
+        throw new Error(`broker_unavailable: cannot acquire ${lockPath}: ${String(error)}`);
+      }
     }
     if (lockCreated) {
-      let entry: string | undefined;
-      try {
-        entry = brokerEntryPath();
-        spawnBroker(runtimeDir, lockPath, entry);
-      } catch (err) {
-        try {
-          unlinkSync(lockPath);
-        } catch {
-  // best effort
-        }
-        const detail = err instanceof Error ? ` (${err.message})` : "";
-        throw new Error(
-          `broker_unavailable: fork failed${entry === undefined ? "" : ` (entry: ${entry})`}${detail}`,
-        );
-      }
-    } else {
-  // lock exists: live pid → just wait; dead pid → unlink + retry
-      let pid = Number.NaN;
-      try {
-        pid = Number(readFileSync(lockPath, "utf8").trim());
-      } catch {
-        pid = Number.NaN;
-      }
-      if (Number.isInteger(pid) && pid > 0 && pidAlive(pid)) {
-  // someone is spawning; fall through to poll-wait below
-      } else {
-        try {
-          unlinkSync(lockPath);
-        } catch {
-  // already gone
-        }
-        continue; // stale lock  → retry loop
-      }
+      await startBroker(runtimeDir, lockPath, sockPath);
+      return sockPath;
     }
-  // poll connect 50 ms × 60 (3 s)
+    let pid = Number.NaN;
+    try {
+      pid = Number(fs.readFileSync(lockPath, "utf8").trim());
+    } catch {
+      // A concurrent startup may already have removed its lock.
+    }
+    if (!(Number.isInteger(pid) && pid > 0 && pidAlive(pid))) {
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        // Already gone.
+      }
+      continue;
+    }
     for (let i = 0; i < ENSURE_BROKER_MAX_POLLS; i += 1) {
       await sleep(ENSURE_BROKER_POLL_MS);
       if (await connectProbe(sockPath, ENSURE_BROKER_POLL_MS)) return sockPath;
     }
-  // timed out; if we created the lock, clean it before retry
-    if (lockCreated) {
-      try {
-        unlinkSync(lockPath);
-      } catch {
-  // best effort
-      }
-    }
   }
-  throw new Error("broker_unavailable");
+  throw new Error(`broker_unavailable: socket ${sockPath} is not ready; inspect ${lockPath} and MESH_BROKER_EXEC_PATH / MESH_BROKER_ENTRY`);
 }
 
 /** Reconnect backoff: 250 ms × 2^n, capped at 5 s. */

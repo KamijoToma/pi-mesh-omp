@@ -1,5 +1,5 @@
 // extension/commands.ts — /mesh command. All output via ctx.ui.notify.
-import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import * as fs from "node:fs";
 import { MeshClient } from "../client/client.js";
 import type { MeshRole } from "../protocol/envelope.js";
 import { loadConfig } from "../shared/config.js";
@@ -10,6 +10,7 @@ import type { MeshHud } from "./hud.js";
 import { identityFromClient } from "../shared/identity-store.js";
 import type { ExtensionAPI, SessionContext } from "./pi-types.js";
 import type { GetRuntime, MeshRuntime } from "./tools.js";
+import { isOmpHost, reportConnectionError } from "./host.js";
 
 const HELP_TEXT = [
   "/mesh status [room]   — broker snapshot (online peers, rooms)",
@@ -29,7 +30,7 @@ const HELP_TEXT = [
 ].join("\n");
 
 function notify(ctx: SessionContext, message: string): void {
-  ctx.ui.notify(message, { level: "info" });
+  ctx.ui.notify(message, "info");
 }
 
 /** persist alias/rooms after a mutation (join/leave/rename). */
@@ -68,12 +69,12 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-async function cmdStatus(rt: MeshRuntime, ctx: SessionContext, room?: string): Promise<void> {
+async function cmdStatus(rt: MeshRuntime, ctx: SessionContext, pi: ExtensionAPI, room?: string): Promise<void> {
   if (!rt.client.isOnline()) {
     try {
       await rt.client.connect();
-    } catch {
-      notify(ctx, "mesh: blocked broker_unavailable");
+    } catch (error) {
+      reportConnectionError(pi, ctx, error);
       return;
     }
   }
@@ -185,41 +186,39 @@ async function cmdNew(
   rt: MeshRuntime,
   ctx: SessionContext,
   withHistory: boolean,
+  pi: ExtensionAPI,
+  getRuntime: GetRuntime,
 ): Promise<void> {
-  // /mesh new — like pi's /new (fresh conversation) but the mesh
-  // identity (alias, rooms, reservations) is handed to the NEXT session via
-  // identity-pending.json; the next session_start consumes it.
-  const history = withHistory
-    ? rt.client.transcript
-        .slice(-30)
-        .map(
-          (f) =>
-            `${f.ts.slice(11, 19)} ${f.type} ${f.from ?? "?"}→${f.to ?? "*"}: ${(f.body ?? "").slice(0, 120)}`,
-        )
-    : undefined;
-  rt.identity.savePending(identityFromClient(rt.sessionId, rt.client), history);
   if (typeof ctx.newSession !== "function") {
-    notify(ctx, "mesh: /mesh new requires a TUI session (newSession unavailable)");
+    notify(ctx, "mesh: /mesh new requires a session command context (newSession unavailable)");
     return;
   }
-  // The ctx becomes STALE after newSession resolves — notify BEFORE, and
-  // do any post-replacement work inside withSession (fresh ctx).
+  const history = withHistory
+    ? rt.client.transcript.slice(-30).map((frame) =>
+      `${frame.ts.slice(11, 19)} ${frame.type} ${frame.from ?? "?"}→${frame.to ?? "*"}: ${(frame.body ?? "").slice(0, 120)}`)
+    : undefined;
+  rt.identity.savePending(identityFromClient(rt.sessionId, rt.client), history);
   notify(ctx, `mesh: opening a new session — @${rt.client.alias} handed off (rooms/reservations kept)`);
-  const res = await ctx.newSession({
-    withSession: async (newCtx) => {
-  // fresh session context: report the handoff there
-      try {
-        newCtx.ui?.notify("mesh: identity handoff received — same alias/rooms/reservations", {
-          level: "info",
-        });
-      } catch {
-  // best effort
-      }
-    },
-  });
-  // NOTE: do NOT touch `ctx` here (stale after newSession). If the user
-  // cancelled, the staged pending expires by itself (PENDING_TTL_MS).
-  void res;
+  try {
+    // Pi's replaced command context is stale: its native withSession supplies the fresh one.
+    // Omp emits session_switch and supplies the fresh context through that public event.
+    const result = isOmpHost(pi)
+      ? await ctx.newSession()
+      : await ctx.newSession({
+        withSession: async (newCtx) => {
+          newCtx.ui.notify("mesh: identity handoff received — same alias/rooms/reservations", "info");
+        },
+      });
+    if (result.cancelled) {
+      rt.identity.consumePending();
+      notify(ctx, "mesh: new session cancelled — current identity unchanged");
+    } else if (isOmpHost(pi)) {
+      getRuntime()?.ctx?.ui.notify("mesh: identity handoff received — same alias/rooms/reservations", "info");
+    }
+  } catch (error) {
+    rt.identity.consumePending();
+    throw error;
+  }
 }
 
 async function cmdReset(
@@ -227,13 +226,17 @@ async function cmdReset(
   ctx: SessionContext,
   pi: ExtensionAPI,
   getHud: () => MeshHud | null,
+  getRuntime: GetRuntime,
+  resetActivity?: (rt: MeshRuntime) => void,
 ): Promise<void> {
   // like /new (fresh alias, default rooms, no reservations) but stays in
   // this pi session, like /reload does for identity preservation.
   const oldAlias = rt.client.alias;
   rt.markDetached?.();
+  rt.stopHold?.();
   // 1. leave the mesh cleanly (alias/rooms/reservations purged at the broker)
   await rt.client.close().catch(() => {});
+  if (getRuntime() !== rt) return;
   // 2. factory-reset the persisted identity for this session
   rt.identity.reset(rt.sessionId);
   // 3. spawn a fresh client in-place (same runtime object, re-attached)
@@ -252,15 +255,20 @@ async function cmdReset(
   // best effort
     }
   });
+  resetActivity?.(rt);
   try {
     await fresh.connect();
+    if (getRuntime() !== rt || rt.client !== fresh) {
+      await fresh.close().catch(() => {});
+      return;
+    }
     updateSessionName(pi, rt);
     notify(
       ctx,
       `mesh: identity reset — was @${oldAlias}, now @${fresh.alias} (rooms: ${fresh.rooms.join(",") || "default"})`,
     );
-  } catch {
-    notify(ctx, "mesh: reset — broker unavailable, tools answer blocked");
+  } catch (error) {
+    if (getRuntime() === rt && rt.client === fresh) reportConnectionError(pi, rt.ctx, error);
   }
 }
 
@@ -345,9 +353,9 @@ function sessionHealth(rt: MeshRuntime): { sizeMb: number; compactions: number; 
   let sizeMb = 0;
   let compactions = 0;
   try {
-    sizeMb = statSync(file).size / 1e6;
+    sizeMb = fs.statSync(file).size / 1e6;
   // count compaction entries — streaming scan, bounded to the first MBs
-    const fd = openSync(file, "r");
+    const fd = fs.openSync(file, "r");
     try {
       const CHUNK = 256 * 1024;
       const buf = Buffer.alloc(CHUNK);
@@ -355,7 +363,7 @@ function sessionHealth(rt: MeshRuntime): { sizeMb: number; compactions: number; 
       let carry = "";
       let scanned = 0;
       for (;;) {
-        const n = readSync(fd, buf, 0, CHUNK, pos);
+        const n = fs.readSync(fd, buf, 0, CHUNK, pos);
         if (n <= 0) break;
         pos += n;
         scanned += n;
@@ -368,7 +376,7 @@ function sessionHealth(rt: MeshRuntime): { sizeMb: number; compactions: number; 
         if (scanned > 4 * 1024 * 1024) break; // good enough; never block
       }
     } finally {
-      closeSync(fd);
+      fs.closeSync(fd);
     }
   } catch {
     return null;
@@ -380,7 +388,7 @@ function cmdBroker(rt: MeshRuntime, ctx: SessionContext): void {
   const sock = brokerSocketPath(rt.runtimeDir);
   let lockInfo = "absent";
   try {
-    const pid = Number(readFileSync(brokerLockPath(rt.runtimeDir), "utf8").trim());
+    const pid = Number(fs.readFileSync(brokerLockPath(rt.runtimeDir), "utf8").trim());
     if (Number.isFinite(pid)) lockInfo = `pid=${pid} alive=${pidAlive(pid)}`;
   } catch {
   // no lock file
@@ -411,6 +419,7 @@ export function registerCommands(
   getRuntime: GetRuntime,
   onChanged?: () => void, // HUD refresh after join/leave/log toggles
   getHud: () => MeshHud | null = () => null,
+  resetActivity?: (rt: MeshRuntime) => void,
 ): void {
   pi.registerCommand("mesh", {
     description: "mesh inter-agent coms: status, join/leave, alias, log, ping, broker",
@@ -420,6 +429,7 @@ export function registerCommands(
         notify(ctx, "mesh: session not started");
         return;
       }
+      rt.ctx = ctx;
       const [sub, ...rest] = args.trim().split(/\s+/).filter((s) => s.length > 0);
       switch (sub) {
         case "inbox":
@@ -434,7 +444,7 @@ export function registerCommands(
           }
           break;
         case "status":
-          await cmdStatus(rt, ctx, rest[0]);
+          await cmdStatus(rt, ctx, pi, rest[0]);
           break;
         case "join": {
   // `/mesh join <room> [as <alias>] [observer]`
@@ -465,10 +475,10 @@ export function registerCommands(
           cmdBroker(rt, ctx);
           break;
         case "new":
-          await cmdNew(rt, ctx, rest.includes("--history") || rest.includes("history"));
+          await cmdNew(rt, ctx, rest.includes("--history") || rest.includes("history"), pi, getRuntime);
           break;
         case "reset":
-          await cmdReset(rt, ctx, pi, getHud);
+          await cmdReset(rt, ctx, pi, getHud, getRuntime, resetActivity);
           onChanged?.();
           break;
         case "help":

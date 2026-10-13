@@ -6,11 +6,12 @@ README first, then these guidelines.
 ## Project shape
 
 - **Zero runtime dependencies.** Everything is plain Node (ESM, NodeNext).
-  The only dependency is the Pi SDK (`@mariozechner/pi-tui`, dev/peer only,
-  for the message renderers).
+  The Pi TUI remains a development/peer dependency for rendering. Pi/omp
+  SDKs and the native TypeScript compiler are development-only dependencies
+  for contract checks and regression runs.
 - **Layered**: `protocol/` (frames + validation) → `broker/` (server) →
-  `client/` (MeshClient) → `extension/` (thin Pi adapter). The first three
-  layers must never import Pi.
+  `client/` (MeshClient) → `extension/` (Pi/omp host integration). The first
+  three layers must never import either host SDK.
 - **Honesty is a feature**: `delivered ≠ read ≠ answered`, statuses are
   never inflated, errors are explicit. Keep it that way.
 
@@ -51,7 +52,8 @@ README first, then these guidelines.
 
 ```bash
 npm install
-npm run build       # strict tsc (ESM, NodeNext)
+bun check           # strict host/API type checking
+npm run build       # native TypeScript (ESM, NodeNext)
 npm test            # build + node --test dist/test/*.test.js
 npm run smoke       # E2E without Pi (broker + 2 headless clients)
 ```
@@ -60,23 +62,31 @@ npm run smoke       # E2E without Pi (broker + 2 headless clients)
   (`npx -y node@24 scripts/run-tests.mjs`).
 - Windows is a first-class platform (named pipes instead of AF_UNIX) —
   never break it.
+- Verify host changes on both modern Pi and omp, including a real compiled
+  omp executable. A `bun cli.ts` run does not exercise compiled-host launch
+  semantics. Use isolated HOME, agent, runtime and state directories.
+- Preserve terminal-settle semantics: Pi `agent_settled` and omp
+  `agent_end` with no `willContinue` are different contracts, not aliases.
 
 ## Releasing
 
-Maintainers only:
+Compatibility releases use an `-omp.N` suffix and GitHub tags, not npm publish.
+Update package metadata, rebuild, and include the generated runtime distribution:
 
-```
-npm version patch          # bumps package.json + creates the v* commit
-npm run build              # REGENERATES src/shared/version.ts (generated file)
-git add src/shared/version.ts && git commit --amend --no-edit
-git push && git push --tags
+```bash
+npm install --package-lock-only --ignore-scripts
+npm run build
+npm run ci
+git add package.json package-lock.json src/shared/version.ts dist/src
+git commit -m "chore: prepare compatibility release"
+git tag v<version>
+git push origin omp-compat --tags
 ```
 
-The `Release` GitHub Action runs the full suite and publishes
-`pi-mesh-extension` to npm (requires the `NPM_TOKEN` secret).
-The build step is NOT optional: `npm version` alone would leave the
-committed (generated) `version.ts` one version behind, and the tagged tree
-would fail `version-sync.test.ts`.
+The `GitHub Release` action tests and uploads an npm-compatible tarball using
+`GITHUB_TOKEN`. Git installations use checked-in `dist/src`, so a fresh online
+install must never depend on a prepare hook or the development SDK packages.
+The generated version must match package.json; never edit it by hand.
 
 ## Reporting issues
 

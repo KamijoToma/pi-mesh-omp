@@ -1,28 +1,16 @@
-name: Release
+name: GitHub Release
 
-# Publishes to the npm registry when a version tag (v*) is pushed.
-# pi.dev indexes npm packages tagged `pi-package` (already in package.json),
-# so publishing here makes the package appear in the pi.dev gallery.
-#
-# Requires a repository secret named NPM_TOKEN (an npm automation access
-# token). Without it the publish step fails with an auth error — add the
-# secret at Settings → Secrets and variables → Actions → New repository
-# secret.
-#
-# Release flow:
-#   npm version patch|minor|major
-#   git push --tags
-# (prepublishOnly runs the full build + test suite before npm publish.)
+# This compatibility fork distributes GitHub artifacts, never the upstream npm name.
 on:
   push:
     tags:
-      - "v*"
+      - "v*-omp.*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,9 +18,14 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          registry-url: https://registry.npmjs.org
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run ci
-      - run: npm publish --access public
+      - run: npm pack --ignore-scripts
+      - name: Publish GitHub release artifact
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" ./*.tgz \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

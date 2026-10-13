@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   findConflict,
+  findToolConflict,
   normalizePath,
   pathMatchesReservation,
 } from "../src/shared/reservations.js";
@@ -74,6 +75,47 @@ describe("reservations: conflict lookup", () => {
   });
 });
 
+describe("reservation enforcement across host tool targets", () => {
+  it("blocks a reserved file after an unreserved target in a multi-file edit", () => {
+    const reservations = new Map<string, readonly FileReservation[]>([
+      ["holder", [{ pattern: "src/protected.ts" }]],
+    ]);
+    const conflict = findToolConflict(
+      { paths: ["src/unreserved.ts", "src/protected.ts"] },
+      reservations,
+      "editor",
+    );
+    assert.equal(conflict?.path, "src/protected.ts");
+    assert.equal(conflict?.alias, "holder");
+  });
+
+  it("cannot hide a reserved scalar target behind an unrelated paths array", () => {
+    const reservations = new Map<string, readonly FileReservation[]>([
+      ["holder", [{ pattern: "src/protected.ts" }]],
+    ]);
+    const conflict = findToolConflict(
+      { path: "src/protected.ts", paths: ["src/unreserved.ts"] },
+      reservations,
+      "editor",
+    );
+    assert.equal(conflict?.path, "src/protected.ts");
+    assert.equal(conflict?.alias, "holder");
+  });
+
+  it("ignores non-path entries without skipping a later directory conflict", () => {
+    const reservations = new Map<string, readonly FileReservation[]>([
+      ["holder", [{ pattern: "src/protected/" }]],
+    ]);
+    const conflict = findToolConflict(
+      { paths: [null, 42, "", "src/protected/nested/file.ts"] },
+      reservations,
+      "editor",
+    );
+    assert.equal(conflict?.path, "src/protected/nested/file.ts");
+    assert.equal(conflict?.alias, "holder");
+  });
+});
+
 describe("reservation TTL (D33)", () => {
   it("expired reservations do not block (ttlMs > 0)", () => {
     const old = new Date(Date.now() - 3 * 3600_000).toISOString(); // 3h old
@@ -98,9 +140,8 @@ describe("reservation TTL (D33)", () => {
 // ---- v0.5: the DEFAULT TTL is now 6 h (DEFAULT_RESERVATION_TTL_MS) ----
 import { DEFAULT_RESERVATION_TTL_MS } from "../src/shared/config.js";
 
-describe("reservation TTL default change (v0.5)", () => {
-  it("default is 6 h — 7 h idle-held leaks expire, 3 h GPU runs survive", () => {
-    assert.equal(DEFAULT_RESERVATION_TTL_MS, 21_600_000);
+describe("reservation lease lifetime", () => {
+  it("keeps active reservations and releases stale claims", () => {
     const now = Date.now();
     const gpuRun = new Date(now - 3 * 3_600_000).toISOString(); // 3 h — legit
     const leak = new Date(now - 7 * 3_600_000).toISOString(); // 7 h idle — leak

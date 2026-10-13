@@ -1,8 +1,8 @@
 // extension/attach.ts — client→session wiring, shared by session_start and
 // /mesh reset: both need a fully-wired MeshClient, and reset must be
 // able to REPLACE the client in-place without a pi reload.
-import { readFileSync } from "node:fs";
-import type { WelcomeInfo } from "../client/client.js";
+import * as fs from "node:fs";
+import type { MeshClient, WelcomeInfo } from "../client/client.js";
 import type { MeshFrame } from "../protocol/envelope.js";
 import { buildBatchMessage, bypassesBatch, batchDetails, InboundBatcher } from "./batcher.js";
 import { DeferredInbox } from "./deferred-inbox.js";
@@ -15,23 +15,13 @@ import type { MeshRuntime } from "./tools.js";
 
 /** live-entry previews shown while the agent is busy (cooldown). */
 const LIVE_COOLDOWN_MS = 1_500;
-const liveCooldowns = new Map<string, number>();
-
-/** One full mesh-context block per session — reconnects send a SHORT diff
- *  (measured: cs-master received the ~500-token block 5× — pure duplication).
- *  A compaction resets the flag: the block is re-sent exactly when the
- *  context lost it. */
-let fullContextSent = false;
-let lastPeersOnline: Set<string> = new Set();
-/** Hint tracker — shared per session (compaction resets re-teach). */
-const hintTracker = new ReplyHintTracker();
 
 /** Format opts for one inbound frame (compact mode + gated hints). */
 export function formatOptsFor(
   frame: MeshFrame,
   verbose: boolean,
   homeRoom: string,
-  hints: ReplyHintTracker = hintTracker,
+  hints: ReplyHintTracker,
 ): FormatOpts {
   return {
     verbose,
@@ -72,7 +62,7 @@ function firstUserMessage(sessionFile: string | undefined): string | undefined {
   if (sessionFile === undefined || sessionFile === "") return undefined;
   let head: string;
   try {
-    head = readFileSync(sessionFile, "utf8").slice(0, SESSION_NAME_SCAN_BYTES);
+    head = fs.readFileSync(sessionFile, "utf8").slice(0, SESSION_NAME_SCAN_BYTES);
   } catch {
     return undefined;
   }
@@ -130,10 +120,12 @@ export function attachClientListeners(
   rt: MeshRuntime,
   getHud: () => MeshHud | null,
   ctx: SessionContext,
-  client: import("../client/client.js").MeshClient,
+  client: MeshClient,
   saveIdentity: (rt: MeshRuntime) => void,
   /** min gap between two live entries of the SAME agent (anti-flood). */
   liveCooldownMs: number = LIVE_COOLDOWN_MS,
+  isCurrent: () => boolean = () =>
+    (rt.ctx?.sessionManager?.getSessionId() ?? rt.sessionId) === rt.sessionId,
 ): void {
   // D41: after /reload, session switch or replacement, the OLD client may
   // still receive frames while the pi/ctx it captured is STALE — calling
@@ -141,13 +133,32 @@ export function attachClientListeners(
   // kills pi. `detached` flips at session_shutdown; every pi/ctx touch in
   // client handlers goes through guarded try/catch as belt-and-braces.
   let detached = false;
+  let fullContextSent = false;
+  let lastPeersOnline = new Set<string>();
+  const hintTracker = new ReplyHintTracker();
+  const liveCooldowns = new Map<string, number>();
+  const active = (): boolean => !detached && isCurrent() && rt.client === client;
   const guarded = (fn: () => void): void => {
-    if (detached) return;
+    if (!active()) return;
     try {
       fn();
     } catch {
       // stale ctx / shutting down — the event belongs to the old session
     }
+  };
+  // Force delivery can keep polling after the initial guarded call returns.
+  // Keep every later send/abort scoped to this runtime, not the next session.
+  const deliveryHost: Pick<ExtensionAPI, "sendMessage"> = {
+    sendMessage: (message, options) => guarded(() => pi.sendMessage(message, options)),
+  };
+  const deliveryContext: SessionContext = {
+    cwd: ctx.cwd,
+    ui: ctx.ui,
+    abort: ctx.abort === undefined ? undefined : () => {
+      if (active()) (rt.ctx ?? ctx).abort?.();
+    },
+    isIdle: ctx.isIdle === undefined ? undefined : () =>
+      !active() || (rt.ctx ?? ctx).isIdle?.() !== false,
   };
 
   const deps = {
@@ -165,8 +176,9 @@ export function attachClientListeners(
     client.inboundBatchMaxHoldMs,
     () => rt.ctx?.isIdle?.() === false, // busy = a turn is running (e.g. sleep)
     (frames: MeshFrame[]) => {
+    if (!active()) return;
     const batch = buildBatchMessage(frames, (f) =>
-      formatOptsFor(f, client.contextVerbosity === "full", client.homeRoom),
+      formatOptsFor(f, client.contextVerbosity === "full", client.homeRoom, hintTracker),
     );
     guarded(() => {
       pi.sendMessage(
@@ -182,18 +194,16 @@ export function attachClientListeners(
   },
   );
   const deferredInbox = new DeferredInbox(pi, (frame) =>
-    formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom),
+    formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker),
   (count) => guarded(() => {
-    if (ctx.mode === "tui") ctx.ui.setStatus("mesh-inbox", count > 0 ? `mesh:deferred ${count}` : undefined);
+    const currentCtx = rt.ctx ?? ctx;
+    if (currentCtx.mode === "tui") currentCtx.ui.setStatus("mesh-inbox", count > 0 ? `mesh:deferred ${count}` : undefined);
   }));
   rt.deferredInbox = deferredInbox;
-  pi.on("input", (_event, inputCtx) => {
-    if (!detached && inputCtx.isIdle?.() !== false) guarded(() => deferredInbox.queueForPrompt());
+  guarded(() => {
+    const currentCtx = rt.ctx ?? ctx;
+    if (currentCtx.mode === "tui") currentCtx.ui.setStatus("mesh-inbox", undefined);
   });
-  pi.on("before_agent_start", () => {
-    if (!detached) deferredInbox.promptStarting();
-  });
-  pi.on("agent_start", () => guarded(() => deferredInbox.agentStarting()));
   // rate-limited hold: while the provider rejects turns (429), inbound
   // frames are NOT injected — every injection would burn another failed
   // turn. They are queued and delivered when the hold expires.
@@ -206,7 +216,7 @@ export function attachClientListeners(
       return;
     }
     const opts: FormatOpts = {
-      ...formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom),
+      ...formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker),
     };
     if (bypassesBatch(frame) || client.inboundBatchMs <= 0) {
       batcher.flushNow(); // deliver any pending batch first (ordering)
@@ -218,11 +228,12 @@ export function attachClientListeners(
       // memory-only counters) before injection runs its repeater path
       if (frame.interrupt === true) {
         injectOpts.onInterruptReport = (report) => {
+          if (!active()) return;
           rt.interruptCount = (rt.interruptCount ?? 0) + 1;
           rt.lastInterruptAt = new Date().toISOString();
           rt.lastInterruptOutcome = report.outcome;
           guarded(() => {
-            ctx.ui.notify(`⚠ turn interrupted by force from @${frame.from ?? "?"}`);
+            (rt.ctx ?? ctx).ui.notify(`⚠ turn interrupted by force from @${frame.from ?? "?"}`, "warning");
           });
           if (rt.interruptReceipts !== false && frame.id !== undefined) {
             const wording =
@@ -240,7 +251,7 @@ export function attachClientListeners(
         };
       }
       guarded(() => {
-        injectInbound(pi, rt.ctx, frame, injectOpts);
+        injectInbound(deliveryHost, deliveryContext, frame, injectOpts);
       });
       return;
     }
@@ -272,12 +283,12 @@ export function attachClientListeners(
   };
   // flush everything queued while rate-limited (called at hold expiry)
   rt.flushHeld = (): void => {
+    if (!active()) return;
     const frames = heldFrames.splice(0);
     for (const { frame, matchedReply } of frames) deliver(frame, matchedReply);
   };
   client.on("inbound", (frame: MeshFrame, meta?: { matchedReply?: boolean }) => {
-    if (detached) return; // old session's client after reload/switch — D41
-    if (rt === null) return; // session shutting down
+    if (!active()) return;
     if (rt.rateLimitedUntil !== undefined && rt.rateLimitedUntil > Date.now()) {
       heldFrames.push({ frame, matchedReply: meta?.matchedReply === true }); // no injection while the provider rejects turns
       return;
@@ -288,7 +299,7 @@ export function attachClientListeners(
 
   // presence → appendEntry ONLY, no turn
   client.on("presence", (frame: MeshFrame) => {
-    if (detached) return; // D41: stale ctx after reload/switch — never throw
+    if (!active()) return;
     guarded(() => {
       pi.appendEntry("mesh", {
         kind: "mesh-presence",
@@ -302,7 +313,7 @@ export function attachClientListeners(
   });
 
   client.on("ready", (welcome: WelcomeInfo) => {
-    if (detached) return; // D41
+    if (!active()) return;
     guarded(() => exposeAlias(pi, client.alias, client.rooms));
     guarded(() => updateSessionName(pi, rt));
     getHud()?.setConnecting(false);
@@ -322,14 +333,14 @@ export function attachClientListeners(
   // master received the ~500-token block 5×, pure context duplication.
     const othersNow = welcome.peers.filter((p) => p.alias !== client.alias).map((p) => p.alias);
     if (fullContextSent) {
-      pi.sendMessage(
+      guarded(() => pi.sendMessage(
         {
           customType: "mesh-context",
           content: buildReconnectDiff([...lastPeersOnline], othersNow),
           display: false,
         },
         { triggerTurn: false },
-      );
+      ));
       lastPeersOnline = new Set(othersNow);
       return;
     }
@@ -338,9 +349,9 @@ export function attachClientListeners(
   // watchdog hook: a compaction wipes the context — re-teach everything
   // (full block + reply hints) exactly when it was lost.
     rt.onCompactionDetected = () => {
+      if (!active()) return;
       fullContextSent = false;
       hintTracker.reset();
-      client.sendActivity("idle"); // harmless; keeps presence fresh
     };
     const roomList = (welcome.rooms.length > 0 ? welcome.rooms.join(",") : "default");
     const myRooms = new Set(roomList.split(","));
@@ -391,28 +402,30 @@ export function attachClientListeners(
     });
   });
   client.on("renamed", () => {
+    if (!active()) return;
     guarded(() => exposeAlias(pi, client.alias, client.rooms));
     guarded(() => updateSessionName(pi, rt));
     saveIdentity(rt); // disk-only
   });
   client.on("alias_fallback", ({ from, to }: { from: string; to: string }) => {
+    if (!active()) return;
   // Another live peer holds our persisted alias (e.g. crashed session) —
   // we took a random one; persist it so the next reload does not fight
   // for the same alias again.
     saveIdentity(rt); // disk-only
     guarded(() => {
-      ctx.ui.notify(`mesh: alias @${from} taken — now connected as @${to}`, { level: "warning" });
+      (rt.ctx ?? ctx).ui.notify(`mesh: alias @${from} taken — now connected as @${to}`, "warning");
     });
   });
-  client.on("closed", () => getHud()?.onClosed());
-  client.on("expired", ({ msgId }: { msgId: string }) => getHud()?.noteExpired(msgId));
+  client.on("closed", () => { if (active()) getHud()?.onClosed(); });
+  client.on("expired", ({ msgId }: { msgId: string }) => { if (active()) getHud()?.noteExpired(msgId); });
 
   // async drop receipt: the broker dropped one of OUR messages from the
   // recipient's offline mailbox (TTL expiry or cap eviction). The client
   // already settled any live awaitReply mission; the session must LEARN
   // the message will never arrive so a re-send decision is possible.
   client.on("dropped_offline", (frame: MeshFrame) => {
-    if (detached) return; // D41: stale ctx after reload/switch — never throw
+    if (!active()) return;
     const target = frame.to ?? "?";
     guarded(() => {
       pi.sendMessage(
@@ -444,7 +457,10 @@ export function attachClientListeners(
   // Frames still in flight on the old socket are then dropped silently
   // instead of reaching the stale pi/ctx.
   rt.markDetached = () => {
-    deferredInbox.clear();
     detached = true;
+    heldFrames.length = 0;
+    deferredInbox.clear();
+    // Drain only into the detached guard: cancels batching timers without injection.
+    batcher.flushNow();
   };
 }
