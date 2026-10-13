@@ -1,15 +1,11 @@
 // test/cli-observe.test.ts — Phase 3: ledger filters, tail -f (real follow),
 // status --reservations, config show token masking. All hermetic.
-import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { MeshClient } from "../src/client/client.js";
-import { makeTempDirs, startTestBroker } from "./helpers.js";
-
-const CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "cli", "mesh.js");
+import { makeTempDirs, startTestBroker, sleep, spawnCli, type CliProcess } from "./helpers.js";
 
 const SCRUB_ENV_KEYS = [
   "MESH_BROKER_URL",
@@ -33,39 +29,29 @@ function hermeticEnv(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...base, ...extra };
 }
 
-function runCli(args: string[], env: NodeJS.ProcessEnv, timeoutMs = 15_000): Promise<{ code: number; out: string; err: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [CLI, ...args], { env: hermeticEnv(env) });
-    let out = "";
-    let err = "";
-    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
-    child.stdout.on("data", (c: Buffer) => {
-      out += c.toString("utf8");
-    });
-    child.stderr.on("data", (c: Buffer) => {
-      err += c.toString("utf8");
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? -1, out, err });
-    });
-  });
+async function runCli(
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  timeoutMs = 15_000,
+): Promise<{ code: number; out: string; err: string }> {
+  const proc = spawnCli(args, hermeticEnv(env), timeoutMs);
+  try {
+    const code = await proc.done;
+    return { code, out: proc.out, err: proc.err };
+  } finally {
+    await proc.cleanup();
+  }
 }
 
-/** Kill a long-running child (tail -f) and collect what it printed. */
-function killAfter(child: { kill: (s: NodeJS.Signals) => void }, ms: number): void {
-  setTimeout(() => child.kill("SIGINT"), ms);
-}
 
 test("mesh ledger: filters, limit, rotations oldest-first", async () => {
   const dirs = makeTempDirs("cli-ledger-");
-  mkdirSync(dirs.stateDir, { recursive: true });
+  fs.mkdirSync(dirs.stateDir, { recursive: true });
   const rec = (event: string, from: string, to: string, n: number): string =>
     JSON.stringify({ schema: "mesh.ledger.v1", event, from, to, room: "default", id: `m_x${n}`, ts: new Date(2026, 0, 1, 0, 0, n).toISOString(), bodyStored: false });
   // rotation (older) + current (newer)
-  writeFileSync(path.join(dirs.stateDir, "ledger-2026-01-01.jsonl.1"), [rec("sent", "alice", "bob", 1), rec("delivered", "bob", "alice", 2)].join("\n") + "\n");
-  writeFileSync(path.join(dirs.stateDir, "ledger.jsonl"), [rec("sent", "carol", "bob", 3), rec("reply", "bob", "carol", 4), rec("sent", "alice", "carol", 5)].join("\n") + "\n");
+  fs.writeFileSync(path.join(dirs.stateDir, "ledger-2026-01-01.jsonl.1"), [rec("sent", "alice", "bob", 1), rec("delivered", "bob", "alice", 2)].join("\n") + "\n");
+  fs.writeFileSync(path.join(dirs.stateDir, "ledger.jsonl"), [rec("sent", "carol", "bob", 3), rec("reply", "bob", "carol", 4), rec("sent", "alice", "carol", 5)].join("\n") + "\n");
   try {
     const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };
 
@@ -98,27 +84,26 @@ test("mesh ledger: filters, limit, rotations oldest-first", async () => {
 
 test("mesh tail -f: backlog then streams appended records", async () => {
   const dirs = makeTempDirs("cli-tailf-");
-  mkdirSync(dirs.stateDir, { recursive: true });
+  fs.mkdirSync(dirs.stateDir, { recursive: true });
   const ledger = path.join(dirs.stateDir, "ledger.jsonl");
-  writeFileSync(ledger, JSON.stringify({ event: "sent", from: "alice", ts: "2026-01-01T00:00:00Z" }) + "\n");
+  fs.writeFileSync(ledger, JSON.stringify({ event: "sent", from: "alice", ts: "2026-01-01T00:00:00Z" }) + "\n");
+  let proc: CliProcess | undefined;
   try {
     const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };
-    const child = spawn(process.execPath, [CLI, "tail", "-f"], { env: hermeticEnv(env) });
-    let out = "";
-    child.stdout.on("data", (c: Buffer) => {
-      out += c.toString("utf8");
-    });
+    proc = spawnCli(["tail", "-f"], hermeticEnv(env));
     // after the backlog had time to print, append two records
-    await new Promise((r) => setTimeout(r, 700));
-    appendFileSync(ledger, JSON.stringify({ event: "reply", from: "bob", ts: "2026-01-01T00:00:01Z" }) + "\n");
-    appendFileSync(ledger, JSON.stringify({ event: "blocked", from: "carol", ts: "2026-01-01T00:00:02Z" }) + "\n");
-    killAfter(child, 1200);
-    const code = await new Promise<number>((resolve) => child.on("close", (c) => resolve(c ?? -1)));
+    await sleep(700);
+    fs.appendFileSync(ledger, JSON.stringify({ event: "reply", from: "bob", ts: "2026-01-01T00:00:01Z" }) + "\n");
+    fs.appendFileSync(ledger, JSON.stringify({ event: "blocked", from: "carol", ts: "2026-01-01T00:00:02Z" }) + "\n");
+    await sleep(1200);
+    proc.interrupt();
+    const code = await proc.done;
     assert.equal(code, 0, "SIGINT exits 0 (agreed outcome)");
-    assert.match(out, /"event":"sent"/); // backlog
-    assert.match(out, /"event":"reply"/); // streamed
-    assert.match(out, /"event":"blocked"/); // streamed
+    assert.match(proc.out, /"event":"sent"/); // backlog
+    assert.match(proc.out, /"event":"reply"/); // streamed
+    assert.match(proc.out, /"event":"blocked"/); // streamed
   } finally {
+    await proc?.cleanup();
     dirs.cleanup();
   }
 });
@@ -157,33 +142,33 @@ test("mesh status --reservations shows peer claims with age; stale = alias", asy
 
 test("mesh tail -f: torn line is carried, not lost", async () => {
   const dirs = makeTempDirs("cli-tailf2-");
-  mkdirSync(dirs.stateDir, { recursive: true });
+  fs.mkdirSync(dirs.stateDir, { recursive: true });
   const ledger = path.join(dirs.stateDir, "ledger.jsonl");
+  let proc: CliProcess | undefined;
   try {
     const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };
-    const child = spawn(process.execPath, [CLI, "tail", "-f"], { env: hermeticEnv(env) });
-    let out = "";
-    child.stdout.on("data", (c: Buffer) => {
-      out += c.toString("utf8");
-    });
-    await new Promise((r) => setTimeout(r, 700));
+    proc = spawnCli(["tail", "-f"], hermeticEnv(env));
+    await sleep(700);
     // first write: HALF a line (no newline) — the second completes it
-    appendFileSync(ledger, '{"event":"sent","from":"alice","ts":"2026');
-    await new Promise((r) => setTimeout(r, 400));
-    appendFileSync(ledger, '-01-01T00:00:03Z"}\n');
-    killAfter(child, 900);
-    await new Promise<number>((resolve) => child.on("close", (c) => resolve(c ?? -1)));
+    fs.appendFileSync(ledger, '{"event":"sent","from":"alice","ts":"2026');
+    await sleep(400);
+    fs.appendFileSync(ledger, '-01-01T00:00:03Z"}\n');
+    await sleep(900);
+    proc.interrupt();
+    const code = await proc.done;
+    assert.equal(code, 0, "SIGINT exits 0 (agreed outcome)");
     // the torn record MUST appear complete exactly once
-    const matches = out.match(/"event":"sent","from":"alice"/g) ?? [];
-    assert.equal(matches.length, 1, `out: ${JSON.stringify(out)}`);
+    const matches = proc.out.match(/"event":"sent","from":"alice"/g) ?? [];
+    assert.equal(matches.length, 1, `out: ${JSON.stringify(proc.out)}`);
   } finally {
+    await proc?.cleanup();
     dirs.cleanup();
   }
 });
 
 test("mesh tail -f --limit invalid exits 2 (validation parity)", async () => {
   const dirs = makeTempDirs("cli-tailf3-");
-  mkdirSync(dirs.stateDir, { recursive: true });
+  fs.mkdirSync(dirs.stateDir, { recursive: true });
   try {
     const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };
     const res = await runCli(["tail", "-f", "--limit", "abc"], env);
@@ -196,8 +181,8 @@ test("mesh tail -f --limit invalid exits 2 (validation parity)", async () => {
 
 test("mesh config show masks the token, honors stateDir config", async () => {
   const dirs = makeTempDirs("cli-config-");
-  mkdirSync(dirs.stateDir, { recursive: true });
-  writeFileSync(
+  fs.mkdirSync(dirs.stateDir, { recursive: true });
+  fs.writeFileSync(
     path.join(dirs.stateDir, "config.json"),
     JSON.stringify({ rooms: ["ops"], mailboxCap: 42 }),
   );

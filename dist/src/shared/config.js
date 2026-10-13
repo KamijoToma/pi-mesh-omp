@@ -52,6 +52,8 @@ export const ENSURE_BROKER_POLL_MS = 50;
 export const ENSURE_BROKER_MAX_POLLS = 60; // 3 s
 export const LOCK_RETRY_MAX = 3;
 export const BROKER_STARTUP_DIAGNOSTIC_MAX_BYTES = 4_096;
+export const BROKER_STOP_TIMEOUT_MS = 5_000;
+export const BROKER_STOP_POLL_MS = 50;
 // ---- Provider failure holds ----
 export const PROVIDER_RATE_LIMIT_HOLD_MS = 60_000;
 export const PROVIDER_BLOCKED_HOLD_MS = 1_800_000;

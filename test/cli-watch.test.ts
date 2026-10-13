@@ -1,15 +1,10 @@
 // test/cli-watch.test.ts — Phase 4: the observer stream. The critical
 // assertion is REDACTION (plan D8): a broadcast msg carries a body on the
 // wire, and `watch` must NEVER print it — text or --json.
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { MeshClient } from "../src/client/client.js";
-import { makeTempDirs, startTestBroker, sleep } from "./helpers.js";
-
-const CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "cli", "mesh.js");
+import { makeTempDirs, startTestBroker, sleep, spawnCli, type CliProcess } from "./helpers.js";
 
 const SCRUB_ENV_KEYS = [
   "MESH_BROKER_URL",
@@ -35,41 +30,34 @@ test("watch --json streams frames and NEVER prints bodies (D8 redaction)", async
   const broker = await startTestBroker(dirs.runtimeDir);
   const member = new MeshClient({ alias: "member", runtimeDir: dirs.runtimeDir });
   await member.connect();
+  let proc: CliProcess | undefined;
   try {
     const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };
-    const child = spawn(process.execPath, [CLI, "watch", "default", "--json"], { env: hermeticEnv(env) });
-    let out = "";
-    child.stdout.on("data", (c: Buffer) => {
-      out += c.toString("utf8");
-    });
-    let err = "";
-    child.stderr.on("data", (c: Buffer) => {
-      err += c.toString("utf8");
-    });
-    const done = new Promise<number>((resolve) => child.on("close", (c) => resolve(c ?? -1)));
+    proc = spawnCli(["watch", "default", "--json"], hermeticEnv(env));
 
     // let the watcher join, then broadcast a message WITH a body
     await sleep(800);
     await member.send({ message: "secret-body-must-not-leak", broadcast: true, room: "default" });
     await sleep(800);
 
-    child.kill("SIGINT");
-    const code = await done;
-    assert.equal(code, 0, `err: ${err}`);
-    assert.match(out, /"type":"watch-start"/);
-    assert.match(out, /"role":"observer"/);
+    proc.interrupt();
+    const code = await proc.done;
+    assert.equal(code, 0, `err: ${proc.err}`);
+    assert.match(proc.out, /"type":"watch-start"/);
+    assert.match(proc.out, /"role":"observer"/);
 
     // the broadcast msg frame MUST appear as an event…
-    const lines = out.trim().split("\n").filter((l) => l.includes('"type":"msg"'));
-    assert.ok(lines.length > 0, `no msg frame in output: ${out}`);
+    const lines = proc.out.trim().split("\n").filter((l) => l.includes('"type":"msg"'));
+    assert.ok(lines.length > 0, `no msg frame in output: ${proc.out}`);
     // …with the body REDACTED everywhere
-    assert.doesNotMatch(out, /secret-body-must-not-leak/, "BODY LEAKED in watch output");
+    assert.doesNotMatch(proc.out, /secret-body-must-not-leak/, "BODY LEAKED in watch output");
     for (const line of lines) {
       const parsed = JSON.parse(line) as Record<string, unknown>;
       assert.equal(parsed.body, undefined, "body key present in a msg frame");
       assert.ok(parsed.bodyHash === undefined || typeof parsed.bodyHash === "string");
     }
   } finally {
+    await proc?.cleanup();
     await member.close();
     await broker.close();
     dirs.cleanup();
@@ -82,14 +70,10 @@ test("watch text mode shows events, hides bodies, SIGINT exits 0", async () => {
   const member = new MeshClient({ alias: "member", runtimeDir: dirs.runtimeDir });
   await member.connect();
   let late: MeshClient | null = null;
+  let proc: CliProcess | undefined;
   try {
     const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };
-    const child = spawn(process.execPath, [CLI, "watch"], { env: hermeticEnv(env) });
-    let out = "";
-    child.stdout.on("data", (c: Buffer) => {
-      out += c.toString("utf8");
-    });
-    const done = new Promise<number>((resolve) => child.on("close", (c) => resolve(c ?? -1)));
+    proc = spawnCli(["watch"], hermeticEnv(env));
 
     await sleep(800);
     await member.send({ message: "classified-body", broadcast: true, room: "default" });
@@ -100,14 +84,15 @@ test("watch text mode shows events, hides bodies, SIGINT exits 0", async () => {
     await late.connect();
     await sleep(900);
 
-    child.kill("SIGINT");
-    const code = await done;
+    proc.interrupt();
+    const code = await proc.done;
     assert.equal(code, 0);
-    assert.match(out, /watching room "default"/);
-    assert.match(out, /presence/);
-    assert.match(out, /msg/);
-    assert.doesNotMatch(out, /classified-body/);
+    assert.match(proc.out, /watching room "default"/);
+    assert.match(proc.out, /presence/);
+    assert.match(proc.out, /msg/);
+    assert.doesNotMatch(proc.out, /classified-body/);
   } finally {
+    await proc?.cleanup();
     if (late !== null) await late.close().catch(() => {});
     await member.close();
     await broker.close();
@@ -120,18 +105,15 @@ test("watch --alias collision: honest alias_taken (exit 1)", async () => {
   const broker = await startTestBroker(dirs.runtimeDir);
   const holder = new MeshClient({ alias: "taken", runtimeDir: dirs.runtimeDir });
   await holder.connect();
+  let proc: CliProcess | undefined;
   try {
     const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };
-    const child = spawn(process.execPath, [CLI, "watch", "--alias", "taken"], { env: hermeticEnv(env) });
-    let out = "";
-    child.stdout.on("data", (c: Buffer) => {
-      out += c.toString("utf8");
-    });
-    const done = new Promise<number>((resolve) => child.on("close", (c) => resolve(c ?? -1)));
-    const code = await done;
+    proc = spawnCli(["watch", "--alias", "taken"], hermeticEnv(env));
+    const code = await proc.done;
     assert.equal(code, 1);
-    assert.match(out, /blocked: alias_taken/);
+    assert.match(proc.out, /blocked: alias_taken/);
   } finally {
+    await proc?.cleanup();
     await holder.close();
     await broker.close();
     dirs.cleanup();

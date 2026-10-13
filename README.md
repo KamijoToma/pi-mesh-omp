@@ -93,7 +93,7 @@ omp install github:KamijoToma/pi-mesh-omp
 For a pinned release:
 
 ```bash
-omp install 'github:KamijoToma/pi-mesh-omp#v0.7.2-omp.1'
+omp install 'github:KamijoToma/pi-mesh-omp#v0.7.2-omp.2'
 ```
 
 The package keeps the `pi-mesh-extension` identity, so use this fork instead of
@@ -391,6 +391,11 @@ deliver it twice). If prompt preflight is cancelled after input, messages
 already handed to Pi remain queued for the next successful prompt, not
 re-sent by flush. Deferred state is session-local and cleared on reset,
 reload, or shutdown; use the existing mesh history for older frames.
+
+### v0.7.2-omp.2 portability changes
+
+- Fixed broker stop leaving stale PID locks after Windows process termination.
+- Broker stop now waits for termination and preserves locks owned by a replacement process.
 
 ### v0.7.2-omp.1 compatibility changes
 

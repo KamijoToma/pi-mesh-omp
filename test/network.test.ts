@@ -1,16 +1,16 @@
 // test/network.test.ts — D37: TCP/TLS broker + token auth (multi-machine).
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
-import path from "node:path";
+import * as fs from "node:fs";
 import { MeshClient } from "../src/client/client.js";
-import { createBroker } from "../src/broker/broker.js";
+import { createBroker, type RunningBroker } from "../src/broker/broker.js";
 import { DEFAULT_POLICY } from "../src/broker/policy.js";
 import { DEFAULT_CONFIG, parseEndpoint } from "../src/shared/config.js";
+import { socketPathForDir } from "../src/shared/paths.js";
 import { makeTempDirs, type TempDirs } from "./helpers.js";
 
 async function tcpBroker(token: string): Promise<{
-  broker: Awaited<ReturnType<typeof createBroker>>;
+  broker: RunningBroker;
   port: number;
   dirs: TempDirs;
 }> {
@@ -55,7 +55,7 @@ describe("TCP broker + token auth (D37)", () => {
       await assert.rejects(() => hacker.connect(), /invalid_token/);
     } finally {
       await broker.close();
-      rmSync(dirs.root, { recursive: true, force: true });
+      fs.rmSync(dirs.root, { recursive: true, force: true });
     }
   });
 
@@ -81,7 +81,7 @@ describe("TCP broker + token auth (D37)", () => {
       await alice.close().catch(() => {});
       await bob.close().catch(() => {});
       await broker.close();
-      rmSync(dirs.root, { recursive: true, force: true });
+      fs.rmSync(dirs.root, { recursive: true, force: true });
     }
   });
 
@@ -92,19 +92,19 @@ describe("TCP broker + token auth (D37)", () => {
       await assert.rejects(() => evil.connect(), /invalid_token/);
     } finally {
       await broker.close();
-      rmSync(dirs.root, { recursive: true, force: true });
+      fs.rmSync(dirs.root, { recursive: true, force: true });
     }
   });
 });
 
-/** D38 dual listen: local unix socket (tokenless) + tcp (token) at once. */
+/** D38 dual listen: local socket/pipe (tokenless) + tcp (token) at once. */
 async function dualBroker(token: string): Promise<{
-  broker: Awaited<ReturnType<typeof createBroker>>;
+  broker: RunningBroker;
   port: number;
   dirs: TempDirs;
 }> {
   const dirs = makeTempDirs("mesh-dual-");
-  const socketPath = path.join(dirs.runtimeDir, "broker.sock");
+  const socketPath = socketPathForDir(dirs.runtimeDir);
   const broker = await createBroker({
     config: { ...DEFAULT_CONFIG, brokerToken: token },
     policy: DEFAULT_POLICY,
@@ -117,15 +117,15 @@ async function dualBroker(token: string): Promise<{
   return { broker, port, dirs };
 }
 
-describe("dual listen: unix (tokenless) + tcp (token) — D38", () => {
-  it("local unix client needs no token, tcp client does, messages flow both ways", async () => {
+describe("dual listen: local socket/pipe (tokenless) + tcp (token) — D38", () => {
+  it("local client needs no token, tcp client does, messages flow both ways", async () => {
     const { broker, port, dirs } = await dualBroker("lan-token");
     const local = new MeshClient({ alias: "local-agent", runtimeDir: dirs.runtimeDir });
     const remote = netClient("remote-agent", port, "lan-token");
     try {
       assert.ok(port > 0, "tcp port assigned");
-      assert.match(broker.socketPath, /broker\.sock/, "both endpoints reported");
-      await local.connect(); // unix — NO token configured, must pass
+      assert.ok(broker.socketPath.includes(socketPathForDir(dirs.runtimeDir)), "local endpoint reported");
+      await local.connect(); // local socket/pipe — NO token configured, must pass
       await remote.connect(); // tcp — token, must pass
       const got = new Promise<{ body?: string }>((resolve) => {
         remote.once("inbound", (f) => resolve(f));
@@ -145,23 +145,23 @@ describe("dual listen: unix (tokenless) + tcp (token) — D38", () => {
       await local.close().catch(() => {});
       await remote.close().catch(() => {});
       await broker.close();
-      rmSync(dirs.root, { recursive: true, force: true });
+      fs.rmSync(dirs.root, { recursive: true, force: true });
     }
   });
 
-  it("tcp without token still refused while unix stays open", async () => {
+  it("tcp without token still refused while local endpoint stays open", async () => {
     const { broker, port, dirs } = await dualBroker("lan-token");
     const local = new MeshClient({ alias: "local-2", runtimeDir: dirs.runtimeDir });
     try {
       const rogue = netClient("rogue", port, undefined);
       await assert.rejects(() => rogue.connect(), /invalid_token/);
-      await local.connect(); // unix unaffected by the tcp refusal
+      await local.connect(); // local endpoint unaffected by the tcp refusal
       const snap = await local.status();
       assert.ok(Array.isArray(snap.peers));
       await local.close();
     } finally {
       await broker.close();
-      rmSync(dirs.root, { recursive: true, force: true });
+      fs.rmSync(dirs.root, { recursive: true, force: true });
     }
   });
 
@@ -176,13 +176,13 @@ describe("dual listen: unix (tokenless) + tcp (token) — D38", () => {
       const mine = snap.peers.find((p) => p.alias === "local-3");
       const far = snap.peers.find((p) => p.alias === "remote-3");
       assert.ok(mine !== undefined && far !== undefined);
-      assert.equal(mine.via, undefined, "unix-socket peer is broker-local");
+      assert.equal(mine.via, undefined, "local socket/pipe peer is broker-local");
       assert.ok(/^tcp:127\.0\.0\.1$|^tcp:::1$/.test(far.via ?? ""), `tcp peer tagged, got ${far.via}`);
     } finally {
       await local.close().catch(() => {});
       await remote.close().catch(() => {});
       await broker.close();
-      rmSync(dirs.root, { recursive: true, force: true });
+      fs.rmSync(dirs.root, { recursive: true, force: true });
     }
   });
 });

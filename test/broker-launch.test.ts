@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { acquireLock } from "../src/broker/broker.js";
+import { connectProbe } from "../src/client/reconnect.js";
 import { brokerLaunch } from "../src/shared/broker-launch.js";
 import { brokerLockPath, socketPathForDir } from "../src/shared/paths.js";
 import { waitFor } from "./helpers.js";
@@ -16,15 +17,41 @@ const commandUrl = new URL("../src/cli/cmd/broker.js", import.meta.url).href;
 const brokerEntry = fileURLToPath(new URL("../src/broker/broker.js", import.meta.url));
 
 // Each startup runs in a separate host process: no global env/module mutation.
-async function runHost(root: string, mode: "auto" | "cli" | "stop", extra: NodeJS.ProcessEnv = {}): Promise<{
+async function runHost(
+  root: string,
+  mode: "auto" | "cli" | "stop",
+  extra: NodeJS.ProcessEnv = {},
+  replacementPid?: number,
+): Promise<{
   code: number | null;
   out: string;
   err: string;
 }> {
   const driver = path.join(fs.mkdtempSync(path.join(root, "host-")), "host.mjs");
   fs.writeFileSync(driver, `
+import * as fs from "node:fs";
 import { ensureBroker } from ${JSON.stringify(reconnectUrl)};
 import { cmdBroker } from ${JSON.stringify(commandUrl)};
+// Deterministically replace the lock at the process-death boundary. The signal
+// and liveness checks still use the real OS process, on both POSIX and Windows.
+const replacementPid = ${JSON.stringify(replacementPid ?? null)};
+if (replacementPid !== null) {
+  const kill = process.kill.bind(process);
+  let stoppedPid;
+  process.kill = (pid, signal) => {
+    try {
+      const result = kill(pid, signal);
+      if (signal === "SIGTERM") stoppedPid = pid;
+      return result;
+    } catch (error) {
+      if (signal === 0 && pid === stoppedPid && error.code === "ESRCH") {
+        fs.writeFileSync(${JSON.stringify(brokerLockPath(path.join(root, "runtime")))}, String(replacementPid));
+        stoppedPid = undefined;
+      }
+      throw error;
+    }
+  };
+}
 try {
   if (process.argv[2] !== "auto") {
     process.exitCode = await cmdBroker(process.argv[2] === "stop" ? "stop" : "start");
@@ -65,25 +92,31 @@ async function cleanup(root: string): Promise<void> {
   const lock = brokerLockPath(path.join(root, "runtime"));
   if (fs.existsSync(lock)) {
     const pid = Number(fs.readFileSync(lock, "utf8").trim());
-    if (Number.isInteger(pid) && pid > 0) {
-      let stopping = false;
-      try {
-        process.kill(pid, "SIGTERM");
-        stopping = true;
-      } catch (error) {
-        if (!(error instanceof Error) || !("code" in error) || error.code !== "ESRCH") throw error;
-      }
-      if (stopping) {
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
+      const ready = await connectProbe(socketPathForDir(path.join(root, "runtime")), 500);
+      const result = await runHost(root, "stop");
+      if (result.code !== 0) {
+        // Failed startup has no ready broker for CLI stop. Still reap a stray
+        // child on failure, without depending on JS signal handlers to run.
         try {
-          await waitFor(() => !fs.existsSync(lock));
+          process.kill(pid, "SIGKILL");
         } catch (error) {
-          try {
-            process.kill(pid, "SIGKILL");
-          } catch {
-            // The process may have exited between the timeout and the signal.
-          }
-          throw error;
+          if (!(error instanceof Error) || !("code" in error) || error.code !== "ESRCH") throw error;
         }
+        await waitFor(() => {
+          try {
+            process.kill(pid, 0);
+            return false;
+          } catch (error) {
+            if (!(error instanceof Error) || !("code" in error) || error.code !== "ESRCH") throw error;
+            return true;
+          }
+        });
+      }
+      if (ready) {
+        assert.equal(result.code, 0, result.err);
+        assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+        assert.equal(fs.existsSync(lock), false, "CLI stop left the stopped broker's lock");
       }
     }
   }
@@ -312,6 +345,33 @@ test("CLI stop does not signal a live startup owner before the broker socket is 
   } finally {
     child.kill("SIGKILL");
     await closed;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI stop confirms process death and preserves a replacement owner's lock", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-launch-stop-replacement-"));
+  let pid: number | undefined;
+  try {
+    const started = await runHost(root, "cli");
+    assert.equal(started.code, 0, started.err);
+    const lock = brokerLockPath(path.join(root, "runtime"));
+    const brokerPid = Number(fs.readFileSync(lock, "utf8").trim());
+    pid = brokerPid;
+    assert.ok(Number.isInteger(brokerPid) && brokerPid > 0);
+    process.kill(brokerPid, 0);
+    const stopped = await runHost(root, "stop", {}, process.pid);
+    assert.equal(stopped.code, 0, stopped.err);
+    assert.throws(() => process.kill(brokerPid, 0), { code: "ESRCH" });
+    assert.equal(fs.readFileSync(lock, "utf8").trim(), String(process.pid));
+  } finally {
+    if (pid !== undefined && Number.isInteger(pid) && pid > 0) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if (!(error instanceof Error) || !("code" in error) || error.code !== "ESRCH") throw error;
+      }
+    }
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

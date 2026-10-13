@@ -35,6 +35,8 @@ export declare const ENSURE_BROKER_POLL_MS = 50;
 export declare const ENSURE_BROKER_MAX_POLLS = 60;
 export declare const LOCK_RETRY_MAX = 3;
 export declare const BROKER_STARTUP_DIAGNOSTIC_MAX_BYTES = 4096;
+export declare const BROKER_STOP_TIMEOUT_MS = 5000;
+export declare const BROKER_STOP_POLL_MS = 50;
 export declare const PROVIDER_RATE_LIMIT_HOLD_MS = 60000;
 export declare const PROVIDER_BLOCKED_HOLD_MS = 1800000;
 /** Observe model changes only while an error hold has pending recovery. */

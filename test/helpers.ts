@@ -1,9 +1,12 @@
 // test/helpers.ts — hermetic test utilities: mkdtemp dirs, real in-process
 // brokers, raw NDJSON socket clients, bounded waitFor. No shared state (I-safe).
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
+import * as fs from "node:fs";
 import net, { type Socket } from "node:net";
-import os from "node:os";
-import path from "node:path";
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createBroker, type RunningBroker } from "../src/broker/broker.js";
 import { DEFAULT_POLICY, type MeshPolicy } from "../src/broker/policy.js";
 import {
@@ -20,6 +23,70 @@ import {
 } from "../src/shared/config.js";
 import { socketPathForDir } from "../src/shared/paths.js";
 
+export interface CliProcess {
+  child: ChildProcess;
+  readonly out: string;
+  readonly err: string;
+  done: Promise<number>;
+  interrupt: () => void;
+  cleanup: () => Promise<void>;
+}
+
+/**
+ * Run the real CLI, with a bounded lifetime. POSIX uses the OS SIGINT;
+ * Windows uses test-only IPC to dispatch SIGINT to the CLI's own handlers,
+ * because child.kill("SIGINT") forcibly terminates Windows processes.
+ */
+export function spawnCli(
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  timeoutMs = 15_000,
+): CliProcess {
+  const cli = fileURLToPath(new URL("../src/cli/mesh.js", import.meta.url));
+  const windows = process.platform === "win32";
+  const preload = new URL("./fixtures/cli-interrupt.js", import.meta.url).href;
+  const child = spawn(
+    process.execPath,
+    windows ? ["--import", preload, cli, ...args] : [cli, ...args],
+    { env, stdio: windows ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"] },
+  );
+  let out = "";
+  let err = "";
+  child.stdout!.on("data", (chunk: Buffer) => {
+    out += chunk.toString("utf8");
+  });
+  child.stderr!.on("data", (chunk: Buffer) => {
+    err += chunk.toString("utf8");
+  });
+  const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+  const done = once(child, "close")
+    .then(([code]) => typeof code === "number" ? code : -1)
+    .finally(() => clearTimeout(timer));
+  // A test can fail before awaiting done; cleanup still reaps the process.
+  void done.catch(() => {});
+  return {
+    child,
+    get out(): string {
+      return out;
+    },
+    get err(): string {
+      return err;
+    },
+    done,
+    interrupt: () => {
+      if (windows) {
+        child.send("mesh-test-sigint");
+      } else {
+        child.kill("SIGINT");
+      }
+    },
+    cleanup: async () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await done.catch(() => {});
+    },
+  };
+}
+
 export interface TempDirs {
   root: string;
   runtimeDir: string;
@@ -29,18 +96,18 @@ export interface TempDirs {
 
 /** Hermetic per-test dirs (no shared runtimeDir/stateDir across tests). */
 export function makeTempDirs(prefix = "mesh-test-"): TempDirs {
-  const root = mkdtempSync(path.join(os.tmpdir(), prefix));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const runtimeDir = path.join(root, "run");
   const stateDir = path.join(root, "state");
-  mkdirSync(runtimeDir, { recursive: true });
-  mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
   return {
     root,
     runtimeDir,
     stateDir,
     cleanup: () => {
       try {
-        rmSync(root, { recursive: true, force: true });
+        fs.rmSync(root, { recursive: true, force: true });
       } catch {
         // best effort
       }
@@ -58,9 +125,9 @@ export async function startTestBroker(
   runtimeDir: string,
   overrides: BrokerOverrides = {},
 ): Promise<RunningBroker> {
-  mkdirSync(runtimeDir, { recursive: true });
+  fs.mkdirSync(runtimeDir, { recursive: true });
   const socketPath = socketPathForDir(runtimeDir);
-  rmSync(socketPath, { force: true }); // stale socket from a previous broker
+  fs.rmSync(socketPath, { force: true }); // stale socket from a previous broker
   const config: MeshConfig = { ...DEFAULT_CONFIG, ...overrides.config };
   const policy: MeshPolicy = {
     ...DEFAULT_POLICY,
