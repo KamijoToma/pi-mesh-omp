@@ -7,6 +7,12 @@ import type { ExtensionAPI } from "./pi-types.js";
 /** Human-facing preview cap for /mesh inbox lines (documentation, not a protocol bound). */
 const PREVIEW_MAX_CHARS = 120;
 
+export interface DeferredInboxReloadState {
+  pending: MeshFrame[];
+  queued: MeshFrame[];
+  draining: boolean;
+}
+
 export class DeferredInbox {
   private pending: MeshFrame[] = [];
   private queued: MeshFrame[] = [];
@@ -20,6 +26,17 @@ export class DeferredInbox {
 
   get count(): number {
     return this.pending.length + this.queued.length;
+  }
+
+  snapshotForReload(): DeferredInboxReloadState {
+    return { pending: [...this.pending], queued: [...this.queued], draining: this.draining };
+  }
+
+  restoreAfterReload(state: DeferredInboxReloadState): void {
+    this.pending = [...state.pending];
+    this.queued = [...state.queued];
+    this.draining = state.draining;
+    this.changed(this.count);
   }
 
   push(frame: MeshFrame): void {

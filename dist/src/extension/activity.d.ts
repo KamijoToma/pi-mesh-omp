@@ -8,10 +8,20 @@ export interface ActivityDependencies {
     flushHeld(): void;
     observeModel: boolean;
 }
+export interface MeshActivityReloadState {
+    announced?: MeshActivityState;
+    heldModel?: string;
+    holding: boolean;
+    runFailed: boolean;
+    heldUntil?: number;
+}
 /** One controller per session. Only an active error hold owns background timers. */
 export declare class MeshActivity {
     #private;
-    constructor(deps: ActivityDependencies);
+    constructor(deps: ActivityDependencies, state?: MeshActivityReloadState);
+    snapshotForReload(): MeshActivityReloadState;
+    /** A new socket has no activity declaration from the previous connection. */
+    announceCurrent(): void;
     beginRun(): void;
     toolCalled(): void;
     failed(state: "rate_limited" | "blocked"): void;

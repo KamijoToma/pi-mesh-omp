@@ -113,6 +113,29 @@ export interface MeshClientOpts {
     *  identity would be dishonest — they want THAT alias or a failure. */
     strictAlias?: boolean;
 }
+interface AwaitedMission {
+    to: string;
+    room: string;
+    status: "waiting" | "answered" | "expired" | "failed";
+    answered: boolean;
+    response?: string;
+    at?: string;
+}
+/** Process-local handover only: message bodies must never be written to disk. */
+export interface MeshClientReloadState {
+    inbox: [string, MeshFrame][];
+    transcript: MeshFrame[];
+    readBy: [string, {
+        alias: string;
+        at: string;
+    }][];
+    sentReplies: string[];
+    awaitedMissions: [string, AwaitedMission][];
+    reportedMissions: string[];
+    handledReplyTargets: [string, number][];
+    outbox: MeshFrame[];
+    roomRoles: [string, MeshRole][];
+}
 export interface WaitAllSummary {
     status: "complete" | "timeout" | "cancelled";
     total: number;
@@ -287,6 +310,11 @@ export declare class MeshClient extends EventEmitter {
     isOnline(): boolean;
     /** Additive (HUD): number of live awaitReply pendings. */
     get pendingCount(): number;
+    /** A live reply/transport promise belongs to this client until it settles. */
+    isReloadSafe(): boolean;
+    snapshotForReload(): MeshClientReloadState;
+    /** Restore before connecting so mailbox messages can still target old frames. */
+    restoreAfterReload(state: MeshClientReloadState): void;
     /**
     * Additive read-only peek at an inbound frame by msgId (ledger enrichment).
     * NEVER mutates the inbox — callers rely on it surviving for future replies.
@@ -382,3 +410,4 @@ export declare class MeshClient extends EventEmitter {
     private roundTrip;
     close(): Promise<void>;
 }
+export {};

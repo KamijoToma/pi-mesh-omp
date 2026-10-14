@@ -2,8 +2,8 @@
 // the conversation, INSIDE the pi custom-message box (background
 // customMessageBg — the "purple frame" of the default rendering,.
 // Per-agent colors everywhere: simple messages, batches and live entries.
-// No Pi imports except pi-tui helpers (wrap + visibleWidth).
-import { visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+// TUI helpers are supplied by the stable host boundary.
+import { visibleWidth, wrapTextWithAnsi } from "./tui.js";
 import { ALIAS_RE, agentColor } from "./colors.js";
 /** Colorize every @alias in a line with its OWN agent color. */
 export function colorizeAliases(line, theme) {

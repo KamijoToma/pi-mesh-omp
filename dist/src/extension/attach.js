@@ -109,17 +109,22 @@ export function updateSessionName(pi, rt) {
  */
 export function attachClientListeners(pi, rt, getHud, ctx, client, saveIdentity, 
 /** min gap between two live entries of the SAME agent (anti-flood). */
-liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.getSessionId() ?? rt.sessionId) === rt.sessionId) {
+liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.getSessionId() ?? rt.sessionId) === rt.sessionId, restored) {
     // D41: after /reload, session switch or replacement, the OLD client may
     // still receive frames while the pi/ctx it captured is STALE — calling
     // pi.* then throws "extension ctx is stale" as an uncaughtException and
     // kills pi. `detached` flips at session_shutdown; every pi/ctx touch in
     // client handlers goes through guarded try/catch as belt-and-braces.
     let detached = false;
-    let fullContextSent = false;
-    let lastPeersOnline = new Set();
+    let paused = restored !== undefined;
+    let fullContextSent = restored?.fullContextSent ?? false;
+    let lastPeersOnline = new Set(restored?.lastPeersOnline);
     const hintTracker = new ReplyHintTracker();
-    const liveCooldowns = new Map();
+    if (restored !== undefined)
+        hintTracker.restoreAfterReload(restored.replyHints);
+    const liveCooldowns = new Map(restored?.liveCooldowns);
+    const pendingInjections = new Set();
+    rt.isInboundReloadSafe = () => pendingInjections.size === 0;
     const active = () => !detached && isCurrent() && rt.client === client;
     const guarded = (fn) => {
         if (!active())
@@ -133,9 +138,6 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
     };
     // Force delivery can keep polling after the initial guarded call returns.
     // Keep every later send/abort scoped to this runtime, not the next session.
-    const deliveryHost = {
-        sendMessage: (message, options) => guarded(() => pi.sendMessage(message, options)),
-    };
     const deliveryContext = {
         cwd: ctx.cwd,
         ui: ctx.ui,
@@ -170,12 +172,15 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
         });
     });
     const deferredInbox = new DeferredInbox(pi, (frame) => formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker), () => guarded(() => getHud()?.refresh()));
+    if (restored !== undefined)
+        deferredInbox.restoreAfterReload(restored.deferred);
     rt.deferredInbox = deferredInbox;
     guarded(() => getHud()?.refresh());
     // rate-limited hold: while the provider rejects turns (429), inbound
     // frames are NOT injected — every injection would burn another failed
     // turn. They are queued and delivered when the hold expires.
-    const heldFrames = [];
+    const heldFrames = [...(restored?.held ?? [])];
+    const pausedBatches = [...(restored?.batched ?? [])];
     const deliver = (frame, matchedReply) => {
         handleInboundSideEffects(frame, deps);
         getHud()?.refresh();
@@ -219,7 +224,21 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
                 };
             }
             guarded(() => {
-                injectInbound(deliveryHost, deliveryContext, frame, injectOpts);
+                let completed = false;
+                const injectionHost = {
+                    sendMessage: (message, options) => guarded(() => {
+                        try {
+                            pi.sendMessage(message, options);
+                        }
+                        finally {
+                            completed = true;
+                            pendingInjections.delete(frame);
+                        }
+                    }),
+                };
+                const result = injectInbound(injectionHost, deliveryContext, frame, injectOpts);
+                if (result.aborted && !completed)
+                    pendingInjections.add(frame);
             });
             return;
         }
@@ -252,7 +271,7 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
     };
     // flush everything queued while rate-limited (called at hold expiry)
     rt.flushHeld = () => {
-        if (!active())
+        if (!active() || paused)
             return;
         const frames = heldFrames.splice(0);
         for (const { frame, matchedReply } of frames)
@@ -261,13 +280,36 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
     client.on("inbound", (frame, meta) => {
         if (!active())
             return;
-        if (rt.rateLimitedUntil !== undefined && rt.rateLimitedUntil > Date.now()) {
+        if (paused || (rt.rateLimitedUntil !== undefined && rt.rateLimitedUntil > Date.now())) {
             heldFrames.push({ frame, matchedReply: meta?.matchedReply === true }); // no injection while the provider rejects turns
             return;
         }
         deliver(frame, meta?.matchedReply === true);
     });
     rt.batcher = batcher;
+    rt.pauseForReload = () => {
+        paused = true;
+        pausedBatches.push(...batcher.takeForReload());
+    };
+    rt.captureInboundForReload = () => ({
+        deferred: deferredInbox.snapshotForReload(),
+        held: [...heldFrames],
+        batched: [...pausedBatches],
+        fullContextSent,
+        lastPeersOnline: [...lastPeersOnline],
+        replyHints: hintTracker.snapshotForReload(),
+        liveCooldowns: [...liveCooldowns],
+    });
+    rt.activateAfterReload = () => {
+        if (!active())
+            return;
+        paused = false;
+        for (const frame of pausedBatches)
+            batcher.push(frame);
+        pausedBatches.length = 0;
+        if (rt.rateLimitedUntil === undefined || rt.rateLimitedUntil <= Date.now())
+            rt.flushHeld?.();
+    };
     // presence → appendEntry ONLY, no turn
     client.on("presence", (frame) => {
         if (!active())
@@ -421,6 +463,8 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
     rt.markDetached = () => {
         detached = true;
         heldFrames.length = 0;
+        pausedBatches.length = 0;
+        pendingInjections.clear();
         deferredInbox.clear();
         // Drain only into the detached guard: cancels batching timers without injection.
         batcher.flushNow();

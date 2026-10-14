@@ -191,6 +191,45 @@ contexts remain native; older Pi versions are not covered by this matrix.
 omp versions without `registerEntryRenderer` omit Pi's display-only live
 entry previews, while final inbound rendering and the HUD remain available.
 
+### Hot-reloading built updates
+
+The first installation of a version providing `/mesh reload` still needs one
+host restart to load its stable entrypoint. Afterwards a linked checkout can
+be updated without restarting omp or Pi:
+
+```bash
+npm run build
+```
+
+Wait for the build to finish, then run `/mesh reload` in the existing session.
+Reload reads the installed package's `dist/src`; it never fetches code or
+builds it. A changed version is loaded into a fresh local module graph before
+the old client is touched. An unchanged build does not reconnect.
+
+If a model run, mesh command/tool or awaited reply is active, the request is
+queued until a safe point. Current work and reply waits continue; reload does
+not call the host's abort, session reload or new-session APIs. Changing
+sessions or shutting down cancels a queued reload.
+
+Cutover briefly reconnects the mesh client to the existing broker. The host
+process, conversation and other extensions remain running. Alias, rooms,
+per-room member/observer roles, reservations and their auto-release deadlines, reply targets,
+memory history/deduplication, deferred inbox (including already-queued messages),
+provider holds, transcript toggle and diagnostic counts are transferred in
+memory. Only built code is cached under `MESH_STATE_DIR/reload-cache`; reload
+does not persist message bodies.
+
+A bad import leaves the old version running; a failed startup restores a
+fresh instance of the old implementation. Failure and rollback results are
+reported explicitly. Registered tool/command/renderer/event names, callback
+contracts and the reload ABI must remain compatible; incompatible changes
+require a host restart. Pi also requires unchanged tool input/output schemas,
+while omp can refresh them. The stable loader and host SDK bindings themselves
+are not replaced. Broker upgrades remain a separate operation: this command
+does not restart the daemon or make incompatible protocol versions compatible.
+
+Hot reload was exercised in real compiled omp 18.10.3/18.10.4 and Pi 1.2.0
+sessions, including a compiled host with no plugin-local SDK dependencies.
 
 ## Tools (Pi/omp extension)
 
@@ -390,7 +429,8 @@ cancel an already-enqueued `nextTurn` message (otherwise manual flush would
 deliver it twice). If prompt preflight is cancelled after input, messages
 already handed to Pi remain queued for the next successful prompt, not
 re-sent by flush. Deferred state is session-local and cleared on reset,
-reload, or shutdown; use the existing mesh history for older frames.
+host/session replacement or shutdown; `/mesh reload` transfers it to the new
+implementation. Use the existing mesh history for older frames.
 
 ### Unreleased
 
@@ -399,6 +439,11 @@ reload, or shutdown; use the existing mesh history for older frames.
 - Merged deferred inbox counts into that row; live waits disappear on answer,
   cancellation or expiry. Recent inbound previews no longer add a second row.
 - `/mesh status` now includes announced activity and the legacy idle/stuck fallback.
+- Added `/mesh reload` for built updates without restarting omp/Pi. It prepares
+  a fresh module graph, waits for idle and settled replies, transfers session
+  state (including observer permissions), and restores the old version on failure.
+  Host SDK functions stay at the stable entry boundary, so compiled omp reloads
+  do not require a plugin-local TUI package.
 
 ### v0.7.2-omp.2 portability changes
 

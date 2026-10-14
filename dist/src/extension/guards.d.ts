@@ -28,6 +28,15 @@ export type GuardResult = {
     reason: string;
     warnings: string[];
 };
+interface SlidingWindow {
+    count: number;
+    windowStart: number;
+}
+export interface MeshGuardsReloadState {
+    recent: [string, number][];
+    windows: [string, SlidingWindow][];
+    repliedTo: [string, number][];
+}
 export declare class MeshGuards {
     private readonly limits;
     private readonly now;
@@ -37,6 +46,8 @@ export declare class MeshGuards {
     /** msgId → last reply ts: flag re-replies, never block). */
     private readonly repliedTo;
     constructor(limits?: GuardRateLimits, now?: () => number);
+    snapshotForReload(): MeshGuardsReloadState;
+    restoreAfterReload(state: MeshGuardsReloadState): void;
     /**
     * track that we replied to a msgId. Returns a WARNING when the same
     * msgId was answered inside REPLY_REPEAT_WINDOW_MS — agents re-answer on
@@ -52,3 +63,4 @@ export declare class MeshGuards {
     private consume;
     private pruneRecent;
 }
+export {};

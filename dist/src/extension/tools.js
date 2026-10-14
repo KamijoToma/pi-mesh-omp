@@ -725,12 +725,12 @@ const MESH_RESERVE_PARAMETERS = {
     required: ["paths"],
 };
 /** Arm one auto-release timer per freshly reserved pattern. */
-function armReserveTimers(rt, patterns, ms) {
+export function armReserveTimers(rt, patterns, ms) {
     rt.reserveTimers ??= new Map();
     for (const pattern of patterns) {
         const prev = rt.reserveTimers.get(pattern);
         if (prev !== undefined)
-            clearTimeout(prev);
+            clearTimeout(prev.timer);
         const t = setTimeout(() => {
             rt.reserveTimers?.delete(pattern);
             void rt.client.release([pattern]).catch(() => { }); // best effort
@@ -742,7 +742,7 @@ function armReserveTimers(rt, patterns, ms) {
             }
         }, ms);
         t.unref();
-        rt.reserveTimers.set(pattern, t);
+        rt.reserveTimers.set(pattern, { timer: t, expiresAt: Date.now() + ms });
     }
 }
 /** Clear auto-release timers (release/shutdown). */
@@ -751,7 +751,7 @@ function clearReserveTimers(rt, patterns) {
         return;
     for (const [pattern, t] of [...rt.reserveTimers]) {
         if (patterns === undefined || patterns.includes(pattern)) {
-            clearTimeout(t);
+            clearTimeout(t.timer);
             rt.reserveTimers.delete(pattern);
         }
     }

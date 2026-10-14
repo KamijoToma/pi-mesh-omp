@@ -3,7 +3,12 @@ import { EventEmitter, once } from "node:events";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import * as Tui from "@mariozechner/pi-tui";
 import meshExtension from "../src/extension/index.js";
+import createMeshExtension from "../src/extension/implementation.js";
+import { installReloadableMesh } from "../src/extension/reload.js";
+import { MESH_VERSION } from "../src/shared/version.js";
 import { MeshClient } from "../src/client/client.js";
 import type { ExtensionAPI, CommandDefinition, InboundMessage, SessionContext, ToolDefinition } from "../src/extension/pi-types.js";
 import { IDENTITY_PENDING_NAME, MeshIdentity } from "../src/shared/identity-store.js";
@@ -12,7 +17,7 @@ import { makeTempDirs, startTestBroker, waitFor } from "./helpers.js";
 type Hook = (event: unknown, ctx: SessionContext) => unknown;
 type ManagedTimer = Parameters<NonNullable<SessionContext["clearTimer"]>>[0];
 
-async function lifecycleFixture(omp: boolean) {
+async function lifecycleFixture(omp: boolean, options: { reload?: boolean; deferred?: boolean } = {}) {
   const dirs = makeTempDirs("mesh-lifecycle-");
   const savedEnvironment: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -24,6 +29,15 @@ async function lifecycleFixture(omp: boolean) {
   process.env.MESH_RUNTIME_DIR = dirs.runtimeDir;
   process.env.MESH_STATE_DIR = dirs.stateDir;
   process.env.MESH_INBOUND_BATCH_MS = "0";
+  if (options.deferred) process.env.MESH_INBOUND_BROADCASTS = "deferred";
+  const packageRoot = path.join(dirs.root, "package");
+  if (options.reload) {
+    fs.mkdirSync(packageRoot, { recursive: true });
+    fs.writeFileSync(path.join(packageRoot, "package.json"),
+      JSON.stringify({ name: "pi-mesh-extension", type: "module" }));
+    fs.cpSync(fileURLToPath(new URL("../src/", import.meta.url)),
+      path.join(packageRoot, "dist", "src"), { recursive: true });
+  }
   const broker = await startTestBroker(dirs.runtimeDir);
   const observer = new MeshClient({ alias: "observer", runtimeDir: dirs.runtimeDir });
   await observer.connect();
@@ -100,12 +114,20 @@ async function lifecycleFixture(omp: boolean) {
       },
     };
   };
-  meshExtension(api);
+  if (options.reload) {
+    installReloadableMesh(api, createMeshExtension,
+      pathToFileURL(path.join(packageRoot, "dist", "src", "extension", "index.js")).href, Tui);
+  } else meshExtension(api);
   const ready = once(events, "mesh:alias");
   await emit("session_start");
   await ready;
   return {
     dirs, observer, sent, notifications, timers, entries,
+    packageRoot,
+    updateVersion: (version: string) => {
+      fs.writeFileSync(path.join(packageRoot, "dist", "src", "shared", "version.js"),
+        `export const MESH_VERSION = ${JSON.stringify(version)};\n`);
+    },
     identity: new MeshIdentity(dirs.stateDir),
     ready: () => once(events, "mesh:alias"),
     alias: () => alias, sessionId: () => sessionId, emit, context,
@@ -339,5 +361,230 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     } finally {
       await fixture.close();
     }
+  });
+});
+
+describe("mesh built-version hot reload", { concurrency: false, timeout: 15_000 }, () => {
+  it("replaces the client module graph while preserving identity, reply targets and reserve deadlines", async () => {
+    const fixture = await lifecycleFixture(true, { reload: true });
+    try {
+      const alias = fixture.alias();
+      await fixture.command("join work");
+      await fixture.command("log on");
+      await fixture.tool("mesh_reserve", { paths: ["hot-reload.ts"], autoReleaseMs: 1000 });
+      const original = await fixture.observer.send({ to: alias, message: "reply-after-reload" });
+      assert.ok(original.status === "delivered");
+      await waitFor(() => fixture.sent.some((message) => message.content.includes("reply-after-reload")));
+      const version = `${MESH_VERSION}-reload-test`;
+      fixture.updateVersion(version);
+      await fixture.command("reload");
+      await waitFor(() => fixture.notifications.some((notification) => notification.message.includes(version)));
+      assert.equal(fixture.sessionId(), "original");
+      assert.equal(fixture.alias(), alias);
+      const peer = (await fixture.observer.status()).peers.find((candidate) => candidate.alias === alias);
+      assert.equal(peer?.clientVersion, version);
+      assert.deepEqual(peer?.rooms, ["default", "work"]);
+      assert.equal(peer?.reservations?.[0]?.pattern, "hot-reload.ts");
+      const history = await fixture.tool("mesh_history", { withBodies: true });
+      assert.ok(history.content.some((part) => part.text.includes("reply-after-reload")));
+      const answer = once(fixture.observer, "inbound");
+      const replied = await fixture.tool("mesh_reply", { msgId: original.msgId, message: "same-target-new-code" });
+      assert.equal(replied.details?.status, "delivered");
+      const [frame] = await answer;
+      assert.equal(frame.replyTo, original.msgId);
+      assert.equal(frame.body, "same-target-new-code");
+      await waitFor(() => fixture.observer.reservationsOf(alias).length === 0, 2000);
+      await fixture.receive("one-new-generation-delivery");
+      assert.equal(fixture.sent.filter((message) => message.content.includes("one-new-generation-delivery")).length, 1);
+      assert.ok(fs.readdirSync(path.join(fixture.dirs.stateDir, "transcripts")).some((name) => name.endsWith(".jsonl")));
+    } finally { await fixture.close(); }
+  });
+
+  it("waits for an active reply and busy host instead of cancelling either", async () => {
+    const fixture = await lifecycleFixture(true, { reload: true });
+    try {
+      fixture.running();
+      await fixture.emit("agent_start");
+      const inbound = once(fixture.observer, "inbound");
+      const sending = fixture.tool("mesh_send", {
+        to: "observer", message: "finish-before-reload", awaitReply: true, timeoutMs: 3000,
+      });
+      const [request] = await inbound;
+      const version = `${MESH_VERSION}-queued-test`;
+      fixture.updateVersion(version);
+      await fixture.command("reload");
+      const before = (await fixture.observer.status()).peers.find((peer) => peer.alias === fixture.alias());
+      assert.equal(before?.clientVersion, MESH_VERSION);
+      await fixture.observer.reply(request.id, "reply-not-cancelled");
+      const result = await sending;
+      assert.equal(result.details?.status, "reply");
+      assert.ok(result.content.some((part) => part.text.includes("reply-not-cancelled")));
+      fixture.idle();
+      await fixture.emit("agent_end", { willContinue: false });
+      await waitFor(() => fixture.notifications.some((notification) => notification.message.includes(version)));
+      const after = (await fixture.observer.status()).peers.find((peer) => peer.alias === fixture.alias());
+      assert.equal(after?.clientVersion, version);
+      assert.equal(fixture.sessionId(), "original");
+    } finally { await fixture.close(); }
+  });
+
+  it("retains both deferred and already-queued broadcasts without reinjecting queued messages", async () => {
+    const fixture = await lifecycleFixture(true, { reload: true, deferred: true });
+    try {
+      await fixture.observer.send({ room: "default", broadcast: true, message: "already-next-turn" });
+      await fixture.tool("mesh_status", {});
+      await fixture.emit("input");
+      assert.equal(fixture.sent.filter((message) => message.content.includes("already-next-turn")).length, 1);
+      await fixture.observer.send({ room: "default", broadcast: true, message: "still-local-inbox" });
+      await fixture.tool("mesh_status", {});
+      const version = `${MESH_VERSION}-inbox-test`;
+      fixture.updateVersion(version);
+      await fixture.command("reload");
+      await waitFor(() => fixture.notifications.some((notification) => notification.message.includes(version)));
+      await fixture.command("inbox");
+      const listing = fixture.notifications.at(-1)?.message ?? "";
+      assert.ok(listing.includes("already-next-turn") && listing.includes("still-local-inbox"));
+      await fixture.emit("input");
+      await fixture.emit("before_agent_start");
+      await fixture.emit("agent_start");
+      assert.equal(fixture.sent.filter((message) => message.content.includes("already-next-turn")).length, 1);
+      assert.equal(fixture.sent.filter((message) => message.content.includes("still-local-inbox")).length, 1);
+      await fixture.command("inbox");
+      assert.equal(fixture.notifications.at(-1)?.message.includes("still-local-inbox"), false);
+    } finally { await fixture.close(); }
+  });
+
+  it("keeps a provider hold across reload and delivers held frames once after model recovery", async () => {
+    const fixture = await lifecycleFixture(true, { reload: true });
+    try {
+      await fixture.emit("turn_end", {
+        message: { stopReason: "error", errorMessage: "insufficient_quota" }, toolResults: [],
+      });
+      await fixture.observer.send({ to: fixture.alias(), message: "held-through-new-code" });
+      await fixture.tool("mesh_status", {});
+      const version = `${MESH_VERSION}-hold-test`;
+      fixture.updateVersion(version);
+      await fixture.command("reload");
+      await waitFor(() => fixture.notifications.some((notification) => notification.message.includes(version)));
+      assert.equal(fixture.sent.some((message) => message.content.includes("held-through-new-code")), false);
+      await waitFor(() => fixture.observer.activityOf(fixture.alias())?.state === "blocked");
+      fixture.modelChanged();
+      fixture.fireNextTimer();
+      assert.equal(fixture.sent.filter((message) => message.content.includes("held-through-new-code")).length, 1);
+      await fixture.emit("agent_end", { willContinue: false });
+      assert.equal(fixture.sent.filter((message) => message.content.includes("held-through-new-code")).length, 1);
+    } finally { await fixture.close(); }
+  });
+
+  it("leaves the previous runtime usable when a built module cannot be imported", async () => {
+    const fixture = await lifecycleFixture(true, { reload: true });
+    try {
+      const alias = fixture.alias();
+      fs.writeFileSync(path.join(fixture.packageRoot, "dist", "src", "extension", "implementation.js"),
+        "throw new Error('unloadable candidate');\n");
+      await fixture.command("reload");
+      assert.ok(fixture.notifications.some((notification) => notification.severity === "error"));
+      const peer = (await fixture.observer.status()).peers.find((candidate) => candidate.alias === alias);
+      assert.equal(peer?.clientVersion, MESH_VERSION);
+      await fixture.receive("still-connected-after-invalid-build");
+      assert.equal(fixture.sent.filter((message) => message.content.includes("still-connected-after-invalid-build")).length, 1);
+      assert.equal(fixture.alias(), alias);
+    } finally { await fixture.close(); }
+  });
+
+  it("reconstructs the previous version after candidate startup fails without losing old reply targets", async () => {
+    const fixture = await lifecycleFixture(true, { reload: true });
+    try {
+      const alias = fixture.alias();
+      const original = await fixture.observer.send({ to: alias, message: "reply-after-rollback" });
+      assert.ok(original.status === "delivered");
+      await fixture.tool("mesh_status", {});
+      const extensionDir = path.join(fixture.packageRoot, "dist", "src", "extension");
+      fs.renameSync(path.join(extensionDir, "implementation.js"), path.join(extensionDir, "implementation-base.js"));
+      fs.writeFileSync(path.join(extensionDir, "implementation.js"), [
+        'import create from "./implementation-base.js";',
+        "export default function(api, host) {",
+        "  const instance = create(api, host);",
+        "  return { ...instance, restore: async (ctx, state) => {",
+        "    await instance.restore(ctx, state);",
+        "    throw new Error('candidate startup failed after connecting');",
+        "  } };",
+        "}",
+      ].join("\n"));
+      await fixture.command("reload");
+      assert.ok(fixture.notifications.some((notification) => notification.severity === "error"));
+      assert.equal(fixture.alias(), alias);
+      const answer = once(fixture.observer, "inbound");
+      const result = await fixture.tool("mesh_reply", { msgId: original.msgId, message: "rollback-target-kept" });
+      assert.equal(result.details?.status, "delivered");
+      const [frame] = await answer;
+      assert.equal(frame.replyTo, original.msgId);
+      await fixture.receive("one-rollback-delivery");
+      assert.equal(fixture.sent.filter((message) => message.content.includes("one-rollback-delivery")).length, 1);
+    } finally { await fixture.close(); }
+  });
+
+  it("cancels an outgoing session's queued reload instead of transferring its identity to a new session", async () => {
+    const fixture = await lifecycleFixture(true, { reload: true });
+    try {
+      const originalAlias = fixture.alias();
+      fixture.running();
+      fixture.updateVersion(`${MESH_VERSION}-session-test`);
+      await fixture.command("reload");
+      await fixture.switchTo("another", "new");
+      fixture.idle();
+      await fixture.emit("agent_end", { willContinue: false });
+      assert.notEqual(fixture.alias(), originalAlias);
+      assert.equal(fixture.identity.load("another")?.alias, fixture.alias());
+      const peer = (await fixture.observer.status()).peers.find((candidate) => candidate.alias === fixture.alias());
+      assert.equal(peer?.clientVersion, MESH_VERSION);
+      await fixture.receive("new-session-uninterrupted");
+      assert.equal(fixture.sent.filter((message) => message.content.includes("new-session-uninterrupted")).length, 1);
+    } finally { await fixture.close(); }
+  });
+
+  it("preserves mixed member/observer room permissions when replacing the client", async () => {
+    const fixture = await lifecycleFixture(true, { reload: true });
+    try {
+      await fixture.command("join audit observer");
+      await fixture.observer.join("audit");
+      const before = await fixture.tool("mesh_send", {
+        to: "observer", room: "audit", message: "denied-before-reload",
+      });
+      assert.equal(before.details?.reason, "observer_readonly");
+      const version = `${MESH_VERSION}-observer-test`;
+      fixture.updateVersion(version);
+      await fixture.command("reload");
+      await waitFor(() => fixture.notifications.some((notification) => notification.message.includes(version)));
+      const result = await fixture.tool("mesh_send", {
+        to: "observer", room: "audit", message: "must-remain-readonly",
+      });
+      assert.equal(result.details?.status, "blocked");
+      assert.equal(result.details?.reason, "observer_readonly");
+      const received = once(fixture.observer, "inbound");
+      const allowed = await fixture.tool("mesh_send", {
+        to: "observer", room: "default", message: "member-room-still-writable",
+      });
+      assert.equal(allowed.details?.status, "delivered");
+      const [frame] = await received;
+      assert.equal(frame.body, "member-room-still-writable");
+    } finally { await fixture.close(); }
+  });
+
+  it("keeps the loaded version and receives messages after Pi's new-session lifecycle", async () => {
+    const fixture = await lifecycleFixture(false, { reload: true });
+    try {
+      const version = `${MESH_VERSION}-pi-warm-test`;
+      fixture.updateVersion(version);
+      await fixture.command("reload");
+      await waitFor(() => fixture.notifications.some((notification) => notification.message.includes(version)));
+      const ready = fixture.ready();
+      await fixture.command("new");
+      await ready;
+      const peer = (await fixture.observer.status()).peers.find((candidate) => candidate.alias === fixture.alias());
+      assert.equal(peer?.clientVersion, version);
+      await fixture.receive("same-hot-code-after-pi-new");
+      assert.equal(fixture.sent.filter((message) => message.content.includes("same-hot-code-after-pi-new")).length, 1);
+    } finally { await fixture.close(); }
   });
 });

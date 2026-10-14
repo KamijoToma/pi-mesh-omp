@@ -32,6 +32,21 @@ export class MeshGuards {
         this.limits = limits;
         this.now = now;
     }
+    snapshotForReload() {
+        return {
+            recent: [...this.recent],
+            windows: [...this.windows].map(([key, value]) => [key, { ...value }]),
+            repliedTo: [...this.repliedTo],
+        };
+    }
+    restoreAfterReload(state) {
+        for (const [key, at] of state.recent)
+            this.recent.set(key, at);
+        for (const [key, window] of state.windows)
+            this.windows.set(key, { ...window });
+        for (const [key, at] of state.repliedTo)
+            this.repliedTo.set(key, at);
+    }
     /**
     * track that we replied to a msgId. Returns a WARNING when the same
     * msgId was answered inside REPLY_REPEAT_WINDOW_MS — agents re-answer on

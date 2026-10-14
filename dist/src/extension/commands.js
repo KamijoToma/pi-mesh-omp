@@ -22,6 +22,7 @@ const HELP_TEXT = [
     "/mesh stale           — reservations held by peers, with age (TTL insight)",
     "/mesh broker          — socket path, lock pid, session state",
     "/mesh inbox [flush]   — list deferred broadcasts, or deliver them now",
+    "/mesh reload          — load the built version without restarting the host (waits for idle)",
     "/mesh help",
 ].join("\n");
 function notify(ctx, message) {
