@@ -1,4 +1,4 @@
-// extension/tools.ts — the mesh tools (send/reply/status/history/wait_all/
+// extension/tools.ts — the mesh tools (send/reply/alias/status/history/wait_all/
 // ledger/reserve/release). Plain JSON Schema parameters (zero-dependency).
 // Honest statuses: delivered ≠ read ≠ answered. Offline → blocked.
 import { computePeerStatus, MeshClient, type SendResult } from "../client/client.js";
@@ -562,6 +562,45 @@ async function execMeshReply(
   return textResult(text, details);
 }
 
+// ---------------------------------------------------------------- mesh_alias
+
+const MESH_ALIAS_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    alias: {
+      type: "string",
+      description: "Custom name for THIS agent (2..32 letters/digits/hyphens, starting " +
+        "with a letter; '@' and uppercase are normalized). Omit to show the current alias.",
+    },
+  },
+};
+
+async function execMeshAlias(
+  getRuntime: GetRuntime,
+  params: Record<string, unknown>,
+): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return textResult("blocked: session_not_started", { status: "blocked", reason: "session_not_started" });
+  const previousAlias = rt.client.alias;
+  if (params.alias === undefined) {
+    return textResult(`mesh alias: @${previousAlias}`, { alias: previousAlias, rooms: rt.client.rooms });
+  }
+  if (typeof params.alias !== "string") {
+    return textResult(`blocked: invalid_alias — current alias @${previousAlias}`, { status: "blocked", reason: "invalid_alias", alias: previousAlias });
+  }
+  const renamed = await rt.client.rename(params.alias);
+  if (!renamed.ok) {
+    return textResult(`blocked: ${renamed.reason} — current alias @${rt.client.alias}`,
+      { status: "blocked", reason: renamed.reason, alias: rt.client.alias });
+  }
+  // attach.ts synchronizes persistence, session name and HUD on ready/renamed.
+  const status = renamed.unchanged === true ? "unchanged" : "renamed";
+  const text = renamed.unchanged === true
+    ? `mesh alias: @${renamed.alias} (unchanged)`
+    : `mesh alias changed: @${previousAlias} → @${renamed.alias}. Use @${renamed.alias} for mentions and message targets; the old alias is not redirected.`;
+  return textResult(text, { status, previousAlias, alias: renamed.alias, rooms: rt.client.rooms });
+}
+
 // ---------------------------------------------------------------- mesh_status
 
 const MESH_STATUS_PARAMETERS: Record<string, unknown> = {
@@ -1090,6 +1129,22 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
       "inbound message). Override with to: (single) or replyAll: true (room).",
     parameters: MESH_REPLY_PARAMETERS,
     execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshReply(getRuntime, params),
+  });
+
+  pi.registerTool({
+    name: "mesh_alias",
+    label: "Mesh Alias",
+    description:
+      "Show or change THIS agent's mesh name, so peers can mention it and send to it " +
+      "(e.g. reviewer or backend). Reuses the routing alias, not a separate display name. " +
+      "Names held by live peers are refused; rooms and reservations are preserved. " +
+      "The name persists across reload/resume. Renaming briefly reconnects the client.",
+    promptSnippet: "Choose a recognizable mesh name for yourself, or show your current alias.",
+    promptGuidelines:
+      "Name yourself before dispatching missions: rename cancels in-flight requests. " +
+      "Tell collaborators the new alias; old aliases do not redirect to it.",
+    parameters: MESH_ALIAS_PARAMETERS,
+    execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshAlias(getRuntime, params),
   });
 
   pi.registerTool({

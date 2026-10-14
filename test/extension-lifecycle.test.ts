@@ -167,6 +167,165 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
 }
 
 describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_000 }, () => {
+  it("both hosts switch out of every old room while join stays additive, and resume restores only the destination", async () => {
+    for (const omp of [true, false]) {
+      const fixture = await lifecycleFixture(omp);
+      try {
+        const alias = fixture.alias();
+        await fixture.command("join alpha");
+        await fixture.command("join beta");
+        assert.deepEqual(fixture.identity.load("original")?.rooms, ["default", "alpha", "beta"]);
+        await fixture.tool("mesh_reserve", { paths: ["room-switch.ts"], reason: "keep across switch" });
+        await fixture.observer.join("ops");
+        await fixture.observer.join("alpha");
+        await fixture.command("switch ops");
+        assert.equal(fixture.alias(), alias);
+        assert.deepEqual(fixture.identity.load("original")?.rooms, ["ops"]);
+        const self = (await fixture.observer.status()).peers.find((peer) => peer.alias === alias);
+        assert.deepEqual(self?.rooms, ["ops"]);
+        assert.equal(self?.reservations?.[0]?.pattern, "room-switch.ts");
+
+        const inbound = once(fixture.observer, "inbound");
+        const sent = await fixture.tool("mesh_send", { to: "observer", message: "destination-is-default-send-room" });
+        assert.equal(sent.details?.status, "delivered");
+        const [frame] = await inbound;
+        assert.equal(frame.room, "ops");
+        await fixture.observer.send({ room: "alpha", broadcast: true, message: "left-room-traffic" });
+        await fixture.tool("mesh_status", {});
+        assert.equal(fixture.sent.some((message) => message.content.includes("left-room-traffic")), false);
+
+        await fixture.switchTo("other-session", "new");
+        await fixture.switchTo("original", "resume");
+        const restored = (await fixture.observer.status()).peers.find((peer) => peer.alias === alias);
+        assert.deepEqual(restored?.rooms, ["ops"]);
+        assert.equal(restored?.reservations?.[0]?.pattern, "room-switch.ts");
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
+  it("switching to an already-joined room retains it, applies observer/alias options and allows a repeated switch", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      await fixture.command("join ops");
+      await fixture.command("join alpha");
+      await fixture.observer.join("ops");
+      await fixture.command("switch ops as room-reviewer observer");
+      assert.equal(fixture.alias(), "room-reviewer");
+      assert.deepEqual(fixture.identity.load("original")?.rooms, ["ops"]);
+      const observerSend = await fixture.tool("mesh_send", { to: "observer", room: "ops", message: "observer-must-not-send" });
+      assert.equal(observerSend.details?.reason, "observer_readonly");
+      await fixture.command("switch ops");
+      await fixture.command("switch ops");
+      assert.deepEqual(fixture.identity.load("original")?.rooms, ["ops"]);
+      const inbound = once(fixture.observer, "inbound");
+      const memberSend = await fixture.tool("mesh_send", { to: "observer", message: "member-after-repeat-switch" });
+      assert.equal(memberSend.details?.status, "delivered");
+      const [frame] = await inbound;
+      assert.equal(frame.room, "ops");
+      assert.equal(frame.from, "room-reviewer");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("missing or rejected switch destinations preserve the original rooms and a missing room never renames", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      const alias = fixture.alias();
+      await fixture.command("join alpha");
+      for (const command of ["switch", "switch as should-not-rename", "switch invalid!"]) {
+        await fixture.command(command);
+        assert.equal(fixture.alias(), alias);
+        assert.deepEqual(fixture.identity.load("original")?.rooms, ["default", "alpha"]);
+        const self = (await fixture.observer.status()).peers.find((peer) => peer.alias === alias);
+        assert.deepEqual(self?.rooms, ["default", "alpha"]);
+      }
+      const inbound = once(fixture.observer, "inbound");
+      const result = await fixture.tool("mesh_send", { to: "observer", message: "still-in-original-room" });
+      assert.equal(result.details?.status, "delivered");
+      const [frame] = await inbound;
+      assert.equal(frame.room, "default");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("both hosts route messages and broadcast mentions by the custom name and restore it on resume", async () => {
+    for (const omp of [true, false]) {
+      const fixture = await lifecycleFixture(omp, { deferred: true });
+      try {
+        const oldAlias = fixture.alias();
+        await fixture.command("join work");
+        await fixture.tool("mesh_reserve", { paths: ["named-agent.ts"], reason: "named work" });
+        const renamed = await fixture.tool("mesh_alias", { alias: " @Reviewer " });
+        assert.equal(renamed.details?.status, "renamed");
+        assert.equal(fixture.alias(), "reviewer");
+        const snapshot = await fixture.observer.status();
+        assert.equal(snapshot.peers.some((peer) => peer.alias === oldAlias), false);
+        const self = snapshot.peers.find((peer) => peer.alias === "reviewer");
+        assert.deepEqual(self?.rooms, ["default", "work"]);
+        assert.equal(self?.reservations?.[0]?.pattern, "named-agent.ts");
+
+        await fixture.observer.send({ broadcast: true, message: "@Reviewer review the named-change" });
+        await fixture.tool("mesh_status", {});
+        assert.equal(fixture.sent.filter((message) => message.customType === "mesh-inbound" &&
+          message.content.includes("@Reviewer review the named-change")).length, 1);
+        await fixture.observer.send({ broadcast: true, message: `@${oldAlias} obsolete-name-mention` });
+        await fixture.tool("mesh_status", {});
+        assert.equal(fixture.sent.some((message) => message.content.includes("obsolete-name-mention")), false);
+        await fixture.receive("direct-to-custom-name");
+        assert.equal(fixture.sent.filter((message) => message.content.includes("direct-to-custom-name")).length, 1);
+
+        const inbound = once(fixture.observer, "inbound");
+        const sending = fixture.tool("mesh_send", {
+          to: "observer", message: "named-request", awaitReply: true, timeoutMs: 3000,
+        });
+        const [request] = await inbound;
+        assert.equal(request.from, "reviewer");
+        await fixture.observer.reply(request.id, "named-answer");
+        const answer = await sending;
+        assert.equal(answer.details?.status, "reply");
+        assert.ok(answer.content.some((part) => part.text.includes("named-answer")));
+
+        assert.equal(fixture.identity.load("original")?.alias, "reviewer");
+        await fixture.switchTo("other-session", "new");
+        await fixture.switchTo("original", "resume");
+        assert.equal(fixture.alias(), "reviewer");
+        const current = await fixture.tool("mesh_alias", {});
+        assert.equal(current.details?.alias, "reviewer");
+        await fixture.receive("direct-after-named-resume");
+        assert.equal(fixture.sent.filter((message) => message.content.includes("direct-after-named-resume")).length, 1);
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
+  it("refuses invalid and occupied names without losing the current identity or routing", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      await fixture.tool("mesh_alias", { alias: "reviewer" });
+      for (const alias of ["", "a", "bad_name", "1reviewer", "r".repeat(33), "observer"]) {
+        const result = await fixture.tool("mesh_alias", { alias });
+        assert.equal(result.details?.status, "blocked");
+        assert.equal(result.details?.reason, alias === "observer" ? "alias_taken" : "invalid_alias");
+        assert.equal(fixture.alias(), "reviewer");
+        assert.equal(fixture.identity.load("original")?.alias, "reviewer");
+      }
+      const unchanged = await fixture.tool("mesh_alias", { alias: "@REVIEWER" });
+      assert.equal(unchanged.details?.status, "unchanged");
+      const snapshot = await fixture.observer.status();
+      assert.ok(snapshot.peers.some((peer) => peer.alias === "observer"));
+      assert.ok(snapshot.peers.some((peer) => peer.alias === "reviewer"));
+      await fixture.receive("direct-after-refused-name");
+      assert.equal(fixture.sent.filter((message) => message.content.includes("direct-after-refused-name")).length, 1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it("omp /mesh new transfers history/rooms/reservations and persists subsequent rename only under the new ID", async () => {
     const fixture = await lifecycleFixture(true);
     try {

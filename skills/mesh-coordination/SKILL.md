@@ -11,17 +11,25 @@ duplicates, loops and confusion.
 ## Know your identity
 
 - Your alias is injected at session start: `[mesh] you are @<alias> (rooms: …)`.
-  It is **stable across /reload** and only changes via `/mesh alias <name>`,
-  `/mesh reset` (fresh random alias) or `/mesh new` (identity handed to the
-  next session).
+  It is **stable across /reload**. Use `mesh_alias { alias: "reviewer" }` or
+  `/mesh alias <name>` to choose a recognizable name for yourself;
+  `mesh_alias {}` shows it. `/mesh reset` gives a fresh random alias and
+  `/mesh new` hands the identity to the next session.
 - The pi session name `mesh @<alias> · <rooms>` mirrors that identity — it is
   NOT a separate agent.
 - **If in doubt, `mesh_status` shows your alias** (first line) and who is
   online. Never guess who you are from the conversation alone.
+- Custom names are routing aliases: peers use the name in `to`, `replyTo` and
+  whole-name `@mentions`, including immediate delivery of mentioned deferred
+  broadcasts. Names are 2–32 ASCII characters: letter first, then letters,
+  digits or hyphens; `@`, whitespace and uppercase are normalized.
+- Name yourself before dispatching missions: renaming briefly reconnects and
+  cancels in-flight requests. Rooms and reservations survive. Tell collaborators
+  the new name; the old alias does NOT redirect to it.
 - A session that inherits an alias (e.g. `/mesh new` handoff) IS that agent:
   same alias, same rooms, same reservations.
-- You can NEVER take an alias held by a live peer (`alias_taken`): the error
-  names the holder. Close that session first, or pick another alias.
+- You can NEVER take an alias held by a live peer (`alias_taken`). Check
+  `mesh_status` for the holder; close that session first or pick another alias.
 
 ## Get oriented
 
@@ -30,6 +38,12 @@ duplicates, loops and confusion.
 - `mesh_history` — recent exchanges (memory).
 - `mesh_ledger` — durable history (hash-only): filter by
   `from/to/room/event`. **Use it to verify before re-sending.**
+- `/mesh join <room>` is additive: keep existing room memberships.
+- `/mesh switch <room> [as <alias>] [observer]` keeps ONLY the destination,
+  leaving every other room, including `default`. It joins first so a refused
+  destination does not drop old memberships. A failed leave can leave multiple
+  rooms; the command reports the remaining rooms. Check `mesh_status` rather
+  than assuming an atomic switch. Use `join` when you need multiple rooms.
 
 ## Sending
 

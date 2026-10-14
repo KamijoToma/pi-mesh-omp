@@ -20,5 +20,5 @@ export declare function buildStaleReport(reservationsByPeer: ReadonlyMap<string,
 }[]>, selfAlias: string, ttlMs: number, activityOf: (alias: string) => {
     state: string;
 } | undefined, now?: number): string[];
-export declare function registerCommands(pi: ExtensionAPI, getRuntime: GetRuntime, onChanged?: () => void, // HUD refresh after join/leave/log toggles
+export declare function registerCommands(pi: ExtensionAPI, getRuntime: GetRuntime, onChanged?: () => void, // HUD refresh after join/switch/leave/log toggles
 getHud?: () => MeshHud | null, resetActivity?: (rt: MeshRuntime) => void): void;

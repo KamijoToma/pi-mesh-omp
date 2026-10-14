@@ -456,8 +456,10 @@ re-sent by flush. Deferred state is session-local and cleared on reset,
 host/session replacement or shutdown; `/mesh reload` transfers it to the new
 implementation. Use the existing mesh history for older frames.
 
-### Unreleased
+### v0.7.2-omp.3
 
+- Added `/mesh switch <room>` to join a destination and leave every other room,
+  while `/mesh join` remains additive; failed destination joins retain old rooms.
 - Added `mesh_alias` so agents can choose recognizable routing names themselves,
   with existing collision protection, identity persistence, and `@name` mentions.
 - Replaced the peer-name HUD and duplicate footer entries with one non-wrapping
@@ -563,11 +565,23 @@ Env overrides: `MESH_ALIAS`, `MESH_ROOMS`, `MESH_RUNTIME_DIR`,
 `MESH_CONTEXT_VERBOSE=1`.
 
 **Commands** — `/mesh status [room] · join <room> [as <alias>] [observer] ·
-leave <room> · alias [<new-alias>] · new [--history] · reset · log [on|off] ·
-ping <alias> · broker · help`.
+switch <room> [as <alias>] [observer] · leave <room> · alias [<new-alias>] ·
+new [--history] · reset · log [on|off] · ping <alias> · broker · help`.
 
 - `/mesh join ops as agent-1` claims the alias `agent-1` and joins room
   `ops` in one step (live rename, rooms + reservations re-declared).
+- `/mesh join ops` adds `ops` without leaving any existing rooms.
+- `/mesh switch ops` leaves every other room (including `default`) and keeps
+  only `ops`. It joins the destination first: a refused destination leaves the
+  original rooms intact. Joining/leaving are separate broker operations, not an
+  atomic transaction; if an old-room leave fails, the command reports the
+  remaining rooms and persists that actual state.
+- `/mesh switch ops as reviewer observer` also supports the existing alias and
+  observer options. If already in `ops`, it keeps that room, applies the requested
+  role (`member` unless `observer` is specified), and leaves the others.
+  Alias rename failures follow `join`: continue under the current alias.
+  Alias, reservations and the selected room survive reconnect/resume/reload;
+  messages without an explicit room then use `ops`.
 - `/mesh new [--history]` opens a fresh pi session like `/new` but hands
   over the mesh identity (alias, rooms, reservations; `--history` also
   transfers the last 30 mesh frames as context). Stale handoffs expire

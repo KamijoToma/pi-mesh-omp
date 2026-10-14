@@ -17,7 +17,8 @@ import { executeTailnetCommand } from "../tailscale/commands.js";
 
 const HELP_TEXT = [
   "/mesh status [room]   — broker snapshot (peers, activity, rooms)",
-  "/mesh join <room> [as <alias>] [observer]",
+  "/mesh join <room> [as <alias>] [observer] — keep existing rooms",
+  "/mesh switch <room> [as <alias>] [observer] — leave all other rooms",
   "/mesh leave <room>",
   "/mesh alias [<new-alias>] — show, or change this session's alias live",
   "/mesh new [--history]  — fresh pi session like /new, mesh identity (alias, rooms,",
@@ -39,7 +40,7 @@ function notify(ctx: SessionContext, message: string): void {
   ctx.ui.notify(message, "info");
 }
 
-/** persist alias/rooms after a mutation (join/leave/rename). */
+/** persist alias/rooms after a mutation (join/switch/leave/rename). */
 function persistIdentity(rt: MeshRuntime): void {
   try {
     rt.identity.save(identityFromClient(rt.sessionId, rt.client));
@@ -102,10 +103,14 @@ async function cmdJoin(
   observer: boolean,
   asAlias: string | undefined,
   pi: ExtensionAPI,
+  mode: "join" | "switch" = "join",
 ): Promise<void> {
-  // `/mesh join <room> as <alias>`: rename first (re-hello), then join.
-  // A rename failure NEVER aborts the join — the session keeps its current
-  // alias and still joins the room (same_alias is a no-op success).
+  if (mode === "switch" && room === undefined) {
+    notify(ctx, "usage: /mesh switch <room> [as <alias>] [observer]");
+    return;
+  }
+  // Rename first (re-hello), then enter the room. A rename failure keeps
+  // the current alias without aborting join/switch; same_alias is a no-op.
   if (asAlias !== undefined) {
     const renamed = await rt.client.rename(asAlias);
     if (renamed.ok) {
@@ -114,7 +119,7 @@ async function cmdJoin(
         persistIdentity(rt);
       }
     } else {
-      notify(ctx, `mesh: rename to "${asAlias}" failed: ${renamed.reason} — joining as @${rt.client.alias}`);
+      notify(ctx, `mesh: rename to "${asAlias}" failed: ${renamed.reason} — ${mode === "switch" ? "switching" : "joining"} as @${rt.client.alias}`);
     }
   }
   if (room === undefined) {
@@ -124,11 +129,26 @@ async function cmdJoin(
   const role: MeshRole = observer ? "observer" : "member";
   try {
     await rt.client.join(room, role);
-    notify(ctx, `mesh: joined ${room} as ${role}`);
+    if (mode === "switch") {
+      // Join first: a refused destination must not discard the original rooms.
+      for (const previous of rt.client.rooms) {
+        if (previous === room) continue;
+        try {
+          await rt.client.leave(previous);
+        } catch (err) {
+          // leave() resyncs local membership when the broker already lost it.
+          if (!(err instanceof Error && err.message === "not_member")) throw err;
+        }
+      }
+    }
+    notify(ctx, `mesh: ${mode === "switch" ? "switched to" : "joined"} ${room} as ${role}`);
+  } catch (err) {
+    notify(ctx, `mesh: ${mode} failed: ${err instanceof Error ? err.message : String(err)}` +
+      (mode === "switch" ? ` — remaining rooms: ${rt.client.rooms.join(",") || "(none)"}` : ""));
+  } finally {
+    // A failed leave may follow successful joins/leaves; persist the actual state.
     persistIdentity(rt);
     updateSessionName(pi, rt);
-  } catch (err) {
-    notify(ctx, `mesh: join failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -491,12 +511,12 @@ async function cmdTailnet(
 export function registerCommands(
   pi: ExtensionAPI,
   getRuntime: GetRuntime,
-  onChanged?: () => void, // HUD refresh after join/leave/log toggles
+  onChanged?: () => void, // HUD refresh after join/switch/leave/log toggles
   getHud: () => MeshHud | null = () => null,
   resetActivity?: (rt: MeshRuntime) => void,
 ): void {
   pi.registerCommand("mesh", {
-    description: "mesh inter-agent coms: status, join/leave, alias, log, ping, broker, tailscale",
+    description: "mesh inter-agent coms: status, join/switch/leave, alias, log, ping, broker, tailscale",
     handler: async (args, ctx) => {
       const rt = getRuntime();
       if (rt === null) {
@@ -524,10 +544,10 @@ export function registerCommands(
         case "status":
           await cmdStatus(rt, ctx, pi, rest[0]);
           break;
-        case "join": {
-  // `/mesh join <room> [as <alias>] [observer]`
+        case "join":
+        case "switch": {
           const parsed = parseJoinArgs(rest);
-          await cmdJoin(rt, ctx, parsed.room, parsed.observer, parsed.asAlias, pi);
+          await cmdJoin(rt, ctx, parsed.room, parsed.observer, parsed.asAlias, pi, sub);
           onChanged?.();
           break;
         }
