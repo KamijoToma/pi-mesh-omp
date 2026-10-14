@@ -193,6 +193,50 @@ contexts remain native; older Pi versions are not covered by this matrix.
 omp versions without `registerEntryRenderer` omit Pi's display-only live
 entry previews, while final inbound rendering and the HUD remain available.
 
+### Hot-reloading built updates
+
+The first installation of a version providing `/mesh reload` still needs one
+host restart to load its stable entrypoint. Afterwards a linked checkout can
+be updated without restarting omp or Pi:
+
+```bash
+npm run build
+```
+
+Wait for the build to finish, then run `/mesh reload` in the existing session.
+Reload reads the installed package's `dist/src`; it never fetches code or
+builds it. A changed version is loaded into a fresh local module graph before
+the old client is touched. An unchanged build does not reconnect.
+
+If a model run, mesh command/tool or awaited reply is active, the request is
+queued until a safe point. Current work and reply waits continue; reload does
+not call the host's abort, session reload or new-session APIs. Changing
+sessions or shutting down cancels a queued reload.
+
+Cutover briefly reconnects the mesh client to the existing broker. The host
+process, conversation and other extensions remain running. Alias, rooms,
+per-room member/observer roles, reservations and their auto-release deadlines, reply targets,
+memory history/deduplication, deferred inbox (including already-queued messages),
+provider holds, transcript toggle and diagnostic counts are transferred in
+memory. Only built code is cached under `MESH_STATE_DIR/reload-cache`; reload
+does not persist message bodies.
+
+Authenticated TCP/Tailnet selections, credentials and verified broker identity
+are also transferred in memory. Retained reply targets stay bound to the same
+broker; a changed broker identity rejects the reload instead of crossing graphs
+or falling back to a local mesh.
+
+A bad import leaves the old version running; a failed startup restores a
+fresh instance of the old implementation. Failure and rollback results are
+reported explicitly. Registered tool/command/renderer/event names, callback
+contracts and the reload ABI must remain compatible; incompatible changes
+require a host restart. Pi also requires unchanged tool input/output schemas,
+while omp can refresh them. The stable loader and host SDK bindings themselves
+are not replaced. Broker upgrades remain a separate operation: this command
+does not restart the daemon or make incompatible protocol versions compatible.
+
+Hot reload was exercised in real compiled omp 18.10.3/18.10.4 and Pi 1.2.0
+sessions, including a compiled host with no plugin-local SDK dependencies.
 
 ## Tools (Pi/omp extension)
 
@@ -201,11 +245,28 @@ entry previews, while final inbound rendering and the HUD remain available.
 | `mesh_send` | `to?`, `message`, `room?`, `broadcast?`, `priority?`, `reason?`, `awaitReply?`, `block?`, `timeoutMs?`, `refs?`, `replyTo?` | `delivered` / `queued_offline` / `reply: …` / `expired` / `blocked: …` — impossible targets (`"*"`, `"<room>-broadcast"`) refused **locally**; unseen aliases get a soft warning; `awaitReply` toward a peer busy longer than the timeout gets a burst-pattern advisory |
 | `mesh_reply` | `msgId`, `message`, `replyAll?`, `to?`, `refs?` | `delivered` or `blocked: reply_without_target` |
 | `mesh_wait_all` | `timeoutMs?` | block the turn until every awaited mission is answered (or timeout) — group verdict: who answered (with the answer), who is missing |
+| `mesh_alias` | `alias?` (omit = show current name) | current alias / `renamed` / `unchanged` / `blocked: invalid_alias` or `alias_taken`; changes this agent's routing name, preserving rooms and reservations |
 | `mesh_status` | `room?`, `all?` | live broker snapshot — peers sharing a room, per-peer version (`⚠` on skew), turn state (`● working / ○ idle / ✕ stuck`), `likely done` summary, read receipts, missions, broker counters |
 | `mesh_ledger` | `limit?`, `from?`, `to?`, `room?`, `event?` | durable **hash-only** history — bodies never stored, survives restarts |
 | `mesh_history` | `limit?`, `withBodies?` | local **memory ring** (debug — never the ledger) |
 | `mesh_reserve` | `paths`, `reason?`, `autoReleaseMs?` | reserve files/dirs — peers' `edit`/`write` get blocked on them; claims expire for conflict checks after `reservationTtlMs` (default 6 h, re-reserve to renew) and can self-release (`autoReleaseMs`) |
 | `mesh_release` | `paths?` (omit = all) | release reservations, peers notified immediately |
+
+**Custom agent names:** call `mesh_alias({ alias: "reviewer" })` to give this
+agent a recognizable name; `mesh_alias({})` shows its current name. The existing
+`/mesh alias reviewer` command remains available for manual naming.
+Other agents can then use `mesh_send({ to: "reviewer", message: "Please review…" })`
+or mention `@reviewer` in a room broadcast. With deferred broadcasts enabled,
+a whole-name mention of the new alias is delivered immediately.
+
+Names use the existing routing alias, not a separate display-name registry:
+2–32 ASCII characters, starting with a letter, then letters, digits or hyphens.
+Leading `@`, surrounding whitespace and uppercase are normalized. Live-peer
+collisions are refused and the previous alias is restored. The session identity,
+session title and mesh status follow the name, including after reload/resume.
+Choose names before dispatching missions: renaming briefly reconnects the client
+and cancels in-flight requests. Tell collaborators the new name; old aliases do
+not redirect to it.
 
 **The orchestrator pattern** (injected in every session's identity context
 and in the bundled skill):
@@ -392,10 +453,13 @@ cancel an already-enqueued `nextTurn` message (otherwise manual flush would
 deliver it twice). If prompt preflight is cancelled after input, messages
 already handed to Pi remain queued for the next successful prompt, not
 re-sent by flush. Deferred state is session-local and cleared on reset,
-reload, or shutdown; use the existing mesh history for older frames.
+host/session replacement or shutdown; `/mesh reload` transfers it to the new
+implementation. Use the existing mesh history for older frames.
 
 ### Unreleased
 
+- Added `mesh_alias` so agents can choose recognizable routing names themselves,
+  with existing collision protection, identity persistence, and `@name` mentions.
 - Replaced the peer-name HUD and duplicate footer entries with one non-wrapping
   status row above the editor. Peer count excludes self and peers in unrelated rooms.
 - Merged deferred inbox counts into that row; live waits disappear on answer,
@@ -409,6 +473,11 @@ reload, or shutdown; use the existing mesh history for older frames.
 - Fixed batched and deferred messages missing read receipts and hash-only history after delivery.
 - Fixed JSON diagnostics losing their error envelope when configuration is invalid.
 - Fixed cancelled or superseded session selections overwriting a newer mesh configuration.
+- Added `/mesh reload` for built updates without restarting omp/Pi. It prepares
+  a fresh module graph, waits for idle and settled replies, transfers session
+  state (including observer permissions), and restores the old version on failure.
+  Host SDK functions stay at the stable entry boundary, so compiled omp reloads
+  do not require a plugin-local TUI package.
 
 ### v0.7.2-omp.2 portability changes
 

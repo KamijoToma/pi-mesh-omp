@@ -2,12 +2,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Container, visibleWidth } from "@mariozechner/pi-tui";
+import * as Tui from "@mariozechner/pi-tui";
+import { configureHostTui } from "../src/extension/tui.js";
 import { MeshClient } from "../src/client/client.js";
 import { attachClientListeners } from "../src/extension/attach.js";
 import { MeshHud } from "../src/extension/hud.js";
 import type { SessionContext } from "../src/extension/pi-types.js";
 import type { MeshRuntime } from "../src/extension/tools.js";
 import { makeTempDirs, startTestBroker, waitFor } from "./helpers.js";
+
+configureHostTui(Tui);
 
 function surface(rt: MeshRuntime) {
   let widget: Parameters<SessionContext["ui"]["setWidget"]>[1];

@@ -124,8 +124,8 @@ export class InboundBatcher {
     this.flushNow();
   }
 
-  /** Flush everything now (called on tool_result: the busy period ended). */
-  flushNow(): void {
+  /** Move pending frames without injecting into the outgoing generation. */
+  takeForReload(): MeshFrame[] {
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -134,10 +134,15 @@ export class InboundBatcher {
       clearTimeout(this.maxTimer);
       this.maxTimer = null;
     }
-    if (this.frames.length === 0) return;
     const batch = this.frames;
     this.frames = [];
-    this.onFlush(batch);
+    return batch;
+  }
+
+  /** Flush everything now (called on tool_result: the busy period ended). */
+  flushNow(): void {
+    const batch = this.takeForReload();
+    if (batch.length > 0) this.onFlush(batch);
   }
 
   /** Discard the old graph's held messages without injecting them into a new graph. */

@@ -5,13 +5,23 @@ import * as fs from "node:fs";
 import type { MeshClient, WelcomeInfo } from "../client/client.js";
 import type { MeshFrame } from "../protocol/envelope.js";
 import { buildBatchMessage, bypassesBatch, batchDetails, InboundBatcher } from "./batcher.js";
-import { DeferredInbox } from "./deferred-inbox.js";
+import { DeferredInbox, type DeferredInboxReloadState } from "./deferred-inbox.js";
 import { classifyInbound } from "./inbound-policy.js";
 import type { MeshHud } from "./hud.js";
 import { tagInboundReplyChain, recordInboundDelivery, injectInbound, type FormatOpts, type InjectOpts } from "./inbound.js";
-import { ReplyHintTracker } from "./reply-hints.js";
+import { ReplyHintTracker, type ReplyHintReloadState } from "./reply-hints.js";
 import type { ExtensionAPI, InboundMessage, SessionContext } from "./pi-types.js";
 import type { MeshRuntime } from "./tools.js";
+
+export interface MeshInboundReloadState {
+  deferred: DeferredInboxReloadState;
+  held: { frame: MeshFrame; matchedReply: boolean }[];
+  batched: MeshFrame[];
+  fullContextSent: boolean;
+  lastPeersOnline: string[];
+  replyHints: ReplyHintReloadState;
+  liveCooldowns: [string, number][];
+}
 
 /** live-entry previews shown while the agent is busy (cooldown). */
 const LIVE_COOLDOWN_MS = 1_500;
@@ -126,6 +136,7 @@ export function attachClientListeners(
   liveCooldownMs: number = LIVE_COOLDOWN_MS,
   isCurrent: () => boolean = () =>
     (rt.ctx?.sessionManager?.getSessionId() ?? rt.sessionId) === rt.sessionId,
+  restored?: MeshInboundReloadState,
 ): void {
   // D41: after /reload, session switch or replacement, the OLD client may
   // still receive frames while the pi/ctx it captured is STALE — calling
@@ -133,10 +144,14 @@ export function attachClientListeners(
   // kills pi. `detached` flips at session_shutdown; every pi/ctx touch in
   // client handlers goes through guarded try/catch as belt-and-braces.
   let detached = false;
-  let fullContextSent = false;
-  let lastPeersOnline = new Set<string>();
+  let paused = restored !== undefined;
+  let fullContextSent = restored?.fullContextSent ?? false;
+  let lastPeersOnline = new Set(restored?.lastPeersOnline);
   const hintTracker = new ReplyHintTracker();
-  const liveCooldowns = new Map<string, number>();
+  if (restored !== undefined) hintTracker.restoreAfterReload(restored.replyHints);
+  const liveCooldowns = new Map<string, number>(restored?.liveCooldowns);
+  const pendingInjections = new Set<MeshFrame>();
+  rt.isInboundReloadSafe = () => pendingInjections.size === 0;
   const active = (): boolean => !detached && isCurrent() && rt.client === client;
   const guarded = (fn: () => void): void => {
     if (!active()) return;
@@ -208,12 +223,14 @@ export function attachClientListeners(
   () => guarded(() => getHud()?.refresh()), (frames) => {
     for (const frame of frames) recordInboundDelivery(frame, deps);
   });
+  if (restored !== undefined) deferredInbox.restoreAfterReload(restored.deferred);
   rt.deferredInbox = deferredInbox;
   guarded(() => getHud()?.refresh());
   // rate-limited hold: while the provider rejects turns (429), inbound
   // frames are NOT injected — every injection would burn another failed
   // turn. They are queued and delivered when the hold expires.
-  const heldFrames: { frame: MeshFrame; matchedReply: boolean }[] = [];
+  const heldFrames: { frame: MeshFrame; matchedReply: boolean }[] = [...(restored?.held ?? [])];
+  const pausedBatches: MeshFrame[] = [...(restored?.batched ?? [])];
   const deliver = (frame: MeshFrame, matchedReply: boolean): void => {
     tagInboundReplyChain(frame, deps);
     getHud()?.refresh();
@@ -258,7 +275,19 @@ export function attachClientListeners(
         };
       }
       guarded(() => {
-        injectInbound(deliveryHost, deliveryContext, frame, injectOpts);
+        let completed = false;
+        const injectionHost: Pick<ExtensionAPI, "sendMessage"> = {
+          sendMessage: (message, options) => {
+            try {
+              deliveryHost.sendMessage(message, options);
+            } finally {
+              completed = true;
+              pendingInjections.delete(frame);
+            }
+          },
+        };
+        const result = injectInbound(injectionHost, deliveryContext, frame, injectOpts);
+        if (result.aborted && !completed) pendingInjections.add(frame);
       });
       return;
     }
@@ -290,13 +319,13 @@ export function attachClientListeners(
   };
   // flush everything queued while rate-limited (called at hold expiry)
   rt.flushHeld = (): void => {
-    if (!active()) return;
+    if (!active() || paused) return;
     const frames = heldFrames.splice(0);
     for (const { frame, matchedReply } of frames) deliver(frame, matchedReply);
   };
   client.on("inbound", (frame: MeshFrame, meta?: { matchedReply?: boolean }) => {
     if (!active()) return;
-    if (rt.rateLimitedUntil !== undefined && rt.rateLimitedUntil > Date.now()) {
+    if (paused || (rt.rateLimitedUntil !== undefined && rt.rateLimitedUntil > Date.now())) {
       heldFrames.push({ frame, matchedReply: meta?.matchedReply === true }); // no injection while the provider rejects turns
       return;
     }
@@ -305,6 +334,8 @@ export function attachClientListeners(
   rt.batcher = batcher;
   rt.clearInbound = () => {
     heldFrames.length = 0;
+    pausedBatches.length = 0;
+    pendingInjections.clear();
     batcher.clear();
     deferredInbox.clear();
     lastPeersOnline.clear();
@@ -317,6 +348,26 @@ export function attachClientListeners(
       "warning",
     ));
   });
+  rt.pauseForReload = () => {
+    paused = true;
+    pausedBatches.push(...batcher.takeForReload());
+  };
+  rt.captureInboundForReload = () => ({
+    deferred: deferredInbox.snapshotForReload(),
+    held: [...heldFrames],
+    batched: [...pausedBatches],
+    fullContextSent,
+    lastPeersOnline: [...lastPeersOnline],
+    replyHints: hintTracker.snapshotForReload(),
+    liveCooldowns: [...liveCooldowns],
+  });
+  rt.activateAfterReload = () => {
+    if (!active()) return;
+    paused = false;
+    for (const frame of pausedBatches) batcher.push(frame);
+    pausedBatches.length = 0;
+    if (rt.rateLimitedUntil === undefined || rt.rateLimitedUntil <= Date.now()) rt.flushHeld?.();
+  };
 
   // presence → appendEntry ONLY, no turn
   client.on("presence", (frame: MeshFrame) => {
@@ -396,8 +447,8 @@ export function attachClientListeners(
         : "";
     let context =
       `[mesh] you are @${client.alias} (rooms: ${roomList}). ` +
-      `Your alias is stable across /reload; it changes only via /mesh alias, ` +
-      `/mesh reset or /mesh new — if in doubt, mesh_status shows your alias. ` +
+      `Your alias is stable across /reload; use mesh_alias {alias: "reviewer"} or /mesh alias to choose a recognizable name. ` +
+      `/mesh reset gives a fresh alias; /mesh new hands the identity over — if in doubt, mesh_status shows your alias. ` +
       `${peerLine}${farLine} ` +
       `mesh_send/mesh_reply to talk, mesh_status for a live snapshot, ` +
       `mesh_reserve to claim files before editing them. ` +
@@ -480,6 +531,8 @@ export function attachClientListeners(
   rt.markDetached = () => {
     detached = true;
     heldFrames.length = 0;
+    pausedBatches.length = 0;
+    pendingInjections.clear();
     deferredInbox.clear();
     // Drain only into the detached guard: cancels batching timers without injection.
     batcher.flushNow();

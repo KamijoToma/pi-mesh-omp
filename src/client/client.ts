@@ -172,6 +172,31 @@ export interface MeshClientOpts {
   strictAlias?: boolean;
 }
 
+interface AwaitedMission {
+  to: string;
+  room: string;
+  status: "waiting" | "answered" | "expired" | "failed";
+  answered: boolean;
+  response?: string;
+  at?: string;
+}
+
+/** Process-local handover only: message bodies must never be written to disk. */
+export interface MeshClientReloadState {
+  inbox: [string, MeshFrame][];
+  transcript: MeshFrame[];
+  readBy: [string, { alias: string; at: string }][];
+  sentReplies: string[];
+  awaitedMissions: [string, AwaitedMission][];
+  reportedMissions: string[];
+  handledReplyTargets: [string, number][];
+  outbox: MeshFrame[];
+  roomRoles: [string, MeshRole][];
+  connectionConfig?: Pick<MeshConfig, "brokerUrl" | "brokerToken" | "tlsCa" | "tlsInsecure" | "meshId" | "brokerId" | "tailscale">;
+  broker?: BrokerInfo;
+  pinnedBrokerId?: string;
+}
+
 interface AckWaiter {
   resolve: (frame: MeshFrame) => void;
   timer: NodeJS.Timeout;
@@ -226,7 +251,7 @@ export class MeshClient extends EventEmitter {
   private aliasInternal: string;
   private readonly initialRooms: string[];
   /** All rooms this client is (or will be) a member of — re-declared at hello. */
-  private readonly joinedRooms: Set<string>;
+  private readonly joinedRooms: Map<string, MeshRole>;
   private readonly runtimeDir: string;
   private config: MeshConfig;
   private readonly noReconnect: boolean;
@@ -279,17 +304,7 @@ export class MeshClient extends EventEmitter {
   *  status: waiting | answered | expired | failed: a mission that was
   *  blocked/errored at ack or expired is NOT 'waiting' forever). Bounded
   * capped at 200 entries, oldest dropped first. */
-  private readonly awaitedMissions = new Map<
-    string,
-    {
-      to: string;
-      room: string;
-      status: "waiting" | "answered" | "expired" | "failed";
-      answered: boolean;
-      response?: string;
-      at?: string;
-    }
-  >();
+  private readonly awaitedMissions = new Map<string, AwaitedMission>();
   /** missions already reported by a wait_all verdict — never re-listed
   *  by a later wait_all (each batch is summarized once). */
   private readonly reportedMissions = new Set<string>();
@@ -321,7 +336,8 @@ export class MeshClient extends EventEmitter {
     super();
     this.aliasInternal = normalizeAlias(opts.alias ?? defaultAlias());
     this.initialRooms = opts.rooms ?? [...DEFAULT_CONFIG.rooms];
-    this.joinedRooms = new Set(this.initialRooms);
+    this.joinedRooms = new Map();
+    for (const room of this.initialRooms) this.joinedRooms.set(room, "member");
     this.runtimeDir = opts.runtimeDir ?? runtimeDir();
     this.config = { ...DEFAULT_CONFIG, ...opts.config, rooms: this.initialRooms };
     this.noReconnect = opts.noReconnect === true;
@@ -354,7 +370,7 @@ export class MeshClient extends EventEmitter {
 
   /** All rooms this client is a member of (re-declared at every hello). */
   get rooms(): readonly string[] {
-    return [...this.joinedRooms];
+    return [...this.joinedRooms.keys()];
   }
 
   /** activity status thresholds from config. */
@@ -590,7 +606,7 @@ export class MeshClient extends EventEmitter {
 
   /** the session's home room: the room tag is omitted for its frames. */
   get homeRoom(): string {
-    return this.joinedRooms.size > 0 ? [...this.joinedRooms][0] ?? "default" : "default";
+    return this.joinedRooms.keys().next().value ?? "default";
   }
 
   /** send a read receipt for an inbound msgId back to its sender. */
@@ -631,6 +647,67 @@ export class MeshClient extends EventEmitter {
   /** Additive (HUD): number of live awaitReply pendings. */
   get pendingCount(): number {
     return this.pending.size;
+  }
+
+  /** A live reply/transport promise belongs to this client until it settles. */
+  isReloadSafe(): boolean {
+    return this.pending.size === 0 && this.waitAllInFlight === 0 &&
+      this.ackWaiters.size === 0 && this.statusWaiters.size === 0 &&
+      this.connecting === null && this.#selection === null && this.#socketClosing === null;
+  }
+
+  snapshotForReload(): MeshClientReloadState {
+    return {
+      inbox: [...this.inbox],
+      transcript: [...this.transcript],
+      readBy: [...this.readBy],
+      sentReplies: [...this.sentReplies],
+      awaitedMissions: [...this.awaitedMissions],
+      reportedMissions: [...this.reportedMissions],
+      handledReplyTargets: [...this.handledReplyTargets],
+      outbox: [...this.outbox],
+      roomRoles: [...this.joinedRooms],
+      connectionConfig: {
+        brokerUrl: this.config.brokerUrl,
+        brokerToken: this.config.brokerToken,
+        tlsCa: this.config.tlsCa,
+        tlsInsecure: this.config.tlsInsecure,
+        meshId: this.config.meshId,
+        brokerId: this.config.brokerId,
+        tailscale: this.config.tailscale === undefined ? undefined : { ...this.config.tailscale },
+      },
+      broker: this.#brokerInfo === undefined ? undefined : { ...this.#brokerInfo },
+      pinnedBrokerId: this.#pinnedBrokerId,
+    };
+  }
+
+  /** Restore before connecting so mailbox messages can still target old frames. */
+  restoreAfterReload(state: MeshClientReloadState): void {
+    if (state.connectionConfig !== undefined) {
+      this.config = {
+        ...this.config,
+        ...state.connectionConfig,
+        // Retained reply targets must never cross into a different broker.
+        brokerId: state.connectionConfig.brokerId ?? state.broker?.brokerId,
+      };
+    }
+    this.#brokerInfo = state.broker;
+    this.#pinnedBrokerId = state.pinnedBrokerId;
+    this.joinedRooms.clear();
+    for (const [room, role] of state.roomRoles) {
+      if (role !== "member" && role !== "observer") {
+        throw new Error("incompatible mesh client reload state; restart the host");
+      }
+      this.joinedRooms.set(room, role);
+    }
+    for (const [id, frame] of state.inbox) this.inbox.set(id, frame);
+    this.transcript.push(...state.transcript);
+    for (const [id, receipt] of state.readBy) this.readBy.set(id, receipt);
+    for (const id of state.sentReplies) this.sentReplies.add(id);
+    for (const [id, mission] of state.awaitedMissions) this.awaitedMissions.set(id, { ...mission });
+    for (const id of state.reportedMissions) this.reportedMissions.add(id);
+    for (const [id, at] of state.handledReplyTargets) this.handledReplyTargets.set(id, at);
+    this.outbox.push(...state.outbox);
   }
 
   /**
@@ -728,7 +805,7 @@ export class MeshClient extends EventEmitter {
     if (this.online && this.socket) {
       return Promise.resolve({
         alias: this.alias,
-        rooms: [...this.joinedRooms],
+        rooms: [...this.joinedRooms.keys()],
         peers: [],
         mailboxCount: 0,
         broker: this.#brokerInfo,
@@ -772,7 +849,7 @@ export class MeshClient extends EventEmitter {
       if (generation !== this.#selectionGeneration) throw new Error("connection_cancelled");
       await this.#closeConnection();
       if (generation !== this.#selectionGeneration) throw new Error("connection_cancelled");
-      this.config = { ...config, rooms: [...this.joinedRooms] };
+      this.config = { ...config, rooms: [...this.joinedRooms.keys()] };
       this.#connectionTarget = null;
       this.#brokerInfo = undefined;
       this.#pinnedBrokerId = undefined;
@@ -890,6 +967,14 @@ export class MeshClient extends EventEmitter {
       this.debug(`socket error: ${err.name}: ${err.message}`);
     });
     const decoder = new FrameDecoder(this.config.maxFrameBytes);
+    // Start mixed-role reconnects read-only; restore member rooms before ready.
+    let helloRole: MeshRole = "member";
+    for (const role of this.joinedRooms.values()) {
+      if (role === "observer") {
+        helloRole = "observer";
+        break;
+      }
+    }
 
     const welcome = await new Promise<WelcomeInfo>((resolve, reject) => {
       let settled = false;
@@ -917,7 +1002,8 @@ export class MeshClient extends EventEmitter {
         const hello = buildFrame({
           type: "hello",
           from: this.alias,
-          rooms: [...this.joinedRooms],
+          rooms: [...this.joinedRooms.keys()],
+          role: helloRole,
           reservations: this.ownReservations.length > 0 ? [...this.ownReservations] : undefined,
           token: this.config.brokerToken !== undefined ? sha256(this.config.brokerToken) : undefined,
           clientVersion: MESH_VERSION, // M1: peers see each other's version
@@ -991,7 +1077,7 @@ export class MeshClient extends EventEmitter {
               this.debug("handshake: welcome received");
               resolve({
                 alias: this.alias,
-                rooms: frame.rooms ?? [...this.joinedRooms],
+                rooms: frame.rooms ?? [...this.joinedRooms.keys()],
                 peers: frame.peers ?? [],
                 mailboxCount: frame.mailboxCount ?? 0,
                 broker,
@@ -1008,6 +1094,18 @@ export class MeshClient extends EventEmitter {
         if (!settled) fail("broker_unavailable");
       });
     });
+    for (const [room, role] of this.joinedRooms) {
+      if (role === helloRole) continue;
+      if (socket.destroyed) throw new Error("connection_lost restoring room roles");
+      const frame = buildFrame({ type: "join", from: this.alias, room, role });
+      const ack = this.waitAck(frame.id);
+      socket.write(encodeFrame(frame, this.config.maxFrameBytes));
+      const result = await ack;
+      if (result.type === "error") {
+        socket.destroy();
+        throw new Error(`cannot restore ${room} role: ${result.code ?? "internal"}`);
+      }
+    }
 
     if (generation !== this.#connectionGeneration || signal?.aborted || this.socket !== socket || !this.online) {
       socket.destroy();
@@ -1335,7 +1433,7 @@ export class MeshClient extends EventEmitter {
   // "default" — sending into it would be refused as not_member).
     const room = opts.room ?? (this.joinedRooms.has(DEFAULT_ROOM)
       ? DEFAULT_ROOM
-      : [...this.joinedRooms][0]);
+      : this.joinedRooms.keys().next().value);
     if (room === undefined || !isValidRoom(room)) {
       return { status: "error", reason: "not_in_any_room" };
     }
@@ -1805,7 +1903,7 @@ export class MeshClient extends EventEmitter {
     const frame = buildFrame({ type: "join", from: this.alias, room, role });
     const ack = await this.roundTrip(frame);
     if (ack.type === "error") throw new Error(ack.code ?? "internal");
-    this.joinedRooms.add(room);
+    this.joinedRooms.set(room, role);
   }
 
   async leave(room: string): Promise<void> {

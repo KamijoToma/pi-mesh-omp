@@ -53,6 +53,12 @@ interface SlidingWindow {
   windowStart: number;
 }
 
+export interface MeshGuardsReloadState {
+  recent: [string, number][];
+  windows: [string, SlidingWindow][];
+  repliedTo: [string, number][];
+}
+
 export class MeshGuards {
   /** (to|room|bodyHash) → last send ts (anti-duplicate window). */
   private readonly recent = new Map<string, number>();
@@ -64,6 +70,20 @@ export class MeshGuards {
     private readonly limits: GuardRateLimits = DEFAULT_GUARD_LIMITS,
     private readonly now: () => number = Date.now,
   ) {}
+
+  snapshotForReload(): MeshGuardsReloadState {
+    return {
+      recent: [...this.recent],
+      windows: [...this.windows].map(([key, value]) => [key, { ...value }]),
+      repliedTo: [...this.repliedTo],
+    };
+  }
+
+  restoreAfterReload(state: MeshGuardsReloadState): void {
+    for (const [key, at] of state.recent) this.recent.set(key, at);
+    for (const [key, window] of state.windows) this.windows.set(key, { ...window });
+    for (const [key, at] of state.repliedTo) this.repliedTo.set(key, at);
+  }
 
   /**
   * track that we replied to a msgId. Returns a WARNING when the same

@@ -47,6 +47,8 @@ export declare class InboundBatcher {
     *  otherwise hold (a long tool call is running; more messages may come)
     *  and arm a max-hold fallback so nothing is retained forever. */
     private onWindow;
+    /** Move pending frames without injecting into the outgoing generation. */
+    takeForReload(): MeshFrame[];
     /** Flush everything now (called on tool_result: the busy period ended). */
     flushNow(): void;
     /** Discard the old graph's held messages without injecting them into a new graph. */

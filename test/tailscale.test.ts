@@ -255,6 +255,71 @@ describe("MeshClient tailnet lifecycle", { concurrency: false }, () => {
     } finally { await client.close(); await broker.close(); cli.cleanup(); }
   });
 
+  it("hot replacement retains the authenticated selection and existing reply targets", async (t) => {
+    const { broker, port } = await tcpBroker();
+    const cli = cliFixture(t, { status: status(), services: [service(port)] });
+    const client = new MeshClient({ alias: "alice", rooms: ["work"], noReconnect: true, config: config(cli.execPath, port) });
+    const peer = new MeshClient({
+      alias: "bob", rooms: ["work"], noReconnect: true,
+      config: { brokerUrl: `tcp://127.0.0.1:${port}`, brokerToken: "secret", meshId: "work" },
+    });
+    const restored = new MeshClient({
+      alias: "alice", noReconnect: true, strictAlias: true,
+      config: { brokerUrl: "tcp://127.0.0.1:1", brokerToken: "wrong", meshId: "wrong" },
+    });
+    const requests: MeshFrame[] = [];
+    const answers: MeshFrame[] = [];
+    client.on("inbound", (frame: MeshFrame) => requests.push(frame));
+    peer.on("inbound", (frame: MeshFrame) => answers.push(frame));
+    try {
+      await Promise.all([client.connect(), peer.connect()]);
+      const sent = await peer.send({ to: "alice", room: "work", message: "reply after code replacement" });
+      assert.ok(sent.status === "delivered");
+      await waitFor(() => requests.find((frame) => frame.id === sent.msgId));
+      await client.close();
+      restored.restoreAfterReload(client.snapshotForReload());
+      const welcome = await restored.connect();
+      assert.equal(welcome.broker?.brokerId, "broker-work");
+      assert.equal(restored.connectionTarget?.source, "tailscale-service");
+      const result = await restored.reply(sent.msgId, "authenticated old target preserved");
+      assert.equal(result.status, "delivered");
+      const answer = await waitFor(() => answers.find((frame) => frame.replyTo === sent.msgId));
+      assert.equal(answer.body, "authenticated old target preserved");
+    } finally {
+      await client.close(); await restored.close(); await peer.close();
+      await broker.close(); cli.cleanup();
+    }
+  });
+
+  it("hot replacement refuses a different broker even when discovery advertises the same mesh", async (t) => {
+    const first = await tcpBroker();
+    let replacement: RunningBroker | undefined;
+    const cli = cliFixture(t, { status: status(), services: [service(first.port)] });
+    const client = new MeshClient({ alias: "alice", noReconnect: true, config: config(cli.execPath, first.port) });
+    const restored = new MeshClient({ alias: "alice", noReconnect: true });
+    let ready = 0;
+    let inbound = 0;
+    restored.on("ready", () => { ready++; });
+    restored.on("inbound", () => { inbound++; });
+    try {
+      await client.connect();
+      await client.close();
+      restored.restoreAfterReload(client.snapshotForReload());
+      await first.broker.close();
+      replacement = (await tcpBroker("work", "replacement-broker", first.port)).broker;
+      cli.update({ status: status(), services: [service(first.port)] });
+      clearTailnetDiscoveryCache();
+      await assert.rejects(() => restored.connect(), /broker_mismatch.*expected broker-work/);
+      assert.equal(ready, 0);
+      assert.equal(inbound, 0);
+      await waitFor(() => !replacement!.state.peers.has("alice"));
+      assert.equal(replacement.state.peers.has("alice"), false);
+    } finally {
+      await client.close(); await restored.close();
+      await first.broker.close(); await replacement?.close(); cli.cleanup();
+    }
+  });
+
   it("wrong mesh and failed authentication never emit ready or enter the local graph", async (t) => {
     const dirs = makeTempDirs("mesh-tailnet-isolation-");
     const local = await startTestBroker(dirs.runtimeDir);

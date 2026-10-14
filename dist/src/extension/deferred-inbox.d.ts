@@ -1,6 +1,11 @@
 import type { MeshFrame } from "../protocol/envelope.js";
 import { type FormatOpts } from "./inbound.js";
 import type { ExtensionAPI } from "./pi-types.js";
+export interface DeferredInboxReloadState {
+    pending: MeshFrame[];
+    queued: MeshFrame[];
+    draining: boolean;
+}
 export declare class DeferredInbox {
     private readonly pi;
     private readonly formatFor;
@@ -14,6 +19,8 @@ export declare class DeferredInbox {
     /** Called once per accepted host batch, never again during prompt drain. */
     onInjected: (frames: readonly MeshFrame[]) => void);
     get count(): number;
+    snapshotForReload(): DeferredInboxReloadState;
+    restoreAfterReload(state: DeferredInboxReloadState): void;
     push(frame: MeshFrame): void;
     list(): string;
     private send;

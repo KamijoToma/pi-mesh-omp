@@ -1,5 +1,5 @@
 // extension/hud.ts — one compact mesh status row above the editor.
-import { truncateToWidth } from "@mariozechner/pi-tui";
+import { truncateToWidth } from "./tui.js";
 import type { StatusSnapshot } from "../client/client.js";
 import { DEFAULT_ROOM } from "../shared/config.js";
 import { agentColor } from "./colors.js";

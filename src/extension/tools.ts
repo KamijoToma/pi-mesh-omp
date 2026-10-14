@@ -25,6 +25,8 @@ import type { ExtensionAPI, SessionContext, ToolResult } from "./pi-types.js";
 import { textResult } from "./pi-types.js";
 import type { MeshTranscript } from "./transcript.js";
 
+import type { MeshInboundReloadState } from "./attach.js";
+
 /** Shared per-session runtime, built at session_start (index.ts). */
 export interface MeshRuntime {
   client: MeshClient;
@@ -50,7 +52,7 @@ export interface MeshRuntime {
   appendEntry?: (type: string, data: unknown) => void;
   /** pending auto-release timers per reserved pattern (mesh_reserve
   *  autoReleaseMs) — cleared on release and at session_shutdown. */
-  reserveTimers?: Map<string, NodeJS.Timeout>;
+  reserveTimers?: Map<string, { timer: NodeJS.Timeout; expiresAt: number }>;
   /** While set (ms epoch), inbound frames are HELD, not injected — the
    *  provider is rejecting turns (429) and every injection burns one. */
   rateLimitedUntil?: number;
@@ -60,6 +62,12 @@ export interface MeshRuntime {
   markDetached?: () => void;
   /** D41: clear the rate-limit hold timer (session_shutdown). */
   stopHold?: () => void;
+  /** Freeze inbound injection, then transfer the queues after the socket closes. */
+  pauseForReload?: () => void;
+  captureInboundForReload?: () => MeshInboundReloadState;
+  activateAfterReload?: () => void;
+  /** Force deliveries deferred until host-idle must finish before handover. */
+  isInboundReloadSafe?: () => boolean;
   /** Called by the context watchdog when a compaction is detected —
   *  lets attach.ts resync the mesh context block (conventions lost). */
   onCompactionDetected?: () => void;
@@ -936,11 +944,11 @@ const MESH_RESERVE_PARAMETERS: Record<string, unknown> = {
 };
 
 /** Arm one auto-release timer per freshly reserved pattern. */
-function armReserveTimers(rt: MeshRuntime, patterns: string[], ms: number): void {
+export function armReserveTimers(rt: MeshRuntime, patterns: string[], ms: number): void {
   rt.reserveTimers ??= new Map();
   for (const pattern of patterns) {
     const prev = rt.reserveTimers.get(pattern);
-    if (prev !== undefined) clearTimeout(prev);
+    if (prev !== undefined) clearTimeout(prev.timer);
     const t = setTimeout(() => {
       rt.reserveTimers?.delete(pattern);
       void rt.client.release([pattern]).catch(() => {}); // best effort
@@ -951,7 +959,7 @@ function armReserveTimers(rt: MeshRuntime, patterns: string[], ms: number): void
       }
     }, ms);
     t.unref();
-    rt.reserveTimers.set(pattern, t);
+    rt.reserveTimers.set(pattern, { timer: t, expiresAt: Date.now() + ms });
   }
 }
 
@@ -960,7 +968,7 @@ function clearReserveTimers(rt: MeshRuntime, patterns?: string[]): void {
   if (rt.reserveTimers === undefined) return;
   for (const [pattern, t] of [...rt.reserveTimers]) {
     if (patterns === undefined || patterns.includes(pattern)) {
-      clearTimeout(t);
+      clearTimeout(t.timer);
       rt.reserveTimers.delete(pattern);
     }
   }

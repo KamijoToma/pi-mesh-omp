@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import * as Tui from "@mariozechner/pi-tui";
+import { configureHostTui } from "../src/extension/tui.js";
 import { DeferredInbox } from "../src/extension/deferred-inbox.js";
 import { attachClientListeners } from "../src/extension/attach.js";
 import { MeshHud } from "../src/extension/hud.js";
@@ -7,6 +9,8 @@ import { MeshClient } from "../src/client/client.js";
 import type { MeshFrame } from "../src/protocol/envelope.js";
 import type { InboundMessage, SendMessageOptions, SessionHookHandler, SessionContext } from "../src/extension/pi-types.js";
 import type { MeshRuntime } from "../src/extension/tools.js";
+
+configureHostTui(Tui);
 
 const frame: MeshFrame = {
   v: 1, type: "msg", id: "m-deferred", from: "alice", ts: "2026-01-01T12:00:00Z",

@@ -21,6 +21,15 @@ export class DeferredInbox {
     get count() {
         return this.pending.length + this.queued.length;
     }
+    snapshotForReload() {
+        return { pending: [...this.pending], queued: [...this.queued], draining: this.draining };
+    }
+    restoreAfterReload(state) {
+        this.pending = [...state.pending];
+        this.queued = [...state.queued];
+        this.draining = state.draining;
+        this.changed(this.count);
+    }
     push(frame) {
         this.pending.push(frame);
         this.changed(this.count);

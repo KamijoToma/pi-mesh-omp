@@ -6,6 +6,7 @@ import { type MeshIdentity } from "../shared/identity-store.js";
 import type { MeshLedger } from "./ledger.js";
 import type { ExtensionAPI, SessionContext } from "./pi-types.js";
 import type { MeshTranscript } from "./transcript.js";
+import type { MeshInboundReloadState } from "./attach.js";
 /** Shared per-session runtime, built at session_start (index.ts). */
 export interface MeshRuntime {
     client: MeshClient;
@@ -33,7 +34,10 @@ export interface MeshRuntime {
     appendEntry?: (type: string, data: unknown) => void;
     /** pending auto-release timers per reserved pattern (mesh_reserve
     *  autoReleaseMs) — cleared on release and at session_shutdown. */
-    reserveTimers?: Map<string, NodeJS.Timeout>;
+    reserveTimers?: Map<string, {
+        timer: NodeJS.Timeout;
+        expiresAt: number;
+    }>;
     /** While set (ms epoch), inbound frames are HELD, not injected — the
      *  provider is rejecting turns (429) and every injection burns one. */
     rateLimitedUntil?: number;
@@ -43,6 +47,12 @@ export interface MeshRuntime {
     markDetached?: () => void;
     /** D41: clear the rate-limit hold timer (session_shutdown). */
     stopHold?: () => void;
+    /** Freeze inbound injection, then transfer the queues after the socket closes. */
+    pauseForReload?: () => void;
+    captureInboundForReload?: () => MeshInboundReloadState;
+    activateAfterReload?: () => void;
+    /** Force deliveries deferred until host-idle must finish before handover. */
+    isInboundReloadSafe?: () => boolean;
     /** Called by the context watchdog when a compaction is detected —
     *  lets attach.ts resync the mesh context block (conventions lost). */
     onCompactionDetected?: () => void;
@@ -116,5 +126,7 @@ export declare function formatPeerActivity(peer: {
     lastSeenAt?: string;
     reservations?: readonly unknown[];
 }, idleMs: number, stuckMs: number, now?: number): string;
+/** Arm one auto-release timer per freshly reserved pattern. */
+export declare function armReserveTimers(rt: MeshRuntime, patterns: string[], ms: number): void;
 export declare function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void;
 export { MAX_BODY_BYTES };

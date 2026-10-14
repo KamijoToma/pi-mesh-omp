@@ -19,6 +19,10 @@ interface HintState {
   count: number;
 }
 
+export interface ReplyHintReloadState {
+  seen: [string, HintState][];
+}
+
 export class ReplyHintTracker {
   private readonly seen = new Map<string, HintState>();
 
@@ -28,6 +32,14 @@ export class ReplyHintTracker {
     private readonly every: number = HINT_EVERY,
     private readonly cap: number = HINT_TRACKER_CAP,
   ) {}
+
+  snapshotForReload(): ReplyHintReloadState {
+    return { seen: [...this.seen].map(([sender, state]) => [sender, { ...state }]) };
+  }
+
+  restoreAfterReload(state: ReplyHintReloadState): void {
+    for (const [sender, hint] of state.seen) this.seen.set(sender, { ...hint });
+  }
 
   /** True when THIS frame should carry the full reply instruction. */
   shouldShow(from: string | undefined): boolean {

@@ -2,9 +2,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { visibleWidth } from "@mariozechner/pi-tui";
+import * as Tui from "@mariozechner/pi-tui";
+import { configureHostTui } from "../src/extension/tui.js";
 import { colorizeAliases, renderLiveEntry, renderMeshInbound, renderVerdictEntry } from "../src/extension/renderer.js";
 
 import { agentColor } from "../src/extension/colors.js";
+
+configureHostTui(Tui);
 
 const theme = {
   fg: (color: string, text: string) => `<${color}>${text}</${color}>`,

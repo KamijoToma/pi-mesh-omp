@@ -16,6 +16,13 @@ export class ReplyHintTracker {
         this.every = every;
         this.cap = cap;
     }
+    snapshotForReload() {
+        return { seen: [...this.seen].map(([sender, state]) => [sender, { ...state }]) };
+    }
+    restoreAfterReload(state) {
+        for (const [sender, hint] of state.seen)
+            this.seen.set(sender, { ...hint });
+    }
     /** True when THIS frame should carry the full reply instruction. */
     shouldShow(from) {
         if (from === undefined || from === "")

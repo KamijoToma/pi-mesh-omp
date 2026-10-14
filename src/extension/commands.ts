@@ -31,6 +31,7 @@ const HELP_TEXT = [
   "/mesh inbox [flush]   — list deferred broadcasts, or deliver them now",
   "/mesh tailscale status|discover|doctor",
   "/mesh tailscale join <mesh-id> [--service svc:NAME | --host HOST | --tag tag:NAME] [--port PORT]",
+  "/mesh reload          — load the built version without restarting the host (waits for idle)",
   "/mesh help",
 ].join("\n");
 
