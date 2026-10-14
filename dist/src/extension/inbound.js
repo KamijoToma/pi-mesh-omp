@@ -129,6 +129,16 @@ function buildInboundMessage(frame, opts = {}) {
         details: inboundDetails(frame),
     };
 }
+/** Delivery callbacks must not turn an accepted host send into a retry. */
+function sendInjectedInbound(pi, message, options, opts) {
+    pi.sendMessage(message, options);
+    try {
+        opts.onInjected?.();
+    }
+    catch {
+        // The host already accepted the message; bookkeeping is best effort.
+    }
+}
 /**
  * Deliver a message once the host reports idle, polling every `pollMs` up to
  * `maxMs`. Used for force: after ctx.abort the steer queue may be purged by
@@ -144,19 +154,27 @@ export function deliverWhenIdle(pi, ctx, frame, opts = {}, pollMs = FORCE_IDLE_P
         if (sent)
             return;
         if ((typeof ctx.isIdle === "function" && ctx.isIdle()) || Date.now() >= deadline) {
+            sendInjectedInbound(pi, message, { triggerTurn: true, deliverAs: "steer" }, opts);
             sent = true;
-            pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
             return;
         }
-        const t = setTimeout(trySend, pollMs);
+        const t = setTimeout(() => {
+            try {
+                trySend();
+            }
+            catch {
+                // A later stale/failed host send cannot throw into the caller's retry.
+                sent = true;
+            }
+        }, pollMs);
         t.unref();
     };
     trySend();
 }
 /**
- * Inject one inbound msg/mailbox/remind frame into the Pi session.
+ * Inject one inbound msg/mailbox/reply/remind frame into the Pi session.
  * force: controlled abort ONLY when the host exposes abort AND reports busy
- * (ctx.isIdle === false), then deliver once idle. Never throws.
+ * (ctx.isIdle === false), then deliver once idle. Synchronous host failures throw.
  * force+interrupt: the dedicated repeater path (deliverInterrupted).
  */
 export function injectInbound(pi, ctx, frame, opts = {}) {
@@ -179,8 +197,9 @@ export function injectInbound(pi, ctx, frame, opts = {}) {
                 ? "followUp"
                 : mapReplyDelivery(frame);
     if (isReceipt) {
-        pi.sendMessage(buildInboundMessage(frame, opts), { triggerTurn: false, deliverAs: "followUp" });
-        return { message: buildInboundMessage(frame, opts), deliverAs, aborted: false };
+        const message = buildInboundMessage(frame, opts);
+        sendInjectedInbound(pi, message, { triggerTurn: false, deliverAs: "followUp" }, opts);
+        return { message, deliverAs, aborted: false };
     }
     let aborted = false;
     if (priority === "force" &&
@@ -197,39 +216,38 @@ export function injectInbound(pi, ctx, frame, opts = {}) {
         deliverWhenIdle(pi, ctx, frame, opts);
         return { message: buildInboundMessage(frame, opts), deliverAs: "steer", aborted };
     }
-    pi.sendMessage(buildInboundMessage(frame, opts), { triggerTurn: true, deliverAs });
-    return { message: buildInboundMessage(frame, opts), deliverAs, aborted };
+    const message = buildInboundMessage(frame, opts);
+    sendInjectedInbound(pi, message, { triggerTurn: true, deliverAs }, opts);
+    return { message, deliverAs, aborted };
 }
-/**
- * Side effects that ALWAYS run per frame (never batched): transcript,
- * ledger, read receipt, replyChain tagging..
- */
-export function handleInboundSideEffects(frame, deps) {
+/** Tag reply-to-reply context before formatting, without claiming delivery. */
+export function tagInboundReplyChain(frame, deps) {
     const replyChain = frame.type === "reply" &&
         frame.replyTo !== undefined &&
         deps.isReplyToReply?.(frame.replyTo) === true;
-    frame.__replyChain = replyChain;
+    // Internal formatting annotation, shared with the batch formatter.
+    const taggedFrame = frame;
+    taggedFrame.__replyChain = replyChain;
 }
 export function handleInboundFrame(pi, ctx, frame, deps) {
-    try {
-        handleInboundSideEffects(frame, deps);
+    tagInboundReplyChain(frame, deps);
+    const inject = () => {
         injectInbound(pi, ctx, frame, {
             ...(deps.format ?? {}),
-            replyChain: frame.__replyChain === true,
+            replyChain: "__replyChain" in frame && frame.__replyChain === true,
+            onInjected: () => recordInboundDelivery(frame, deps),
         });
+    };
+    try {
+        inject();
     }
     catch {
-        // one bounded retry: a transient host state (turn teardown, reload
-        // boundary) must not silently eat a frame the broker already acked
-        // delivered. If the retry throws too, the failure is counted — one bad
-        // frame must not kill the loop.
+        // One bounded retry for a transient host state. Neither a failed attempt
+        // nor a pending retry is a read: bookkeeping runs only after injection.
         const delay = deps.retryMs ?? INJECTION_RETRY_MS;
         const t = setTimeout(() => {
             try {
-                injectInbound(pi, ctx, frame, {
-                    ...(deps.format ?? {}),
-                    replyChain: frame.__replyChain === true,
-                });
+                inject();
             }
             catch {
                 deps.counters.injectionFailures += 1;
@@ -237,6 +255,9 @@ export function handleInboundFrame(pi, ctx, frame, deps) {
         }, delay);
         t.unref();
     }
+}
+/** Persist hash-only metadata and acknowledge a successfully injected frame. */
+export function recordInboundDelivery(frame, deps) {
     // the message reached the session → honest read receipt back to the
     // sender (msg/mailbox only — replies and reminds are not 'new' messages).
     if (deps.read !== undefined && (frame.type === "msg" || frame.type === "mailbox")) {
@@ -292,7 +313,7 @@ function deliverInterrupted(pi, ctx, frame, opts) {
         }
     };
     const deliver = () => {
-        pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+        sendInjectedInbound(pi, message, { triggerTurn: true, deliverAs: "steer" }, opts);
     };
     // "Never throws" holds for the ASYNC path too: aborts and deliveries run
     // inside timer callbacks the caller's guarded() can never catch — a host
@@ -309,25 +330,26 @@ function deliverInterrupted(pi, ctx, frame, opts) {
     const safeDeliver = () => {
         try {
             deliver();
+            return true;
         }
         catch {
-            // stale ctx — nothing more we can do; the report still fires
+            return false; // No accepted host send, so no delivery report or read.
         }
     };
     const canAbort = ctx !== null && typeof ctx.abort === "function" && typeof ctx.isIdle === "function";
     if (!canAbort) {
         // No abort surface on this host (mode-dependent): the message still
         // goes out as a steer, queued behind whatever is running — said as is.
-        safeDeliver();
-        report("abort_unavailable", 0, 0);
+        if (safeDeliver())
+            report("abort_unavailable", 0, 0);
         return { message, deliverAs: "steer", aborted: false };
     }
     const c = ctx;
     // first abort — guarded by a fresh !isIdle check (tiny settle race)
     let aborts = 0;
     if (c.isIdle()) {
-        safeDeliver();
-        report("already_idle", 0, 0);
+        if (safeDeliver())
+            report("already_idle", 0, 0);
         return { message, deliverAs: "steer", aborted: false };
     }
     if (safeAbort())
@@ -359,8 +381,8 @@ function deliverInterrupted(pi, ctx, frame, opts) {
         clearTimeout(cap);
         for (const t of reabortTimers)
             clearTimeout(t);
-        safeDeliver();
-        report(c.isIdle() ? "aborted" : "still_busy", aborts, Date.now() - start);
+        if (safeDeliver())
+            report(c.isIdle() ? "aborted" : "still_busy", aborts, Date.now() - start);
     };
     const poll = setInterval(() => {
         if (c.isIdle() || Date.now() - start >= maxMs)

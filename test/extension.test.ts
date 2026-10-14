@@ -98,7 +98,7 @@ describe("extension inbound handler (T-B1)", () => {
   // the worst outcome once the broker already acked delivered
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(c.injectionFailures, 1);
-    assert.equal(ledgerAppends, 1, "ledger still records the frame");
+    assert.equal(ledgerAppends, 0, "a failed injection is not a delivered inbound record");
     // the handler is still usable for the NEXT frame
     const sent: InboundMessage[] = [];
     handleInboundFrame(fakePi(sent), null, msgFrame(), {

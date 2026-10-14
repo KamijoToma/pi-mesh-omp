@@ -2,14 +2,16 @@
 // mailbox, rate limits, policy. Stateless in-memory (rooms/mailbox are
 // re-declared by clients at hello).
 // Run directly (`node dist/src/broker/broker.js`) or via startBroker({config, policy}) in tests.
+import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { buildFrame, parseFrameLine, } from "../protocol/envelope.js";
 import { encodeFrame, FrameDecoder, FrameSizeError, makeMsgId, sha256 } from "../protocol/frames.js";
-import { DEFAULT_MAX_FRAME_BYTES, DEFAULT_ROOM, parseEndpoint, HELLO_TIMEOUT_MS, MAILBOX_PURGE_INTERVAL_MS, SWEEP_INTERVAL_MS, WRITE_TIMEOUT_MS, loadConfig, } from "../shared/config.js";
+import { DEFAULT_MAX_FRAME_BYTES, DEFAULT_ROOM, isBrokerId, isMeshId, parseEndpoint, HELLO_TIMEOUT_MS, MAILBOX_PURGE_INTERVAL_MS, SWEEP_INTERVAL_MS, WRITE_TIMEOUT_MS, loadConfig, } from "../shared/config.js";
 import { brokerLockPath, brokerSocketPath, runtimeDir, stateDir } from "../shared/paths.js";
+import { loadOrCreateBrokerId } from "../shared/broker-identity.js";
 import { enqueueMailbox, flushMailbox, purgeAllExpired } from "./mailbox.js";
 import { evaluatePolicy, loadPolicy } from "./policy.js";
 import { checkRate } from "./ratelimit.js";
@@ -48,6 +50,14 @@ function writeFrame(socket, frame, maxBytes, cb) {
 }
 export function createBroker(options) {
     const { config, policy } = options;
+    const meshId = config.meshId ?? "default";
+    const brokerId = config.brokerId ?? randomUUID();
+    if (!isMeshId(meshId) || !isBrokerId(brokerId)) {
+        throw new Error("broker_identity_invalid: invalid meshId or brokerId");
+    }
+    // Library brokers are ephemeral unless the caller supplies an ID. Only
+    // standalone main reads/writes the state directory.
+    const brokerInfo = { meshId, brokerId, bootId: randomUUID() };
     const sockPath = options.socketPath ?? brokerSocketPath();
     const state = new BrokerState();
     const tcp = options.tcpListen;
@@ -193,6 +203,11 @@ export function createBroker(options) {
                 return;
             }
         }
+        if (frame.meshId !== undefined && frame.meshId !== brokerInfo.meshId) {
+            sendError(socket, "mesh_mismatch", frame.id);
+            socket.destroy();
+            return;
+        }
         const existing = state.peers.get(alias);
         if (existing && existing.socket !== socket && !existing.socket.destroyed) {
             sendError(socket, "alias_taken", frame.id); // same-tick refusal
@@ -251,6 +266,7 @@ export function createBroker(options) {
             rooms: [...peer.rooms.keys()],
             peers: peersSnapshot(state),
             mailboxCount: mailboxFrames.length,
+            broker: brokerInfo,
         }));
         for (const mf of mailboxFrames)
             sendTo(peer, mf); // mailbox frames right after welcome
@@ -516,6 +532,7 @@ export function createBroker(options) {
                 sendTo(peer, buildFrame({
                     type: "status_res",
                     id: frame.id,
+                    broker: brokerInfo,
                     peers: peersSnapshot(state, frame.room),
                     rooms: [...state.rooms.keys()],
                     // M2: broker counters ride along — relayed/refused/mailbox
@@ -865,6 +882,7 @@ export async function main() {
         }
     }
     const config = loadConfig(sDir);
+    config.brokerId = loadOrCreateBrokerId(sDir, config.brokerId);
     const policy = loadPolicy(sDir);
     // D38: honor MESH_LISTEN / config.listen (validated by loadConfig — only
     // well-formed endpoints land here). tcp:// or tls:// opens the mesh to

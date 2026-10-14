@@ -8,7 +8,7 @@ import { buildBatchMessage, bypassesBatch, batchDetails, InboundBatcher } from "
 import { DeferredInbox } from "./deferred-inbox.js";
 import { classifyInbound } from "./inbound-policy.js";
 import type { MeshHud } from "./hud.js";
-import { handleInboundSideEffects, injectInbound, type FormatOpts, type InjectOpts } from "./inbound.js";
+import { tagInboundReplyChain, recordInboundDelivery, injectInbound, type FormatOpts, type InjectOpts } from "./inbound.js";
 import { ReplyHintTracker } from "./reply-hints.js";
 import type { ExtensionAPI, InboundMessage, SessionContext } from "./pi-types.js";
 import type { MeshRuntime } from "./tools.js";
@@ -149,7 +149,10 @@ export function attachClientListeners(
   // Force delivery can keep polling after the initial guarded call returns.
   // Keep every later send/abort scoped to this runtime, not the next session.
   const deliveryHost: Pick<ExtensionAPI, "sendMessage"> = {
-    sendMessage: (message, options) => guarded(() => pi.sendMessage(message, options)),
+    sendMessage: (message, options) => {
+      if (!active()) throw new Error("mesh inbound session is no longer active");
+      pi.sendMessage(message, options);
+    },
   };
   const deliveryContext: SessionContext = {
     cwd: ctx.cwd,
@@ -157,8 +160,14 @@ export function attachClientListeners(
     abort: ctx.abort === undefined ? undefined : () => {
       if (active()) (rt.ctx ?? ctx).abort?.();
     },
-    isIdle: ctx.isIdle === undefined ? undefined : () =>
-      !active() || (rt.ctx ?? ctx).isIdle?.() !== false,
+    isIdle: ctx.isIdle === undefined ? undefined : () => {
+      if (!active()) return true;
+      try {
+        return (rt.ctx ?? ctx).isIdle?.() !== false;
+      } catch {
+        return true; // Let the guarded host send reject a stale context.
+      }
+    },
   };
 
   const deps = {
@@ -190,15 +199,18 @@ export function attachClientListeners(
         },
         { triggerTurn: true, deliverAs: batch.deliverAs },
       );
+      for (const frame of frames) recordInboundDelivery(frame, deps);
     });
   },
   );
-  const deferredInbox = new DeferredInbox(pi, (frame) =>
+  const deferredInbox = new DeferredInbox(deliveryHost, (frame) =>
     formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker),
   (count) => guarded(() => {
     const currentCtx = rt.ctx ?? ctx;
     if (currentCtx.mode === "tui") currentCtx.ui.setStatus("mesh-inbox", count > 0 ? `mesh:deferred ${count}` : undefined);
-  }));
+  }), (frames) => {
+    for (const frame of frames) recordInboundDelivery(frame, deps);
+  });
   rt.deferredInbox = deferredInbox;
   guarded(() => {
     const currentCtx = rt.ctx ?? ctx;
@@ -209,7 +221,7 @@ export function attachClientListeners(
   // turn. They are queued and delivered when the hold expires.
   const heldFrames: { frame: MeshFrame; matchedReply: boolean }[] = [];
   const deliver = (frame: MeshFrame, matchedReply: boolean): void => {
-    handleInboundSideEffects(frame, deps);
+    tagInboundReplyChain(frame, deps);
     getHud()?.noteInbound(frame); // preview: transient memory only, never persisted
     if (classifyInbound(frame, client.alias, client.inboundBroadcasts, matchedReply) === "deferred") {
       deferredInbox.push(frame);
@@ -222,7 +234,8 @@ export function attachClientListeners(
       batcher.flushNow(); // deliver any pending batch first (ordering)
       const injectOpts: InjectOpts = {
         ...opts,
-        replyChain: (frame as unknown as { __replyChain?: boolean }).__replyChain === true,
+        replyChain: "__replyChain" in frame && frame.__replyChain === true,
+        onInjected: () => recordInboundDelivery(frame, deps),
       };
       // force+interrupt: wire the honest report (receipt + local notify +
       // memory-only counters) before injection runs its repeater path
@@ -296,6 +309,20 @@ export function attachClientListeners(
     deliver(frame, meta?.matchedReply === true);
   });
   rt.batcher = batcher;
+  rt.clearInbound = () => {
+    heldFrames.length = 0;
+    batcher.clear();
+    deferredInbox.clear();
+    lastPeersOnline.clear();
+    liveCooldowns.clear();
+    fullContextSent = false;
+  };
+  client.on("broker_restart", () => {
+    guarded(() => (rt.ctx ?? ctx).ui.notify(
+      "mesh broker restarted: peers will re-register; the previous broker's in-memory mailbox is not recovered",
+      "warning",
+    ));
+  });
 
   // presence → appendEntry ONLY, no turn
   client.on("presence", (frame: MeshFrame) => {

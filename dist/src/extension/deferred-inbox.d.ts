@@ -5,10 +5,14 @@ export declare class DeferredInbox {
     private readonly pi;
     private readonly formatFor;
     private readonly changed;
+    /** Called once per accepted host batch, never again during prompt drain. */
+    private readonly onInjected;
     private pending;
     private queued;
     private draining;
-    constructor(pi: Pick<ExtensionAPI, "sendMessage">, formatFor: (frame: MeshFrame) => FormatOpts, changed: (count: number) => void);
+    constructor(pi: Pick<ExtensionAPI, "sendMessage">, formatFor: (frame: MeshFrame) => FormatOpts, changed: (count: number) => void, 
+    /** Called once per accepted host batch, never again during prompt drain. */
+    onInjected: (frames: readonly MeshFrame[]) => void);
     get count(): number;
     push(frame: MeshFrame): void;
     list(): string;

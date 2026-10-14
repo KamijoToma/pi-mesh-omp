@@ -13,6 +13,7 @@ import {
   isValidRoom,
   normalizeAlias,
   parseFrameLine,
+  type BrokerInfo,
   type FileReservation,
   type MeshFrame,
   type MeshPeerInfo,
@@ -23,7 +24,7 @@ import { encodeFrame, FrameDecoder, sha256 } from "../protocol/frames.js";
 import {
   ACK_TIMEOUT_MS,
   ALIAS_RAND_CHARS,
-  parseEndpoint,
+  type MeshEndpoint,
   DEFAULT_AWAIT_REPLY_TIMEOUT_MS,
   DEFAULT_CONFIG,
   DEFAULT_ROOM,
@@ -42,12 +43,14 @@ import { runtimeDir, stateDir } from "../shared/paths.js";
 import { MESH_VERSION } from "../shared/version.js";
 import { PendingReplies } from "./pending.js";
 import { backoffMs, ensureBroker } from "./reconnect.js";
+import { resolveConnection, type ResolvedConnection } from "../tailscale/adapter.js";
 
 export interface WelcomeInfo {
   alias: string;
   rooms: string[];
   peers: MeshPeerInfo[];
   mailboxCount: number;
+  broker?: BrokerInfo;
 }
 
 export interface StatusSnapshot {
@@ -55,6 +58,7 @@ export interface StatusSnapshot {
   rooms: string[];
   /** M2: broker counters (status_res) — relayed/refused/mailbox. */
   stats?: { relayed: number; refused: number; mailboxDelivered: number; mailboxDropped: number };
+  broker?: BrokerInfo;
 }
 
 export interface SendOpts {
@@ -224,7 +228,7 @@ export class MeshClient extends EventEmitter {
   /** All rooms this client is (or will be) a member of — re-declared at hello. */
   private readonly joinedRooms: Set<string>;
   private readonly runtimeDir: string;
-  private readonly config: MeshConfig;
+  private config: MeshConfig;
   private readonly noReconnect: boolean;
   private readonly strictAlias: boolean;
 
@@ -240,6 +244,16 @@ export class MeshClient extends EventEmitter {
   *  (observed once on a remote TCP client: socket gone, no retry). */
   private watchdogTimer: NodeJS.Timeout | null = null;
   private helloTimer: NodeJS.Timeout | null = null;
+  #connectionTarget: ResolvedConnection | null = null;
+  #brokerInfo: BrokerInfo | undefined;
+  #connectionError: string | undefined;
+  #pinnedBrokerId: string | undefined;
+  #refreshDiscovery = false;
+  #connectionGeneration = 0;
+  #connectAbort: AbortController | null = null;
+  #selectionGeneration = 0;
+  #selection: Promise<WelcomeInfo> | null = null;
+  #socketClosing: Promise<void> | null = null;
 
   private readonly ackWaiters = new Map<string, AckWaiter>();
   private readonly statusWaiters = new Map<string, AckWaiter>();
@@ -252,6 +266,7 @@ export class MeshClient extends EventEmitter {
    *  LAUNCH answers skip session injection (the verdict carries that
    *  batch). */
   private waitAllInFlight = 0;
+  private readonly waitAllCancels = new Set<() => void>();
   /** Memory-only ring buffer of last frames (bodies included) for mesh_history. */
   readonly transcript: MeshFrame[] = [];
   /** Own file reservations — declared at hello, updated via reserve/release. */
@@ -320,6 +335,18 @@ export class MeshClient extends EventEmitter {
 
   get alias(): string {
     return this.aliasInternal;
+  }
+
+  get connectionTarget(): ResolvedConnection | null {
+    return this.#connectionTarget;
+  }
+
+  get brokerInfo(): BrokerInfo | undefined {
+    return this.#brokerInfo;
+  }
+
+  get connectionError(): string | undefined {
+    return this.#connectionError;
   }
 
   /** All rooms this client is a member of (re-declared at every hello). */
@@ -431,12 +458,19 @@ export class MeshClient extends EventEmitter {
       if (now - Date.parse(m.at) <= RECENT_ANSWER_WINDOW_MS) targets.add(id);
     }
     const targetList = [...targets];
+    if (this.#selection !== null || this.intentionallyClosed) {
+      return this.summarize(start, "cancelled", targetList);
+    }
     this.waitAllInFlight += 1; // answers arriving now are carried by the verdict
     return new Promise((resolve) => {
       let settled = false;
+      let timer: NodeJS.Timeout | null = null;
       const done = (status: "complete" | "timeout" | "cancelled"): void => {
         if (settled) return;
         settled = true;
+        clearTimeout(timer ?? undefined);
+        timer = null;
+        this.waitAllCancels.delete(onAbort);
         this.waitAllInFlight -= 1;
         if (signal !== undefined) signal.removeEventListener("abort", onAbort);
         if (status !== "cancelled") {
@@ -460,6 +494,7 @@ export class MeshClient extends EventEmitter {
         resolve(this.summarize(start, status, targetList));
       };
       const onAbort = (): void => done("cancelled");
+      this.waitAllCancels.add(onAbort);
       if (signal !== undefined) {
         if (signal.aborted) {
           done("cancelled");
@@ -468,6 +503,7 @@ export class MeshClient extends EventEmitter {
         signal.addEventListener("abort", onAbort, { once: true });
       }
       const tick = (): void => {
+        if (settled) return;
         const missing = targetList.filter((id) => this.awaitedMissions.get(id)?.answered !== true);
         if (missing.length === 0) {
           done("complete");
@@ -477,8 +513,8 @@ export class MeshClient extends EventEmitter {
           done("timeout");
           return;
         }
-        const t = setTimeout(tick, 200);
-        t.unref();
+        timer = setTimeout(tick, 200);
+        timer.unref();
       };
       tick();
     });
@@ -681,20 +717,97 @@ export class MeshClient extends EventEmitter {
   // ---- connection lifecycle ----
 
   connect(): Promise<WelcomeInfo> {
+    if (this.#selection !== null) return this.#selection;
+    return this.#connectSelected();
+  }
+
+  #connectSelected(): Promise<WelcomeInfo> {
     if (this.online && this.socket) {
       return Promise.resolve({
         alias: this.alias,
         rooms: [...this.joinedRooms],
         peers: [],
         mailboxCount: 0,
+        broker: this.#brokerInfo,
       });
     }
-  // explicit connect re-arms auto-reconnect after a prior close
+    if (this.connecting !== null) return this.connecting;
+    // An explicit connect re-arms after close; automatic retries never do.
     this.intentionallyClosed = false;
-    this.connecting ??= this.doConnectWithAliasFallback().finally(() => {
-      this.connecting = null;
+    clearTimeout(this.reconnectTimer ?? undefined);
+    this.reconnectTimer = null;
+    const generation = this.#connectionGeneration;
+    const controller = new AbortController();
+    this.#connectAbort = controller;
+    const connection = this.doConnectWithAliasFallback(generation, controller.signal)
+      .catch((error: unknown) => {
+        if (generation === this.#connectionGeneration && !controller.signal.aborted) {
+          this.#connectionError = error instanceof Error ? error.message : String(error);
+          if (this.config.brokerUrl === undefined && this.config.tailscale?.mode !== undefined && this.config.tailscale.mode !== "off") {
+            this.#refreshDiscovery = true;
+          }
+          if (this.socket?.destroyed) this.socket = null;
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (this.connecting !== connection) return;
+        this.connecting = null;
+        this.#connectAbort = null;
+        if (!this.online && generation === this.#connectionGeneration && !controller.signal.aborted) this.#scheduleReconnect();
+      });
+    this.connecting = connection;
+    return connection;
+  }
+
+  /** Select a new graph atomically for public connect/send callers.
+   * A later selection or explicit close cancels this one; it never joins
+   * itself through the public connect barrier. */
+  selectTailnet(config: MeshConfig): Promise<WelcomeInfo> {
+    const generation = ++this.#selectionGeneration;
+    const selecting = Promise.resolve().then(async () => {
+      if (generation !== this.#selectionGeneration) throw new Error("connection_cancelled");
+      await this.#closeConnection();
+      if (generation !== this.#selectionGeneration) throw new Error("connection_cancelled");
+      this.config = { ...config, rooms: [...this.joinedRooms] };
+      this.#connectionTarget = null;
+      this.#brokerInfo = undefined;
+      this.#pinnedBrokerId = undefined;
+      this.#connectionError = undefined;
+      this.#refreshDiscovery = true;
+      this.reconnectAttempt = 0;
+      this.outbox.length = 0;
+      this.inbox.clear();
+      this.cancelAllAwaited();
+      this.awaitedMissions.clear();
+      this.reportedMissions.clear();
+      this.readBy.clear();
+      this.sentReplies.clear();
+      this.handledReplyTargets.clear();
+      this.transcript.length = 0;
+      this.#clearPeerCaches();
+      return this.#connectSelected();
+    }).finally(() => {
+      if (this.#selection === selecting) this.#selection = null;
     });
-    return this.connecting;
+    this.#selection = selecting;
+    return selecting;
+  }
+
+  #clearPeerCaches(): void {
+    this.peerReservations.clear();
+    this.peerActivity.clear();
+    this.knownPeers.clear();
+  }
+
+  #awaitConnection<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal === undefined) return operation;
+    return new Promise((resolve, reject) => {
+      const abort = (): void => reject(new Error("connection_cancelled"));
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+      operation.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    });
   }
 
   /**
@@ -706,15 +819,16 @@ export class MeshClient extends EventEmitter {
   * random alias instead of looping forever. Emits `alias_fallback` so the
   * extension can notify the user and persist the new identity.
   */
-  private async doConnectWithAliasFallback(): Promise<WelcomeInfo> {
+  private async doConnectWithAliasFallback(generation: number, signal: AbortSignal): Promise<WelcomeInfo> {
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await this.doConnect();
+        return await this.doConnect(generation, signal);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        if (signal.aborted || generation !== this.#connectionGeneration) throw new Error("connection_cancelled");
         if (!msg.includes("alias_taken")) throw err;
         if (attempt < ALIAS_RETRY_ATTEMPTS) {
-          await sleepMs(ALIAS_RETRY_DELAY_MS * 2 ** attempt);
+          await this.#awaitConnection(sleepMs(ALIAS_RETRY_DELAY_MS * 2 ** attempt), signal);
           continue;
         }
         // strictAlias: keep the transient RETRIES (a mid-close race must not
@@ -726,7 +840,7 @@ export class MeshClient extends EventEmitter {
         const previous = this.aliasInternal;
         this.aliasInternal = defaultAlias();
         try {
-          const welcome = await this.doConnect();
+          const welcome = await this.doConnect(generation, signal);
           this.emit("alias_fallback", { from: previous, to: this.aliasInternal });
           return welcome;
         } catch {
@@ -737,10 +851,12 @@ export class MeshClient extends EventEmitter {
     }
   }
 
-  private async doConnect(): Promise<WelcomeInfo> {
-  // explicit broker URL (tcp/tls/unix) → connect there; otherwise the
-  // local auto-spawned broker (ensureBroker).
-    const endpoint = this.config.brokerUrl !== undefined ? parseEndpoint(this.config.brokerUrl) : null;
+  private async doConnect(generation: number, signal: AbortSignal): Promise<WelcomeInfo> {
+    const target = await this.#awaitConnection(resolveConnection(this.config, { refresh: this.#refreshDiscovery }), signal);
+    if (generation !== this.#connectionGeneration || signal?.aborted) throw new Error("connection_cancelled");
+    this.#connectionTarget = target;
+    this.#refreshDiscovery = false;
+    const endpoint: MeshEndpoint | null = target.endpoint;
     let socket: Socket;
     if (endpoint !== null && (endpoint.kind === "tcp" || endpoint.kind === "tls")) {
       const opts = {
@@ -757,11 +873,12 @@ export class MeshClient extends EventEmitter {
     } else if (endpoint !== null && endpoint.kind === "unix") {
       socket = net.createConnection(endpoint.path);
     } else {
-      const sockPath = await ensureBroker(this.runtimeDir); // throws broker_unavailable 
+      const sockPath = await this.#awaitConnection(ensureBroker(this.runtimeDir), signal);
+      if (generation !== this.#connectionGeneration || signal?.aborted) throw new Error("connection_cancelled");
       socket = net.createConnection(sockPath);
     }
     this.socket = socket;
-    this.debug(`doConnect: socket created → ${this.config.brokerUrl ?? "local unix"}`);
+    this.debug(`doConnect: socket created → ${target.url ?? "local socket/pipe"}`);
   // persistent error listener — a write racing a broker-side destroy
   // (e.g. invalid_token: broker answers + closes) must never surface as an
   // unhandled 'error' event after the handshake promise already settled.
@@ -773,17 +890,27 @@ export class MeshClient extends EventEmitter {
 
     const welcome = await new Promise<WelcomeInfo>((resolve, reject) => {
       let settled = false;
+      let accepted = false;
+      const cancelled = (): boolean => generation !== this.#connectionGeneration || signal?.aborted === true;
       const fail = (reason: string): void => {
         if (settled) return;
         settled = true;
         clearTimeout(this.helloTimer ?? undefined);
+        signal?.removeEventListener("abort", abort);
+        if (this.socket === socket) this.socket = null;
         socket.destroy();
         reject(new Error(reason));
       };
+      const abort = (): void => fail("connection_cancelled");
+      signal?.addEventListener("abort", abort, { once: true });
       this.helloTimer = setTimeout(() => fail("timeout: hello handshake"), HELLO_TIMEOUT_MS);
       this.helloTimer.unref();
 
       socket.once("connect", () => {
+        if (cancelled()) {
+          fail("connection_cancelled");
+          return;
+        }
         const hello = buildFrame({
           type: "hello",
           from: this.alias,
@@ -791,11 +918,16 @@ export class MeshClient extends EventEmitter {
           reservations: this.ownReservations.length > 0 ? [...this.ownReservations] : undefined,
           token: this.config.brokerToken !== undefined ? sha256(this.config.brokerToken) : undefined,
           clientVersion: MESH_VERSION, // M1: peers see each other's version
+          meshId: target.meshId,
         });
         socket.write(encodeFrame(hello, this.config.maxFrameBytes));
       });
       socket.once("error", () => fail("broker_unavailable"));
       socket.on("data", (chunk) => {
+        if (cancelled()) {
+          fail("connection_cancelled");
+          return;
+        }
         let lines: string[];
         try {
           lines = decoder.push(chunk);
@@ -809,7 +941,31 @@ export class MeshClient extends EventEmitter {
           const frame = parsed.frame;
           if (!settled) {
             if (frame.type === "welcome") {
+              const discovered = target.source === "tailscale-service" || target.source === "tailscale-node";
+              const broker = frame.broker;
+              if (broker === undefined && (discovered || target.meshId !== undefined || this.config.brokerId !== undefined)) {
+                fail("broker_metadata_missing: selected broker did not return mesh/broker identity");
+                return;
+              }
+              if (broker !== undefined) {
+                if (target.meshId !== undefined && broker.meshId !== target.meshId) {
+                  fail(`mesh_mismatch: expected ${target.meshId}, received ${broker.meshId}`);
+                  return;
+                }
+                const expected = this.config.brokerId ?? (discovered ? this.#pinnedBrokerId : undefined);
+                if (expected !== undefined && broker.brokerId !== expected) {
+                  fail(`broker_mismatch: expected ${expected}, received ${broker.brokerId}`);
+                  return;
+                }
+              }
+              const previous = this.#brokerInfo;
+              this.#brokerInfo = broker;
+              if (discovered && broker !== undefined) this.#pinnedBrokerId = broker.brokerId;
+              this.#connectionError = undefined;
+              this.#clearPeerCaches();
               settled = true;
+              accepted = true;
+              signal?.removeEventListener("abort", abort);
               clearTimeout(this.helloTimer ?? undefined);
               this.online = true;
               this.reconnectAttempt = 0;
@@ -823,7 +979,9 @@ export class MeshClient extends EventEmitter {
                 }
               }
   // send-guard cache: aliases present in the welcome are known online
-              this.knownPeers.clear();
+              if (previous !== undefined && broker !== undefined && previous.brokerId === broker.brokerId && previous.bootId !== broker.bootId) {
+                this.emit("broker_restart", { previous, current: broker });
+              }
               for (const p of frame.peers ?? []) {
                 if (p.alias !== undefined && p.alias !== this.alias) this.knownPeers.add(p.alias);
               }
@@ -833,11 +991,12 @@ export class MeshClient extends EventEmitter {
                 rooms: frame.rooms ?? [...this.joinedRooms],
                 peers: frame.peers ?? [],
                 mailboxCount: frame.mailboxCount ?? 0,
+                broker,
               });
             } else if (frame.type === "error") {
               fail(frame.code ?? "internal");
             }
-          } else {
+          } else if (accepted && this.socket === socket && this.online) {
             this.onFrame(frame);
           }
         }
@@ -847,6 +1006,10 @@ export class MeshClient extends EventEmitter {
       });
     });
 
+    if (generation !== this.#connectionGeneration || signal?.aborted || this.socket !== socket || !this.online) {
+      socket.destroy();
+      throw new Error("connection_cancelled");
+    }
     this.startHeartbeat();
     this.startWatchdog();
     this.flushOutbox();
@@ -862,11 +1025,6 @@ export class MeshClient extends EventEmitter {
 
   private onSocketClosed(closedSocket?: Socket): void {
     this.debug(`onSocketClosed: online=${this.online} stale=${closedSocket !== undefined && this.socket !== closedSocket}`);
-  // An explicit connect is in flight — it owns the socket lifecycle.
-    if (this.connecting) {
-      this.debug("onSocketClosed: ignored — connect already in flight");
-      return;
-    }
   // Ignore stale closes from sockets we have already replaced (rename
   // retry loop, late close of a detached socket): only the CURRENT
   // socket's close may tear the connection down.
@@ -892,15 +1050,18 @@ export class MeshClient extends EventEmitter {
       if (wasOnline) this.emit("closed");
       return;
     }
-  // backoff 250ms ×2^n cap 5s → ensureBroker → re-hello
+    if (this.config.brokerUrl === undefined && this.config.tailscale?.mode !== undefined && this.config.tailscale.mode !== "off") this.#refreshDiscovery = true;
+    this.#scheduleReconnect();
+  }
+
+  #scheduleReconnect(): void {
+    if (this.intentionallyClosed || this.noReconnect || this.reconnectTimer !== null || this.online) return;
     const delay = backoffMs(this.reconnectAttempt);
     this.reconnectAttempt += 1;
     this.reconnectTimer = setTimeout(() => {
-      this.connect().catch(() => {
-  // ensureBroker/connect failed → onSocketClosed not called (no socket);
-  // schedule next attempt via the same backoff path.
-        this.onSocketClosed();
-      });
+      this.reconnectTimer = null;
+      if (this.intentionallyClosed) return;
+      void this.connect().catch(() => {});
     }, delay);
     this.reconnectTimer.unref();
   }
@@ -1215,14 +1376,21 @@ export class MeshClient extends EventEmitter {
       Math.max(MIN_AWAIT_REPLY_TIMEOUT_MS, opts.timeoutMs ?? DEFAULT_AWAIT_REPLY_TIMEOUT_MS),
     );
 
-    if (!this.online) {
+    const selectionGeneration = this.#selectionGeneration;
+    if (!this.online || this.#selection !== null) {
       try {
         await this.connect();
-      } catch {
-        return { status: "blocked", reason: "broker_unavailable" };
+      } catch (error) {
+        return {
+          status: "blocked",
+          reason: error instanceof Error && error.message === "connection_cancelled"
+            ? "connection_cancelled" : "broker_unavailable",
+        };
       }
     }
-
+    if (selectionGeneration !== this.#selectionGeneration || !this.online) {
+      return { status: "blocked", reason: "connection_cancelled" };
+    }
     const expiresAt = opts.awaitReply ? new Date(Date.now() + timeoutMs).toISOString() : undefined;
     const frame = buildFrame({
       type: "msg",
@@ -1623,6 +1791,7 @@ export class MeshClient extends EventEmitter {
             peers: res.peers ?? [],
             rooms: res.rooms ?? [],
             stats: res.stats,
+            broker: res.broker,
           }),
       });
       this.writeOrQueue(frame);
@@ -1672,6 +1841,9 @@ export class MeshClient extends EventEmitter {
         return { ok: false, reason: "broker_unavailable" };
       }
     }
+    const generation = this.#connectionGeneration;
+    const controller = new AbortController();
+    this.#connectAbort = controller;
     const oldAlias = this.aliasInternal;
     const oldSocket = this.socket;
     if (this.reconnectTimer) {
@@ -1696,6 +1868,7 @@ export class MeshClient extends EventEmitter {
         oldSocket.end();
       });
     }
+    if (generation !== this.#connectionGeneration || controller.signal.aborted) return { ok: false, reason: "connection_cancelled" };
 
   // 2. re-hello under the new alias. NO alias_fallback here: rename
   //  handles alias_taken itself (restore the previous identity below).
@@ -1709,16 +1882,23 @@ export class MeshClient extends EventEmitter {
     let lastErr: unknown;
     for (let attempt = 0; ; attempt += 1) {
       try {
-        await this.doConnect();
+        await this.doConnect(generation, controller.signal);
         lastErr = undefined;
         break;
       } catch (err) {
         lastErr = err;
         const msg = err instanceof Error ? err.message : String(err);
-        if (!msg.includes("alias_taken") || attempt >= ALIAS_RETRY_ATTEMPTS) break;
-        await sleepMs(ALIAS_RETRY_DELAY_MS * 2 ** attempt);
+        if (generation !== this.#connectionGeneration || controller.signal.aborted || !msg.includes("alias_taken") || attempt >= ALIAS_RETRY_ATTEMPTS) break;
+        try {
+          await this.#awaitConnection(sleepMs(ALIAS_RETRY_DELAY_MS * 2 ** attempt), controller.signal);
+        } catch (error) {
+          lastErr = error;
+          break;
+        }
       }
     }
+    if (this.#connectAbort === controller) this.#connectAbort = null;
+    if (generation !== this.#connectionGeneration || controller.signal.aborted) return { ok: false, reason: "connection_cancelled" };
     if (lastErr !== undefined) {
   // restore the previous identity so the session stays usable
       this.aliasInternal = oldAlias;
@@ -1749,22 +1929,60 @@ export class MeshClient extends EventEmitter {
     return ackPromise;
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.#selectionGeneration += 1;
+    return this.#closeConnection();
+  }
+
+  async #closeConnection(): Promise<void> {
     this.intentionallyClosed = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.#connectionGeneration += 1;
+    this.#connectAbort?.abort();
+    this.#connectAbort = null;
+    this.connecting = null;
+    clearTimeout(this.helloTimer ?? undefined);
+    this.helloTimer = null;
+    clearTimeout(this.reconnectTimer ?? undefined);
     this.reconnectTimer = null;
     this.stopHeartbeat();
     this.stopWatchdog();
+    // Snapshot cancelled verdicts before selection clears the old missions.
+    for (const cancel of this.waitAllCancels) cancel();
     this.pending.cancelAll("shutting_down");
     const socket = this.socket;
     this.socket = null;
     this.online = false;
+    for (const [id, waiter] of this.ackWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(buildFrame({ type: "error", code: "shutting_down", id }));
+    }
+    this.ackWaiters.clear();
+    for (const [id, waiter] of this.statusWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(buildFrame({ type: "error", code: "shutting_down", id }));
+    }
+    this.statusWaiters.clear();
     if (socket && !socket.destroyed) {
-      await new Promise<void>((resolve) => {
-        socket.once("close", () => resolve());
+      const closing = new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          socket.destroy();
+          resolve();
+        }, ACK_TIMEOUT_MS);
+        timer.unref();
+        socket.once("close", () => {
+          clearTimeout(timer);
+          resolve();
+        });
         socket.end();
-        setTimeout(resolve, ACK_TIMEOUT_MS).unref();
       });
+      this.#socketClosing = closing;
+      try {
+        await closing;
+      } finally {
+        if (this.#socketClosing === closing) this.#socketClosing = null;
+      }
+    } else if (this.#socketClosing !== null) {
+      await this.#socketClosing;
     }
     this.emit("closed");
   }

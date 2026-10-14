@@ -78,6 +78,8 @@ upstream npm package.
   hand the identity over; `/mesh reset` factory-resets in place.
 - **Multi-machine** — TCP/TLS broker with a shared token; everything works
   unchanged across machines (VPS, LAN, Tailscale…).
+- **Tailnet discovery (unreleased)** — opt-in Tailscale Services or exact
+  device/tag discovery, authenticated mesh selection, and restart-aware reconnects.
 - **Hash-only ledger** — durable history with bodies never stored, plus an
   opt-in redacted transcript. Zero loops: rate caps, anti-duplicate window,
   self-send block, reply dedup, ack-of-ack protection.
@@ -392,6 +394,17 @@ already handed to Pi remain queued for the next successful prompt, not
 re-sent by flush. Deferred state is session-local and cleared on reset,
 reload, or shutdown; use the existing mesh history for older frames.
 
+### Unreleased compatibility changes
+
+- Added opt-in Tailscale mesh discovery and saved selections for Pi, omp, and the CLI.
+- Added mesh/broker/boot identity to status and notifications when a broker restarts.
+- Fixed doctor reporting success for reachable ports that reject mesh authentication.
+- Fixed graph changes delivering old queued messages or suppressing new mission replies.
+- Fixed interrupted broker identity initialization preventing a subsequent startup.
+- Fixed batched and deferred messages missing read receipts and hash-only history after delivery.
+- Fixed JSON diagnostics losing their error envelope when configuration is invalid.
+- Fixed cancelled or superseded session selections overwriting a newer mesh configuration.
+
 ### v0.7.2-omp.2 portability changes
 
 - Fixed broker stop leaving stale PID locks after Windows process termination.
@@ -541,8 +554,9 @@ MESH_BROKER_URL=tcp://<machine-A>:8712 MESH_BROKER_TOKEN=change-me pi
   dev only).
 - **Remote peers are visible**: every peer carries its connection origin
   (`via=tcp:<ip>` / `tls:<ip>`; broker-local unix peers have none) — shown in
-  `mesh_status` (`via=… ⟵ other machine`), `/mesh status`, the session
-  context block, and the HUD peers line (`alias⌁<last-ip-octet>`).
+  `mesh_status` (`via=… (network origin)`), `/mesh status`, the session
+  context block, and the HUD peers line (`alias⌁<last-ip-octet>`). A proxy
+  address is not a verified remote device or user identity.
 - **Privacy note**: `via` exposes the peer IP as seen by the broker — fine
   on a trusted LAN/home mesh; for a multi-org mesh, gate or truncate it
   before it rides any presence broadcast (future policy hook).
@@ -555,6 +569,120 @@ MESH_BROKER_URL=tcp://<machine-A>:8712 MESH_BROKER_TOKEN=change-me pi
   (`MESH_ALIAS=pcB-agent-2`). Identities/ledgers stay local to each
   machine; reservations protect the same repo paths when both machines
   share the same git checkout (always reserve repo-relative paths).
+
+### Tailnet discovery (unreleased)
+
+This section describes the working-tree build; the published
+`v0.7.2-omp.2` does not include these commands. Load this checkout's
+`dist/src/extension/index.js` instead of a second installed mesh extension.
+
+Discovery is **off by default**. It reuses the installed Tailscale client;
+no management API token, Go sidecar, IRC transport, or tailnet-wide port scan
+is involved. Automatic Service enumeration requires Tailscale **1.102.1+**
+and a working `service list --json` command. Linux, macOS, and Windows use
+the official CLI; macOS also supports the application-bundled CLI.
+
+#### Publish one broker
+
+Set a strong `MESH_BROKER_TOKEN` in the environment or private `config.json`.
+For Tailscale Services, start the broker on a token-protected loopback TCP
+endpoint, then publish that endpoint explicitly:
+
+```bash
+MESH_ID=main MESH_LISTEN=tcp://127.0.0.1:8712 pimesh broker start
+tailscale serve --service=svc:pi-mesh-main --tcp=8712 tcp://127.0.0.1:8712
+```
+
+An administrator must first define the Service, permit client access to its
+TCP endpoint, and approve the host (or configure Service auto-approval).
+Service hosts require **tag-based identity**; do not retag a personal
+computer merely to try this feature. Never forward the existing tokenless
+Unix socket/named pipe to remote clients.
+
+Without a dedicated tagged host, use direct node discovery instead:
+
+```bash
+MESH_ID=main MESH_LISTEN="tcp://$(tailscale ip -4):8712" pimesh broker start
+```
+
+The host must have native Tailscale networking. Pure userspace/SOCKS mode
+does not transparently give Node TCP sockets tailnet connectivity. Both
+deployments retain the existing tokenless local socket for local sessions.
+
+#### Discover and select
+
+```bash
+pimesh tailscale status
+pimesh tailscale discover --json
+pimesh tailscale join main --service svc:pi-mesh-main
+# Or choose an exact device name, full MagicDNS name, IP, or unique tag:
+pimesh tailscale join main --host my-broker --port 8712
+pimesh tailscale join main --tag tag:mesh-broker --port 8712
+pimesh tailscale doctor --json
+```
+
+The extension has the same actions under `/mesh tailscale`. `join` verifies
+the token and returned mesh identity **before** changing `config.json`.
+It preserves unrelated settings and secrets. A CLI selection applies to
+subsequent sessions; `/mesh tailscale join` also switches the current client.
+Explicit graph selection preserves alias, current rooms, and own reservations,
+but cancels old batch waits and discards locally buffered old-graph traffic.
+Messages already handed to the host SDK remain part of the session history.
+Cancelled or replaced sessions cannot publish a stale pending selection.
+Read receipts and hash-only history are recorded only after the host accepts
+the message, including batched, deferred, retried, and delayed force delivery.
+
+
+The equivalent opt-in configuration is:
+
+```json
+{
+  "meshId": "main",
+  "tailscale": {
+    "mode": "service",
+    "service": "svc:pi-mesh-main",
+    "port": 8712
+  }
+}
+```
+
+Node mode uses `"mode": "node"` with `"host"` and/or `"tag"`. Omitting the
+Service name selects exactly `svc:pi-mesh-<meshId>`, never a random matching
+machine. An ambiguous selector fails even when one of the devices is offline.
+Device online/active status does not prove that a broker or agent is ready.
+
+Environment overrides: `MESH_ID`, `MESH_BROKER_ID`, `MESH_TAILSCALE_MODE`
+(`off|service|node`), `MESH_TAILSCALE_SERVICE`, `MESH_TAILSCALE_HOST`,
+`MESH_TAILSCALE_TAG`, `MESH_TAILSCALE_PORT`, and `MESH_TAILSCALE_EXEC_PATH`.
+An explicit `MESH_BROKER_URL`/`brokerUrl` takes precedence. Invalid explicit
+URLs, missing Services, daemon failures, and failed authentication never
+silently join a separate local graph. Conflicting environment overrides
+must be removed before a saved selection can take effect.
+
+#### Identity, recovery, and limits
+
+- Tailnet mode requires a broker supporting `meshId`, `brokerId`, and `bootId`
+  metadata. Upgrade the broker too; generic legacy TCP/TLS without an expected
+  mesh identity remains compatible.
+- The standalone broker persists its stable identity in `<stateDir>/broker-id`
+  with crash-safe, exclusive publication. A fresh process gets a new boot ID.
+  An explicit `brokerId`/`MESH_BROKER_ID` overrides it without rewriting the file.
+- Clients pin the first accepted broker ID for that client lifetime; an explicit
+  configured broker ID can pin it across sessions. A different broker is refused.
+  Restart detection clears stale peer state and re-declares own claims; the old
+  in-memory mailbox is **not recovered**.
+- Each Service must route to **one actual broker**. Adding independent backends
+  does not replicate rooms, aliases, reservations or mailboxes, and is not HA.
+- Successful discovery is cached per process for 30 seconds with concurrent
+  requests shared. Connection failures refresh discovery. CLI calls are bounded
+  to 5 seconds and 1 MiB output; normalized Service port expansions are bounded
+  to 65,535 total entries per response.
+- Doctor separates discovery, socket reachability, and authenticated mesh
+  readiness. Its success exit code requires a completed mesh handshake; status
+  and discover intentionally do not claim that advertisements are healthy agents.
+- Shared tokens remain required. Mesh IDs and rooms are routing/coordination
+  boundaries, not tenant authorization. WhoIs/app-capability authorization and
+  trusted PROXY-protocol identity forwarding are not implemented in this stage.
 
 ## Reliability notes
 

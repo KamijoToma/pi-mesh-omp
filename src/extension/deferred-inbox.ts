@@ -16,6 +16,8 @@ export class DeferredInbox {
     private readonly pi: Pick<ExtensionAPI, "sendMessage">,
     private readonly formatFor: (frame: MeshFrame) => FormatOpts,
     private readonly changed: (count: number) => void,
+    /** Called once per accepted host batch, never again during prompt drain. */
+    private readonly onInjected: (frames: readonly MeshFrame[]) => void,
   ) {}
 
   get count(): number {
@@ -45,6 +47,11 @@ export class DeferredInbox {
       display: true,
       details: batchDetails(frames),
     }, immediate ? { deliverAs: "followUp", triggerTurn: true } : { deliverAs: "nextTurn" });
+    try {
+      this.onInjected(frames);
+    } catch {
+      // Host acceptance is final; a bookkeeping failure must not resend it.
+    }
   }
 
   /** Queue at input, BEFORE Pi drains nextTurn. Holding locally until then

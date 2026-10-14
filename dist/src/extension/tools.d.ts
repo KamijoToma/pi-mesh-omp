@@ -27,6 +27,8 @@ export interface MeshRuntime {
     };
     /** Unaddressed broadcasts held separately from immediate traffic. */
     deferredInbox?: DeferredInbox;
+    /** Discard locally held old-graph messages before an explicit graph selection. */
+    clearInbound?: () => void;
     /** Display-only entry outside the LLM context (mesh-verdict colors). */
     appendEntry?: (type: string, data: unknown) => void;
     /** pending auto-release timers per reserved pattern (mesh_reserve

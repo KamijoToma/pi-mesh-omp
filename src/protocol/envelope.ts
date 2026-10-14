@@ -2,6 +2,8 @@
 // No Pi imports. Validation rules applied by BOTH broker and client.
 import {
   ALIAS_REGEX,
+  isBrokerId,
+  isMeshId,
   MAX_BODY_BYTES,
   MAX_FRAME_ID_CHARS,
   MAX_REFS,
@@ -14,6 +16,12 @@ import { makeMsgId, nowIso, sha256 } from "./frames.js";
 
 export type MeshPriority = "normal" | "urgent" | "force";
 export type MeshRole = "member" | "observer";
+
+export interface BrokerInfo {
+  meshId: string;
+  brokerId: string;
+  bootId: string;
+}
 
 export interface FileReservation {
   pattern: string;
@@ -74,6 +82,10 @@ export interface MeshFrame {
   reads?: string;
   /** shared auth token hash (hello only) — required on tcp/tls brokers. */
   token?: string;
+  /** Logical mesh selection (hello only). Omitted by legacy clients. */
+  meshId?: string;
+  /** Broker identity (welcome/status_res only). */
+  broker?: BrokerInfo;
   /** msg: sender demands the recipient's running tool be interrupted
   *  (abort the stuck turn) so the message lands with priority. Requires
   *  priority=force + reason at SEND time (reason travels hashed only). */
@@ -120,6 +132,7 @@ export const ERROR_CODES = [
   "alias_taken",
   "invalid_room",
   "invalid_token",
+  "mesh_mismatch",
   "not_member",
   "observer_readonly",
   "last_room",
@@ -244,6 +257,8 @@ export interface BuildFrameOpts {
   totalCount?: number;
   reads?: string;
   token?: string;
+  meshId?: string;
+  broker?: BrokerInfo;
   interrupt?: boolean;
   receipt?: boolean;
   /** M1: extension version (hello). */
@@ -288,6 +303,8 @@ export function buildFrame(opts: BuildFrameOpts): MeshFrame {
   if (opts.totalCount !== undefined) frame.totalCount = opts.totalCount;
   if (opts.reads !== undefined) frame.reads = opts.reads;
   if (opts.token !== undefined) frame.token = opts.token;
+  if (opts.meshId !== undefined) frame.meshId = opts.meshId;
+  if (opts.broker !== undefined) frame.broker = { ...opts.broker };
   if (opts.interrupt !== undefined) frame.interrupt = opts.interrupt;
   if (opts.receipt !== undefined) frame.receipt = opts.receipt;
   if (opts.clientVersion !== undefined) frame.clientVersion = opts.clientVersion;
@@ -450,6 +467,22 @@ export function validateFrame(value: unknown, opts: ValidateOpts = {}): Validati
       return { ok: false, code: "invalid_frame", detail: "bad token" };
     }
   }
+  // Mesh selection and broker metadata are bounded, frame-specific contracts.
+  if (value.meshId !== undefined) {
+    if (value.type !== "hello" || !isMeshId(value.meshId)) {
+      return { ok: false, code: "invalid_frame", detail: "bad meshId or meshId on non-hello" };
+    }
+  }
+  if (value.broker !== undefined) {
+    if (value.type !== "welcome" && value.type !== "status_res") {
+      return { ok: false, code: "invalid_frame", detail: "broker on non-welcome/status_res" };
+    }
+    if (!isRecord(value.broker) || !isMeshId(value.broker.meshId) ||
+      !isBrokerId(value.broker.brokerId) || !isBrokerId(value.broker.bootId)) {
+      return { ok: false, code: "invalid_frame", detail: "bad broker metadata" };
+    }
+  }
+
 
   // M1: clientVersion — bounded string (hello carries it)
   if (value.clientVersion !== undefined) {

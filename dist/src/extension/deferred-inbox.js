@@ -6,13 +6,17 @@ export class DeferredInbox {
     pi;
     formatFor;
     changed;
+    onInjected;
     pending = [];
     queued = [];
     draining = false;
-    constructor(pi, formatFor, changed) {
+    constructor(pi, formatFor, changed, 
+    /** Called once per accepted host batch, never again during prompt drain. */
+    onInjected) {
         this.pi = pi;
         this.formatFor = formatFor;
         this.changed = changed;
+        this.onInjected = onInjected;
     }
     get count() {
         return this.pending.length + this.queued.length;
@@ -36,6 +40,12 @@ export class DeferredInbox {
             display: true,
             details: batchDetails(frames),
         }, immediate ? { deliverAs: "followUp", triggerTurn: true } : { deliverAs: "nextTurn" });
+        try {
+            this.onInjected(frames);
+        }
+        catch {
+            // Host acceptance is final; a bookkeeping failure must not resend it.
+        }
     }
     /** Queue at input, BEFORE Pi drains nextTurn. Holding locally until then
      *  lets /mesh inbox flush promote the batch without duplicate injections:

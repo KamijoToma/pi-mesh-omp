@@ -1,6 +1,6 @@
 // protocol/envelope.ts — MeshFrame type, closed sets, build/validate/parse.
 // No Pi imports. Validation rules applied by BOTH broker and client.
-import { ALIAS_REGEX, MAX_BODY_BYTES, MAX_FRAME_ID_CHARS, MAX_REFS, MAX_REF_CHARS, MAX_REPLY_TARGETS, ROOM_REGEX, SHA256_HEX_REGEX, } from "../shared/config.js";
+import { ALIAS_REGEX, isBrokerId, isMeshId, MAX_BODY_BYTES, MAX_FRAME_ID_CHARS, MAX_REFS, MAX_REF_CHARS, MAX_REPLY_TARGETS, ROOM_REGEX, SHA256_HEX_REGEX, } from "../shared/config.js";
 import { makeMsgId, nowIso, sha256 } from "./frames.js";
 // ---- Closed sets ----
 export const FRAME_TYPES = [
@@ -31,6 +31,7 @@ export const ERROR_CODES = [
     "alias_taken",
     "invalid_room",
     "invalid_token",
+    "mesh_mismatch",
     "not_member",
     "observer_readonly",
     "last_room",
@@ -189,6 +190,10 @@ export function buildFrame(opts) {
         frame.reads = opts.reads;
     if (opts.token !== undefined)
         frame.token = opts.token;
+    if (opts.meshId !== undefined)
+        frame.meshId = opts.meshId;
+    if (opts.broker !== undefined)
+        frame.broker = { ...opts.broker };
     if (opts.interrupt !== undefined)
         frame.interrupt = opts.interrupt;
     if (opts.receipt !== undefined)
@@ -329,6 +334,21 @@ export function validateFrame(value, opts = {}) {
         }
         if (typeof value.token !== "string" || value.token.length === 0 || value.token.length > 128) {
             return { ok: false, code: "invalid_frame", detail: "bad token" };
+        }
+    }
+    // Mesh selection and broker metadata are bounded, frame-specific contracts.
+    if (value.meshId !== undefined) {
+        if (value.type !== "hello" || !isMeshId(value.meshId)) {
+            return { ok: false, code: "invalid_frame", detail: "bad meshId or meshId on non-hello" };
+        }
+    }
+    if (value.broker !== undefined) {
+        if (value.type !== "welcome" && value.type !== "status_res") {
+            return { ok: false, code: "invalid_frame", detail: "broker on non-welcome/status_res" };
+        }
+        if (!isRecord(value.broker) || !isMeshId(value.broker.meshId) ||
+            !isBrokerId(value.broker.brokerId) || !isBrokerId(value.broker.bootId)) {
+            return { ok: false, code: "invalid_frame", detail: "bad broker metadata" };
         }
     }
     // M1: clientVersion — bounded string (hello carries it)

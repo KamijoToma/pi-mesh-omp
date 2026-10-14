@@ -54,6 +54,14 @@ export const LOCK_RETRY_MAX = 3;
 export const BROKER_STARTUP_DIAGNOSTIC_MAX_BYTES = 4_096;
 export const BROKER_STOP_TIMEOUT_MS = 5_000;
 export const BROKER_STOP_POLL_MS = 50;
+// ---- Tailscale discovery ----
+export const TAILSCALE_COMMAND_TIMEOUT_MS = 5_000;
+export const TAILSCALE_MAX_OUTPUT_BYTES = 1_048_576;
+export const TAILSCALE_DISCOVERY_CACHE_MS = 30_000;
+export const DEFAULT_TAILSCALE_PORT = 8_712;
+export const MAX_BROKER_ID_CHARS = 64;
+export const TAILSCALE_MAX_SERVICE_PORTS = 65_535;
+export const TAILSCALE_DIAGNOSTIC_MAX_CHARS = 4_096;
 // ---- Provider failure holds ----
 export const PROVIDER_RATE_LIMIT_HOLD_MS = 60_000;
 export const PROVIDER_BLOCKED_HOLD_MS = 1_800_000;
@@ -191,6 +199,48 @@ function envInt(env, key) {
     const n = Number(raw);
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 }
+export function isMeshId(value) {
+    return typeof value === "string" && ROOM_REGEX.test(value);
+}
+export function isBrokerId(value) {
+    return typeof value === "string" && value.length <= MAX_BROKER_ID_CHARS &&
+        /^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(value);
+}
+function parseTailscaleConfig(value) {
+    if (value === undefined)
+        return undefined;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("tailscale_config_invalid: tailscale must be an object");
+    }
+    const raw = value;
+    if (raw.mode !== "off" && raw.mode !== "service" && raw.mode !== "node") {
+        throw new Error("tailscale_config_invalid: mode must be off, service, or node");
+    }
+    const port = raw.port ?? DEFAULT_TAILSCALE_PORT;
+    if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65_535) {
+        throw new Error("tailscale_config_invalid: port must be an integer between 1 and 65535");
+    }
+    const cfg = { mode: raw.mode, port };
+    for (const key of ["service", "host", "tag", "execPath"]) {
+        const item = raw[key];
+        if (item === undefined)
+            continue;
+        if (typeof item !== "string" || item.trim() === "" || /[\r\n\0]/.test(item)) {
+            throw new Error(`tailscale_config_invalid: ${key} must be a non-empty string`);
+        }
+        cfg[key] = item.trim();
+    }
+    if (cfg.service !== undefined && !/^svc:[a-z0-9][a-z0-9-]*$/.test(cfg.service)) {
+        throw new Error("tailscale_config_invalid: service must be svc:<service-name>");
+    }
+    if (cfg.tag !== undefined && !/^tag:[a-z0-9][a-z0-9-]*$/.test(cfg.tag)) {
+        throw new Error("tailscale_config_invalid: tag must be tag:<tag-name>");
+    }
+    if (cfg.mode === "node" && cfg.host === undefined && cfg.tag === undefined) {
+        throw new Error("tailscale_config_invalid: node mode requires an exact host or tag");
+    }
+    return cfg;
+}
 /**
  * Load config: defaults < <stateDir>/config.json < env.
  * Env overrides: MESH_ALIAS, MESH_ROOMS (csv), MESH_MAX_FRAME_BYTES,
@@ -244,8 +294,13 @@ export function loadConfig(stateDir, env = process.env) {
         cfg.alias = fileCfg.alias;
     if (typeof fileCfg.listen === "string" && parseEndpoint(fileCfg.listen) !== null)
         cfg.listen = fileCfg.listen;
-    if (typeof fileCfg.brokerUrl === "string" && parseEndpoint(fileCfg.brokerUrl) !== null)
-        cfg.brokerUrl = fileCfg.brokerUrl;
+    const configuredUrl = env.MESH_BROKER_URL ?? fileCfg.brokerUrl;
+    if (configuredUrl !== undefined) {
+        if (typeof configuredUrl !== "string" || parseEndpoint(configuredUrl) === null) {
+            throw new Error("broker_endpoint_invalid: MESH_BROKER_URL/brokerUrl must be tcp://, tls://, or unix://; unset it to use local mode");
+        }
+        cfg.brokerUrl = configuredUrl;
+    }
     if (typeof fileCfg.brokerToken === "string" && fileCfg.brokerToken.trim() !== "")
         cfg.brokerToken = fileCfg.brokerToken;
     if (typeof fileCfg.tlsCert === "string" && fileCfg.tlsCert !== "")
@@ -258,13 +313,47 @@ export function loadConfig(stateDir, env = process.env) {
         cfg.tlsInsecure = true;
     if (fileCfg.debug === true)
         cfg.debug = true;
+    const meshId = env.MESH_ID ?? fileCfg.meshId;
+    if (meshId !== undefined) {
+        if (!isMeshId(meshId))
+            throw new Error("mesh_config_invalid: MESH_ID/meshId must be a valid mesh identifier");
+        cfg.meshId = meshId;
+    }
+    const brokerId = env.MESH_BROKER_ID ?? fileCfg.brokerId;
+    if (brokerId !== undefined) {
+        if (!isBrokerId(brokerId))
+            throw new Error("mesh_config_invalid: MESH_BROKER_ID/brokerId must be a valid broker identifier");
+        cfg.brokerId = brokerId;
+    }
+    const tailscaleRaw = fileCfg.tailscale;
+    const tailscaleOverrides = tailscaleRaw !== null && typeof tailscaleRaw === "object" && !Array.isArray(tailscaleRaw)
+        ? { ...tailscaleRaw }
+        : {};
+    let hasTailscaleOverride = false;
+    for (const [key, envKey] of [
+        ["mode", "MESH_TAILSCALE_MODE"],
+        ["service", "MESH_TAILSCALE_SERVICE"],
+        ["host", "MESH_TAILSCALE_HOST"],
+        ["tag", "MESH_TAILSCALE_TAG"],
+        ["execPath", "MESH_TAILSCALE_EXEC_PATH"],
+    ]) {
+        if (env[envKey] !== undefined) {
+            tailscaleOverrides[key] = env[envKey];
+            hasTailscaleOverride = true;
+        }
+    }
+    if (env.MESH_TAILSCALE_PORT !== undefined) {
+        tailscaleOverrides.port = Number(env.MESH_TAILSCALE_PORT);
+        hasTailscaleOverride = true;
+    }
+    cfg.tailscale = parseTailscaleConfig(hasTailscaleOverride ? tailscaleOverrides : tailscaleRaw);
+    if (cfg.tailscale !== undefined && cfg.tailscale.mode !== "off" && cfg.meshId === undefined) {
+        throw new Error("tailscale_config_invalid: set MESH_ID/meshId before enabling discovery");
+    }
     // env overrides (priority over config file)
     const envListen = env.MESH_LISTEN;
     if (envListen !== undefined && parseEndpoint(envListen) !== null)
         cfg.listen = envListen;
-    const envBrokerUrl = env.MESH_BROKER_URL;
-    if (envBrokerUrl !== undefined && parseEndpoint(envBrokerUrl) !== null)
-        cfg.brokerUrl = envBrokerUrl;
     const envToken = env.MESH_BROKER_TOKEN;
     if (envToken !== undefined && envToken.trim() !== "")
         cfg.brokerToken = envToken;

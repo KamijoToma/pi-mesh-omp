@@ -44,6 +44,8 @@ export interface MeshRuntime {
   batcher?: { flushNow(): void };
   /** Unaddressed broadcasts held separately from immediate traffic. */
   deferredInbox?: DeferredInbox;
+  /** Discard locally held old-graph messages before an explicit graph selection. */
+  clearInbound?: () => void;
   /** Display-only entry outside the LLM context (mesh-verdict colors). */
   appendEntry?: (type: string, data: unknown) => void;
   /** pending auto-release timers per reserved pattern (mesh_reserve
@@ -600,7 +602,7 @@ async function execMeshStatus(
       const skew = p.clientVersion !== undefined && p.clientVersion !== localVersion ? " ⚠" : "";
       const since = p.since !== undefined ? ` since=${p.since}` : "";
   // D40: remote-machine peers (tcp/tls to the broker) carry their origin
-      const via = p.via !== undefined ? ` via=${p.via} ⟵ other machine` : "";
+      const via = p.via !== undefined ? ` via=${p.via} (network origin)` : "";
   // Phase 3: announced turn state wins; heuristic (lastSeenAt) as
   // fallback for peers that never announce (old versions)
       if (p.activity !== undefined) {
@@ -619,6 +621,12 @@ async function execMeshStatus(
     }),
     `mesh rooms: ${snap.rooms.length > 0 ? snap.rooms.join(", ") : "(none)"}`,
   ];
+  if (snap.broker !== undefined) {
+    lines.push(`mesh identity: ${snap.broker.meshId} · broker=${snap.broker.brokerId} · boot=${snap.broker.bootId}`);
+  }
+  if (rt.client.connectionTarget !== null && rt.client.connectionTarget !== undefined) {
+    lines.push(`connection: ${rt.client.connectionTarget.source} ${rt.client.connectionTarget.url ?? "local socket/pipe"}`);
+  }
   // Phase 3: who is likely done — idle AND no mission of ours still
   // waiting on them (their last verdicts were all answered)
   const summary = buildStatusSummary(peers, missions);
@@ -666,6 +674,11 @@ async function execMeshStatus(
     room,
     peers: peers.map((p) => ({ alias: p.alias, rooms: p.rooms, since: p.since, via: p.via })),
     rooms: snap.rooms,
+    broker: snap.broker,
+    connection: {
+      source: rt.client.connectionTarget?.source,
+      endpoint: rt.client.connectionTarget?.url,
+    },
   });
 }
 
