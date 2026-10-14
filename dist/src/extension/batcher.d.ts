@@ -49,5 +49,7 @@ export declare class InboundBatcher {
     private onWindow;
     /** Flush everything now (called on tool_result: the busy period ended). */
     flushNow(): void;
+    /** Discard the old graph's held messages without injecting them into a new graph. */
+    clear(): void;
     get pending(): number;
 }

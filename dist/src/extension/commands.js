@@ -1,13 +1,16 @@
 // extension/commands.ts — /mesh command. All output via ctx.ui.notify.
 import * as fs from "node:fs";
+import { stripVTControlCharacters } from "node:util";
+import { parseTailnetArgs, TAILSCALE_USAGE } from "../cli/cmd/tailscale.js";
 import { MeshClient } from "../client/client.js";
-import { loadConfig } from "../shared/config.js";
+import { loadConfig, TAILSCALE_DIAGNOSTIC_MAX_CHARS } from "../shared/config.js";
 import { brokerLockPath, brokerSocketPath } from "../shared/paths.js";
 import { MESH_VERSION } from "../shared/version.js";
 import { attachClientListeners, updateSessionName } from "./attach.js";
 import { identityFromClient } from "../shared/identity-store.js";
 import { formatPeerActivity } from "./tools.js";
 import { isOmpHost, reportConnectionError } from "./host.js";
+import { executeTailnetCommand } from "../tailscale/commands.js";
 const HELP_TEXT = [
     "/mesh status [room]   — broker snapshot (peers, activity, rooms)",
     "/mesh join <room> [as <alias>] [observer]",
@@ -22,6 +25,8 @@ const HELP_TEXT = [
     "/mesh stale           — reservations held by peers, with age (TTL insight)",
     "/mesh broker          — socket path, lock pid, session state",
     "/mesh inbox [flush]   — list deferred broadcasts, or deliver them now",
+    "/mesh tailscale status|discover|doctor",
+    "/mesh tailscale join <mesh-id> [--service svc:NAME | --host HOST | --tag tag:NAME] [--port PORT]",
     "/mesh help",
 ].join("\n");
 function notify(ctx, message) {
@@ -75,7 +80,7 @@ async function cmdStatus(rt, ctx, pi, room) {
         notify(ctx, `mesh: no online peers${room !== undefined ? ` in room ${room}` : ""}`);
         return;
     }
-    const lines = snap.peers.map((p) => `@${p.alias} rooms=${p.rooms.join(",")}${p.since !== undefined ? ` since=${p.since}` : ""}${p.via !== undefined ? ` via=${p.via} ⟵ other machine` : ""}${formatPeerActivity(p, rt.client.activityIdleMs, rt.client.activityStuckMs)}`);
+    const lines = snap.peers.map((p) => `@${p.alias} rooms=${p.rooms.join(",")}${p.since !== undefined ? ` since=${p.since}` : ""}${p.via !== undefined ? ` via=${p.via} (network origin)` : ""}${formatPeerActivity(p, rt.client.activityIdleMs, rt.client.activityStuckMs)}`);
     notify(ctx, `mesh peers (${snap.peers.length}):\n${lines.join("\n")}\nrooms: ${snap.rooms.join(", ") || "(none)"}`);
 }
 async function cmdJoin(rt, ctx, room, observer, asAlias, pi) {
@@ -377,10 +382,69 @@ function cmdBroker(rt, ctx) {
     }
     notify(ctx, lines.join("\n"));
 }
+function notifyTailnet(ctx, message, failed = false) {
+    const clean = stripVTControlCharacters(message).replaceAll("\t", " ").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
+    ctx.ui.notify(clean.length > TAILSCALE_DIAGNOSTIC_MAX_CHARS
+        ? clean.slice(0, TAILSCALE_DIAGNOSTIC_MAX_CHARS) + "\n…"
+        : clean, failed ? "warning" : "info");
+}
+const tailnetSelectionEpochs = new WeakMap();
+async function cmdTailnet(rt, ctx, args, pi, getRuntime, getHud) {
+    const parsed = parseTailnetArgs(args);
+    if (!parsed.ok) {
+        notifyTailnet(ctx, `${parsed.error}\n${TAILSCALE_USAGE}`, true);
+        return;
+    }
+    if (parsed.help) {
+        notifyTailnet(ctx, TAILSCALE_USAGE);
+        return;
+    }
+    const client = rt.client;
+    const epoch = parsed.command.action === "join"
+        ? (tailnetSelectionEpochs.get(rt) ?? 0) + 1
+        : tailnetSelectionEpochs.get(rt) ?? 0;
+    if (parsed.command.action === "join")
+        tailnetSelectionEpochs.set(rt, epoch);
+    const isCurrent = () => getRuntime() === rt && rt.client === client &&
+        (rt.ctx?.sessionManager?.getSessionId() ?? rt.sessionId) === rt.sessionId &&
+        (parsed.command.action !== "join" || tailnetSelectionEpochs.get(rt) === epoch);
+    try {
+        const result = await executeTailnetCommand(parsed.command, loadConfig(rt.stateDir), rt.stateDir, rt.runtimeDir, client, process.env, isCurrent);
+        if (!isCurrent())
+            return;
+        if (result.ok && result.config !== undefined) {
+            rt.clearInbound?.();
+            getHud()?.setConnecting(true);
+            try {
+                await client.selectTailnet(result.config);
+            }
+            catch (error) {
+                if (!isCurrent())
+                    return;
+                getHud()?.setConnecting(false);
+                const message = error instanceof Error ? error.message : String(error);
+                notifyTailnet(ctx, `selection saved; live join failed: ${message}`, true);
+                return;
+            }
+            if (!isCurrent())
+                return;
+            persistIdentity(rt);
+            updateSessionName(pi, rt);
+            result.details.connected = true;
+            result.text = `mesh ${client.brokerInfo?.meshId} connected at ${client.connectionTarget?.url} as @${client.alias}; selection saved`;
+        }
+        notifyTailnet(ctx, parsed.json ? JSON.stringify({ ...result.details, ok: result.ok }) : result.text, !result.ok);
+    }
+    catch (error) {
+        if (isCurrent()) {
+            notifyTailnet(ctx, error instanceof Error ? error.message : String(error), true);
+        }
+    }
+}
 export function registerCommands(pi, getRuntime, onChanged, // HUD refresh after join/leave/log toggles
 getHud = () => null, resetActivity) {
     pi.registerCommand("mesh", {
-        description: "mesh inter-agent coms: status, join/leave, alias, log, ping, broker",
+        description: "mesh inter-agent coms: status, join/leave, alias, log, ping, broker, tailscale",
         handler: async (args, ctx) => {
             const rt = getRuntime();
             if (rt === null) {
@@ -402,6 +466,10 @@ getHud = () => null, resetActivity) {
                     else {
                         notify(ctx, "usage: /mesh inbox [flush]");
                     }
+                    break;
+                case "tailscale":
+                    await cmdTailnet(rt, ctx, rest, pi, getRuntime, getHud);
+                    onChanged?.();
                     break;
                 case "status":
                     await cmdStatus(rt, ctx, pi, rest[0]);

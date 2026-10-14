@@ -117,6 +117,14 @@ export class InboundBatcher {
         this.frames = [];
         this.onFlush(batch);
     }
+    /** Discard the old graph's held messages without injecting them into a new graph. */
+    clear() {
+        this.frames.length = 0;
+        clearTimeout(this.timer ?? undefined);
+        clearTimeout(this.maxTimer ?? undefined);
+        this.timer = null;
+        this.maxTimer = null;
+    }
     get pending() {
         return this.frames.length;
     }

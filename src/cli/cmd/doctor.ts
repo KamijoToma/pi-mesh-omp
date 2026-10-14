@@ -1,14 +1,13 @@
-// cli/cmd/doctor.ts — endpoint/auth/config diagnostics. Exit 1 when the
-// broker is unreachable. The token is NEVER printed (D9) — only its hash
-// prefix so operators can compare configs without leaking secrets.
+// cli/cmd/doctor.ts — resolved endpoint, socket reachability and mesh authentication.
+// A reachable TCP port is not a healthy mesh. Tokens stay masked.
 import { existsSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { say } from "../out.js";
 import { EXIT_OK, EXIT_MESH_FAILURE } from "../codes.js";
-import { loadConfig, parseEndpoint, STATUS_REQ_TIMEOUT_MS } from "../../shared/config.js";
+import { loadConfig } from "../../shared/config.js";
 import { brokerLockPath, brokerSocketPath, configPath, policyPath, runtimeDir, stateDir } from "../../shared/paths.js";
 import { loadPolicy } from "../../broker/policy.js";
-import { connectProbe, connectProbeTcp } from "../../client/reconnect.js";
+import { diagnoseConnection } from "../../tailscale/diagnostics.js";
 import { MESH_VERSION } from "../../shared/version.js";
 
 function pidAlive(pid: number): boolean {
@@ -25,14 +24,10 @@ export async function cmdDoctor(): Promise<number> {
   const sock = brokerSocketPath(dir);
   const lock = brokerLockPath(dir);
   const cfg = loadConfig(stateDir());
-  const url = cfg.brokerUrl;
+  const diagnostic = await diagnoseConnection(cfg, dir);
+  const url = diagnostic.target?.url ?? cfg.brokerUrl;
   const listen = cfg.listen;
-  const endpoint = url !== undefined ? parseEndpoint(url) : null;
-  const reachable = endpoint === null
-    ? await connectProbe(sock, STATUS_REQ_TIMEOUT_MS)
-    : endpoint.kind === "unix"
-      ? await connectProbe(endpoint.path, STATUS_REQ_TIMEOUT_MS)
-      : await connectProbeTcp(endpoint.host, endpoint.port, STATUS_REQ_TIMEOUT_MS);
+  const reachable = diagnostic.reachable;
 
   let lockInfo = "absent";
   let stale = false;
@@ -67,8 +62,13 @@ export async function cmdDoctor(): Promise<number> {
 
   for (const line of [
     `runtimeDir: ${dir}`,
-    url !== undefined ? `endpoint: ${url} reachable=${reachable}` : `socket: ${sock} reachable=${reachable}`,
-    `brokerUrl: ${url ?? "(local unix socket)"}`,
+    diagnostic.resolved
+      ? (url !== undefined && url !== null ? `endpoint: ${url} reachable=${reachable}` : `socket: ${sock} reachable=${reachable}`)
+      : "endpoint: unresolved reachable=false",
+    `brokerUrl: ${url ?? (diagnostic.resolved ? "(local socket/pipe)" : "(unresolved)")}`,
+    `source: ${diagnostic.target?.source ?? "unresolved"}`,
+    `discovery: ${diagnostic.resolved ? "resolved" : "failed"}`,
+    `authenticated: ${diagnostic.authenticated}`,
     `listen: ${listen ?? "(unix socket)"}`,
     `lock: ${lockInfo}${stale ? " STALE" : ""}`,
     `config: ${cfgInfo}`,
@@ -76,8 +76,12 @@ export async function cmdDoctor(): Promise<number> {
     `token: ${tokenInfo}`,
     `protocol: mesh.v1`,
     `cliVersion: ${MESH_VERSION}`,
+    ...(diagnostic.broker !== undefined
+      ? [`meshId: ${diagnostic.broker.meshId}`, `brokerId: ${diagnostic.broker.brokerId}`, `bootId: ${diagnostic.broker.bootId}`]
+      : []),
+    ...(diagnostic.error !== undefined ? [`error: ${diagnostic.error}`] : []),
   ]) {
     say(line);
   }
-  return reachable ? EXIT_OK : EXIT_MESH_FAILURE;
+  return diagnostic.authenticated ? EXIT_OK : EXIT_MESH_FAILURE;
 }

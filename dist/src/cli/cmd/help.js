@@ -2,6 +2,7 @@
 import { say, dim, useColor } from "../out.js";
 import { specUsage } from "../args.js";
 import { CLI_PING_TIMEOUT_MS, CLI_SEND_TIMEOUT_MS, CLI_TAIL_BACKLOG_MAX_LINES, CLI_TAIL_LINES, CLI_WAIT_TIMEOUT_MS, DEFAULT_RESERVATION_TTL_MS } from "../../shared/config.js";
+import { TAILSCALE_USAGE } from "./tailscale.js";
 export const COMMANDS = [
     "broker",
     "peers",
@@ -22,10 +23,11 @@ export const COMMANDS = [
     "attach",
     "config",
     "doctor",
+    "tailscale",
     "help",
 ];
 export const GENERAL_USAGE = "usage: mesh <command> [args]\n" +
-    "commands: broker start|stop|status · peers · status [--reservations] · stale · send · reply · ping · wait · join · leave · reserve [--hold] · release · ledger · tail [-f] · watch · sessions · attach (standalone peer) · config show · doctor · help <command>";
+    "commands: broker start|stop|status · peers · status [--reservations] · stale · send · reply · ping · wait · join · leave · reserve [--hold] · release · ledger · tail [-f] · watch · sessions · attach (standalone peer) · config show · doctor · tailscale · help <command>";
 const HELP = {
     broker: {
         usage: "mesh broker start|stop|status",
@@ -60,6 +62,14 @@ const HELP = {
     config: {
         usage: "mesh config show",
         notes: ["Resolved config (defaults < file < env) and paths. The token is masked (sha256 prefix)."],
+    },
+    tailscale: {
+        usage: TAILSCALE_USAGE,
+        notes: [
+            "Discovery is opt-in; explicit brokerUrl overrides it. Device online is not broker readiness.",
+            "join saves a selection only after mesh authentication; tokens stay in env/config, never argv.",
+            "Services need a tagged host, administrator definition/approval and TCP grants.",
+        ],
     },
     ledger: {
         usage: "mesh ledger",

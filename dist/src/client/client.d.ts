@@ -1,11 +1,13 @@
 import { EventEmitter } from "node:events";
-import { type FileReservation, type MeshFrame, type MeshPeerInfo, type MeshPriority, type MeshRole } from "../protocol/envelope.js";
+import { type BrokerInfo, type FileReservation, type MeshFrame, type MeshPeerInfo, type MeshPriority, type MeshRole } from "../protocol/envelope.js";
 import { type MeshConfig } from "../shared/config.js";
+import { type ResolvedConnection } from "../tailscale/adapter.js";
 export interface WelcomeInfo {
     alias: string;
     rooms: string[];
     peers: MeshPeerInfo[];
     mailboxCount: number;
+    broker?: BrokerInfo;
 }
 export interface StatusSnapshot {
     peers: MeshPeerInfo[];
@@ -17,6 +19,7 @@ export interface StatusSnapshot {
         mailboxDelivered: number;
         mailboxDropped: number;
     };
+    broker?: BrokerInfo;
 }
 export interface SendOpts {
     to?: string;
@@ -129,13 +132,14 @@ export interface WaitAllSummary {
     }[];
 }
 export declare class MeshClient extends EventEmitter {
+    #private;
     /** Current alias — mutable via rename (in-flight alias change). */
     private aliasInternal;
     private readonly initialRooms;
     /** All rooms this client is (or will be) a member of — re-declared at hello. */
     private readonly joinedRooms;
     private readonly runtimeDir;
-    private readonly config;
+    private config;
     private readonly noReconnect;
     private readonly strictAlias;
     private socket;
@@ -161,6 +165,7 @@ export declare class MeshClient extends EventEmitter {
      *  LAUNCH answers skip session injection (the verdict carries that
      *  batch). */
     private waitAllInFlight;
+    private readonly waitAllCancels;
     /** Memory-only ring buffer of last frames (bodies included) for mesh_history. */
     readonly transcript: MeshFrame[];
     /** Own file reservations — declared at hello, updated via reserve/release. */
@@ -202,6 +207,9 @@ export declare class MeshClient extends EventEmitter {
     private readonly handledReplyTargets;
     constructor(opts?: MeshClientOpts);
     get alias(): string;
+    get connectionTarget(): ResolvedConnection | null;
+    get brokerInfo(): BrokerInfo | undefined;
+    get connectionError(): string | undefined;
     /** All rooms this client is a member of (re-declared at every hello). */
     get rooms(): readonly string[];
     /** activity status thresholds from config. */
@@ -313,6 +321,10 @@ export declare class MeshClient extends EventEmitter {
     /** Mark a reply target as consumed (after pending match or orphan inject). */
     private markReplyHandled;
     connect(): Promise<WelcomeInfo>;
+    /** Select a new graph atomically for public connect/send callers.
+     * A later selection or explicit close cancels this one; it never joins
+     * itself through the public connect barrier. */
+    selectTailnet(config: MeshConfig): Promise<WelcomeInfo>;
     /**
     * doConnect, but on alias_taken: first RETRY the original alias with a
     * short backoff — the old connection may be mid-close (the /reload

@@ -16,16 +16,22 @@ const frame: MeshFrame = {
 function setup() {
   const sent: { msg: InboundMessage; opts?: SendMessageOptions }[] = [];
   const counts: number[] = [];
-  const inbox = new DeferredInbox({ sendMessage: (msg, opts) => { sent.push({ msg, opts }); } }, () => ({}), (n) => counts.push(n));
-  return { inbox, sent, counts };
+  const injected: string[] = [];
+  const inbox = new DeferredInbox(
+    { sendMessage: (msg, opts) => { sent.push({ msg, opts }); } },
+    () => ({}), (n) => counts.push(n),
+    (frames) => { injected.push(...frames.map((f) => f.id)); },
+  );
+  return { inbox, sent, counts, injected };
 }
 
 describe("deferred inbox", () => {
   it("batches only on next input, no triggerTurn; clears on the consuming agent_start", () => {
-    const { inbox, sent, counts } = setup();
+    const { inbox, sent, counts, injected } = setup();
     inbox.push(frame);
     inbox.push({ ...frame, id: "m-two", body: "second update" });
     assert.equal(sent.length, 0);
+    assert.deepEqual(injected, []);
     assert.equal(inbox.count, 2);
     assert.match(inbox.list(), /@alice .*status for @someone-else/);
     inbox.agentStarting(); // unrelated immediate mesh turn must NOT clear it
@@ -38,22 +44,24 @@ describe("deferred inbox", () => {
     inbox.agentStarting();
     assert.equal(inbox.count, 0);
     assert.equal(counts.at(-1), 0);
+    assert.deepEqual(injected, ["m-deferred", "m-two"]);
   });
 
   it("manual flush sends one immediate followUp and does not re-queue it", () => {
-    const { inbox, sent } = setup();
+    const { inbox, sent, injected } = setup();
     inbox.push(frame);
-    inbox.push(frame);
+    inbox.push({ ...frame, id: "m-two" });
     assert.equal(inbox.flush(), 2);
     assert.deepEqual(sent[0]!.opts, { deliverAs: "followUp", triggerTurn: true });
     inbox.queueForPrompt();
     assert.equal(sent.length, 1);
     assert.equal(inbox.count, 0);
     assert.equal(inbox.flush(), 0);
+    assert.deepEqual(injected, ["m-deferred", "m-two"]);
   });
 
   it("cancelled preflight does not lose, duplicate or promote already-queued messages", () => {
-    const { inbox, sent } = setup();
+    const { inbox, sent, injected } = setup();
     inbox.push(frame);
     inbox.queueForPrompt();
     inbox.agentStarting(); // direct message after cancelled/failed user preflight
@@ -67,15 +75,27 @@ describe("deferred inbox", () => {
     assert.equal(inbox.count, 1);
     inbox.clear();
     assert.equal(inbox.count, 0);
+    assert.deepEqual(injected, ["m-deferred"]);
   });
 
   it("failed send retains the local batch; preview is limited to 120 characters", () => {
-    const inbox = new DeferredInbox({ sendMessage: () => { throw new Error("stale"); } }, () => ({}), () => {});
+    let failing = true;
+    const injected: string[] = [];
+    const inbox = new DeferredInbox(
+      { sendMessage: () => { if (failing) throw new Error("stale"); } },
+      () => ({}), () => {},
+      (frames) => { injected.push(...frames.map((f) => f.id)); },
+    );
     inbox.push({ ...frame, body: "x".repeat(200) });
     assert.throws(() => inbox.flush(), /stale/);
     assert.equal(inbox.count, 1);
     assert.ok(inbox.list().endsWith("x".repeat(120)));
     assert.ok(!inbox.list().includes("x".repeat(121)));
+    assert.deepEqual(injected, []);
+    failing = false;
+    assert.equal(inbox.flush(), 1);
+    inbox.queueForPrompt();
+    assert.deepEqual(injected, ["m-deferred"]);
   });
 });
 

@@ -27,6 +27,7 @@ import { cmdAttach, ATTACH_USAGE } from "./cmd/attach.js";
 import { cmdTail } from "./cmd/ledger.js";
 import { cmdDoctor } from "./cmd/doctor.js";
 import { GENERAL_USAGE, printCommandHelp, printGeneralUsage } from "./cmd/help.js";
+import { cmdTailscale } from "./cmd/tailscale.js";
 
 const SEND_SPECS: ArgSpec[] = [
   { name: "room", kind: "value", short: "R", meta: "ROOM" },
@@ -561,6 +562,8 @@ export async function main(argv: string[]): Promise<number> {
       }
       return cmdTail(r.parsed.values.get("limit"));
     }
+    case "tailscale":
+      return cmdTailscale(rest);
     case "doctor": {
       // no options: --help helps, anything else is a usage error (never a
       // silently-ignored argument).

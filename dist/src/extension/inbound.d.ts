@@ -15,7 +15,9 @@ export interface InterruptReport {
 }
 export interface InjectOpts extends FormatOpts {
     replyChain?: boolean;
-    /** Called once the interrupt handling concludes (delivery done). */
+    /** Called only after sendMessage successfully hands the message to the host. */
+    onInjected?: () => void;
+    /** Called once successful delivery concludes the interrupt handling. */
     onInterruptReport?: (report: InterruptReport) => void;
     /** Timing overrides (tests) — defaults come from the named constants. */
     interruptTimings?: {
@@ -67,11 +69,11 @@ export declare const FORCE_IDLE_MAX_MS = 3000;
  * for the run to settle and then start a fresh turn with triggerTurn.
  * Falls back to a plain steer send when the deadline passes.
  */
-export declare function deliverWhenIdle(pi: Pick<ExtensionAPI, "sendMessage">, ctx: SessionContext, frame: MeshFrame, opts?: FormatOpts, pollMs?: number, maxMs?: number): void;
+export declare function deliverWhenIdle(pi: Pick<ExtensionAPI, "sendMessage">, ctx: SessionContext, frame: MeshFrame, opts?: InjectOpts, pollMs?: number, maxMs?: number): void;
 /**
- * Inject one inbound msg/mailbox/remind frame into the Pi session.
+ * Inject one inbound msg/mailbox/reply/remind frame into the Pi session.
  * force: controlled abort ONLY when the host exposes abort AND reports busy
- * (ctx.isIdle === false), then deliver once idle. Never throws.
+ * (ctx.isIdle === false), then deliver once idle. Synchronous host failures throw.
  * force+interrupt: the dedicated repeater path (deliverInterrupted).
  */
 export declare function injectInbound(pi: Pick<ExtensionAPI, "sendMessage">, ctx: SessionContext | null, frame: MeshFrame, opts?: InjectOpts): InjectedInbound;
@@ -99,9 +101,8 @@ export interface InboundDeps {
     /** injection retry delay (defaults to INJECTION_RETRY_MS; tests shrink it). */
     retryMs?: number;
 }
-/**
- * Side effects that ALWAYS run per frame (never batched): transcript,
- * ledger, read receipt, replyChain tagging..
- */
-export declare function handleInboundSideEffects(frame: MeshFrame, deps: InboundDeps): void;
+/** Tag reply-to-reply context before formatting, without claiming delivery. */
+export declare function tagInboundReplyChain(frame: MeshFrame, deps: InboundDeps): void;
 export declare function handleInboundFrame(pi: Pick<ExtensionAPI, "sendMessage">, ctx: SessionContext | null, frame: MeshFrame, deps: InboundDeps): void;
+/** Persist hash-only metadata and acknowledge a successfully injected frame. */
+export declare function recordInboundDelivery(frame: MeshFrame, deps: InboundDeps): void;

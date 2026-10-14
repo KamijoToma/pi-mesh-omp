@@ -37,6 +37,13 @@ export declare const LOCK_RETRY_MAX = 3;
 export declare const BROKER_STARTUP_DIAGNOSTIC_MAX_BYTES = 4096;
 export declare const BROKER_STOP_TIMEOUT_MS = 5000;
 export declare const BROKER_STOP_POLL_MS = 50;
+export declare const TAILSCALE_COMMAND_TIMEOUT_MS = 5000;
+export declare const TAILSCALE_MAX_OUTPUT_BYTES = 1048576;
+export declare const TAILSCALE_DISCOVERY_CACHE_MS = 30000;
+export declare const DEFAULT_TAILSCALE_PORT = 8712;
+export declare const MAX_BROKER_ID_CHARS = 64;
+export declare const TAILSCALE_MAX_SERVICE_PORTS = 65535;
+export declare const TAILSCALE_DIAGNOSTIC_MAX_CHARS = 4096;
 export declare const PROVIDER_RATE_LIMIT_HOLD_MS = 60000;
 export declare const PROVIDER_BLOCKED_HOLD_MS = 1800000;
 /** Observe model changes only while an error hold has pending recovery. */
@@ -125,6 +132,14 @@ export type MeshEndpoint = {
 };
 /** Parse `tcp://host:port`, `tls://host:port`, `unix:///path`. */
 export declare function parseEndpoint(url: string): MeshEndpoint | null;
+export interface TailscaleConfig {
+    mode: "off" | "service" | "node";
+    service?: string;
+    host?: string;
+    tag?: string;
+    port: number;
+    execPath?: string;
+}
 export interface MeshConfig {
     alias?: string;
     rooms: string[];
@@ -162,6 +177,12 @@ export interface MeshConfig {
     brokerUrl?: string;
     /** shared auth token — REQUIRED for tcp/tls endpoints. */
     brokerToken?: string;
+    /** Logical mesh identity, checked before joining an automatically discovered broker. */
+    meshId?: string;
+    /** Stable broker identity; persisted by the standalone broker when omitted. */
+    brokerId?: string;
+    /** Opt-in discovery. Explicit brokerUrl always takes precedence. */
+    tailscale?: TailscaleConfig;
     /** TLS server cert/key (broker, for tls:// listen). */
     tlsCert?: string;
     tlsKey?: string;
@@ -183,6 +204,8 @@ export interface MeshConfig {
     debug?: boolean;
 }
 export declare const DEFAULT_CONFIG: MeshConfig;
+export declare function isMeshId(value: unknown): value is string;
+export declare function isBrokerId(value: unknown): value is string;
 /**
  * Load config: defaults < <stateDir>/config.json < env.
  * Env overrides: MESH_ALIAS, MESH_ROOMS (csv), MESH_MAX_FRAME_BYTES,

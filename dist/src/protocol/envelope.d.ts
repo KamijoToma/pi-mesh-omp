@@ -1,5 +1,10 @@
 export type MeshPriority = "normal" | "urgent" | "force";
 export type MeshRole = "member" | "observer";
+export interface BrokerInfo {
+    meshId: string;
+    brokerId: string;
+    bootId: string;
+}
 export interface FileReservation {
     pattern: string;
     reason?: string;
@@ -58,6 +63,10 @@ export interface MeshFrame {
     reads?: string;
     /** shared auth token hash (hello only) — required on tcp/tls brokers. */
     token?: string;
+    /** Logical mesh selection (hello only). Omitted by legacy clients. */
+    meshId?: string;
+    /** Broker identity (welcome/status_res only). */
+    broker?: BrokerInfo;
     /** msg: sender demands the recipient's running tool be interrupted
     *  (abort the stuck turn) so the message lands with priority. Requires
     *  priority=force + reason at SEND time (reason travels hashed only). */
@@ -79,7 +88,7 @@ export interface MeshFrame {
 }
 export declare const FRAME_TYPES: readonly ["hello", "welcome", "msg", "ack", "reply", "remind", "presence", "mailbox", "status_req", "status_res", "join", "leave", "reserve", "read", "ping", "pong", "activity", "error"];
 export type MeshFrameType = (typeof FRAME_TYPES)[number];
-export declare const ERROR_CODES: readonly ["invalid_frame", "oversized", "hello_required", "invalid_alias", "alias_taken", "invalid_room", "invalid_token", "not_member", "observer_readonly", "last_room", "peer_not_found", "rate_limited", "policy_denied", "force_requires_reason", "hash_mismatch", "reply_without_target", "timeout", "expired", "shutting_down", "internal"];
+export declare const ERROR_CODES: readonly ["invalid_frame", "oversized", "hello_required", "invalid_alias", "alias_taken", "invalid_room", "invalid_token", "mesh_mismatch", "not_member", "observer_readonly", "last_room", "peer_not_found", "rate_limited", "policy_denied", "force_requires_reason", "hash_mismatch", "reply_without_target", "timeout", "expired", "shutting_down", "internal"];
 export type MeshErrorCode = (typeof ERROR_CODES)[number];
 export declare const PRIORITIES: readonly ["normal", "urgent", "force"];
 export declare const ROLES: readonly ["member", "observer"];
@@ -126,6 +135,8 @@ export interface BuildFrameOpts {
     totalCount?: number;
     reads?: string;
     token?: string;
+    meshId?: string;
+    broker?: BrokerInfo;
     interrupt?: boolean;
     receipt?: boolean;
     /** M1: extension version (hello). */

@@ -465,12 +465,18 @@ async function execMeshStatus(getRuntime, params) {
             const skew = p.clientVersion !== undefined && p.clientVersion !== localVersion ? " ⚠" : "";
             const since = p.since !== undefined ? ` since=${p.since}` : "";
             // D40: remote-machine peers (tcp/tls to the broker) carry their origin
-            const via = p.via !== undefined ? ` via=${p.via} ⟵ other machine` : "";
+            const via = p.via !== undefined ? ` via=${p.via} (network origin)` : "";
             const activity = formatPeerActivity(p, rt.client.activityIdleMs, rt.client.activityStuckMs);
             return `  @${p.alias} rooms=${p.rooms.join(",")}${v}${skew}${since}${via}${activity}`;
         }),
         `mesh rooms: ${snap.rooms.length > 0 ? snap.rooms.join(", ") : "(none)"}`,
     ];
+    if (snap.broker !== undefined) {
+        lines.push(`mesh identity: ${snap.broker.meshId} · broker=${snap.broker.brokerId} · boot=${snap.broker.bootId}`);
+    }
+    if (rt.client.connectionTarget !== null && rt.client.connectionTarget !== undefined) {
+        lines.push(`connection: ${rt.client.connectionTarget.source} ${rt.client.connectionTarget.url ?? "local socket/pipe"}`);
+    }
     // Phase 3: who is likely done — idle AND no mission of ours still
     // waiting on them (their last verdicts were all answered)
     const summary = buildStatusSummary(peers, missions);
@@ -509,6 +515,11 @@ async function execMeshStatus(getRuntime, params) {
         room,
         peers: peers.map((p) => ({ alias: p.alias, rooms: p.rooms, since: p.since, via: p.via })),
         rooms: snap.rooms,
+        broker: snap.broker,
+        connection: {
+            source: rt.client.connectionTarget?.source,
+            endpoint: rt.client.connectionTarget?.url,
+        },
     });
 }
 // ---------------------------------------------------------------- mesh_history

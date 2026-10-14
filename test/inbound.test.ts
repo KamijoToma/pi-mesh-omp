@@ -186,15 +186,19 @@ describe("handleInboundFrame: injection retry (a silent drop is the worst outcom
 
   const makeDeps = () => {
     const counters = { ledgerFailures: 0, transcriptFailures: 0, injectionFailures: 0 };
+    const ledgerInputs: unknown[] = [];
+    const transcripts: MeshFrame[] = [];
+    const reads: string[] = [];
     return {
       deps: {
-        ledger: { append: (_input: unknown) => {} },
-        transcript: { record: (_dir: "in" | "out", _f: MeshFrame) => {} },
+        ledger: { append: (input: unknown) => { ledgerInputs.push(input); } },
+        transcript: { record: (_dir: "in" | "out", f: MeshFrame) => { transcripts.push(f); } },
+        read: (msgId: string) => { reads.push(msgId); },
         selfAlias: "bob",
         counters,
         retryMs: 5,
       },
-      counters,
+      counters, ledgerInputs, transcripts, reads,
     };
   };
   const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -207,12 +211,19 @@ describe("handleInboundFrame: injection retry (a silent drop is the worst outcom
         if (calls === 1) throw new Error("transient host state");
       },
     };
-    const { deps, counters } = makeDeps();
-    handleInboundFrame(pi as never, null, frame(), deps as never);
+    const { deps, counters, ledgerInputs, transcripts, reads } = makeDeps();
+    const incoming = frame();
+    handleInboundFrame(pi, null, incoming, deps);
     assert.equal(calls, 1); // first attempt threw synchronously
+    assert.deepEqual(reads, []);
+    assert.deepEqual(ledgerInputs, []);
+    assert.deepEqual(transcripts, []);
     await sleep(30); // retryMs 5 — the retry has fired
     assert.equal(calls, 2);
     assert.equal(counters.injectionFailures, 0);
+    assert.deepEqual(reads, [incoming.id]);
+    assert.equal(ledgerInputs.length, 1);
+    assert.deepEqual(transcripts, [incoming]);
   });
 
   it("a persistent failure is counted exactly once, after the retry", async () => {
@@ -223,28 +234,28 @@ describe("handleInboundFrame: injection retry (a silent drop is the worst outcom
         throw new Error("host is gone");
       },
     };
-    const { deps, counters } = makeDeps();
-    handleInboundFrame(pi as never, null, frame(), deps as never);
+    const { deps, counters, ledgerInputs, transcripts, reads } = makeDeps();
+    handleInboundFrame(pi, null, frame(), deps);
     await sleep(30);
     assert.equal(calls, 2);
     assert.equal(counters.injectionFailures, 1);
+    assert.deepEqual(reads, []);
+    assert.deepEqual(ledgerInputs, []);
+    assert.deepEqual(transcripts, []);
   });
 
-  it("side effects (ledger/transcript/read receipt) still run on the injection-failure path", async () => {
-    const pi = { sendMessage: (): void => {
-      throw new Error("nope");
-    } };
-    const ledgerEvents: string[] = [];
-    const { counters } = makeDeps();
-    const deps = {
-      ledger: { append: (input: { event?: string }) => { ledgerEvents.push(input.event ?? "?"); } },
-      transcript: { record: (_dir: "in" | "out", _f: MeshFrame) => {} },
-      selfAlias: "bob",
-      counters,
-      retryMs: 5,
-    };
-    handleInboundFrame(pi as never, null, frame(), deps as never);
-    await sleep(30);
-    assert.ok(ledgerEvents.includes("inbound"));
+  it("only successfully injected msg/mailbox frames acknowledge new-message reads", () => {
+    const { deps, ledgerInputs, transcripts, reads } = makeDeps();
+    const incoming = (["msg", "mailbox", "reply", "remind"] as const).map((type) =>
+      buildFrame({ type, from: "alice", to: "bob", room: "default", body: "hello" }),
+    );
+    const accepted: MeshFrame[] = [];
+    for (const f of incoming) {
+      handleInboundFrame({ sendMessage: () => { accepted.push(f); } }, null, f, deps);
+    }
+    assert.deepEqual(accepted, incoming);
+    assert.deepEqual(reads, incoming.slice(0, 2).map((f) => f.id));
+    assert.deepEqual(transcripts, incoming);
+    assert.equal(ledgerInputs.length, incoming.length);
   });
 });
