@@ -14,10 +14,11 @@ export interface PendingResolution {
  */
 export declare class PendingReplies {
     private readonly onRemind;
+    private readonly onChanged?;
     private readonly entries;
     /** Replies with no matching live pending (orphan/late), for observability. */
     unmatchedReplyCount: number;
-    constructor(onRemind: (msgId: string) => void);
+    constructor(onRemind: (msgId: string) => void, onChanged?: (() => void) | undefined);
     register(msgId: string, expiresAtMs: number, launch?: boolean): Promise<PendingResolution>;
     /** True when msgId is a live LAUNCH mission (awaitReply + block:false).
      *  Consulted by the client BEFORE handleReply consumes the entry. */

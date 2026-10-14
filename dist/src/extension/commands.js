@@ -6,9 +6,10 @@ import { brokerLockPath, brokerSocketPath } from "../shared/paths.js";
 import { MESH_VERSION } from "../shared/version.js";
 import { attachClientListeners, updateSessionName } from "./attach.js";
 import { identityFromClient } from "../shared/identity-store.js";
+import { formatPeerActivity } from "./tools.js";
 import { isOmpHost, reportConnectionError } from "./host.js";
 const HELP_TEXT = [
-    "/mesh status [room]   — broker snapshot (online peers, rooms)",
+    "/mesh status [room]   — broker snapshot (peers, activity, rooms)",
     "/mesh join <room> [as <alias>] [observer]",
     "/mesh leave <room>",
     "/mesh alias [<new-alias>] — show, or change this session's alias live",
@@ -74,7 +75,7 @@ async function cmdStatus(rt, ctx, pi, room) {
         notify(ctx, `mesh: no online peers${room !== undefined ? ` in room ${room}` : ""}`);
         return;
     }
-    const lines = snap.peers.map((p) => `@${p.alias} rooms=${p.rooms.join(",")}${p.since !== undefined ? ` since=${p.since}` : ""}${p.via !== undefined ? ` via=${p.via} ⟵ other machine` : ""}`);
+    const lines = snap.peers.map((p) => `@${p.alias} rooms=${p.rooms.join(",")}${p.since !== undefined ? ` since=${p.since}` : ""}${p.via !== undefined ? ` via=${p.via} ⟵ other machine` : ""}${formatPeerActivity(p, rt.client.activityIdleMs, rt.client.activityStuckMs)}`);
     notify(ctx, `mesh peers (${snap.peers.length}):\n${lines.join("\n")}\nrooms: ${snap.rooms.join(", ") || "(none)"}`);
 }
 async function cmdJoin(rt, ctx, room, observer, asAlias, pi) {

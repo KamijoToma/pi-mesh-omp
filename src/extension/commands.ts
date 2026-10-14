@@ -9,11 +9,11 @@ import { attachClientListeners, updateSessionName } from "./attach.js";
 import type { MeshHud } from "./hud.js";
 import { identityFromClient } from "../shared/identity-store.js";
 import type { ExtensionAPI, SessionContext } from "./pi-types.js";
-import type { GetRuntime, MeshRuntime } from "./tools.js";
+import { formatPeerActivity, type GetRuntime, type MeshRuntime } from "./tools.js";
 import { isOmpHost, reportConnectionError } from "./host.js";
 
 const HELP_TEXT = [
-  "/mesh status [room]   — broker snapshot (online peers, rooms)",
+  "/mesh status [room]   — broker snapshot (peers, activity, rooms)",
   "/mesh join <room> [as <alias>] [observer]",
   "/mesh leave <room>",
   "/mesh alias [<new-alias>] — show, or change this session's alias live",
@@ -84,7 +84,7 @@ async function cmdStatus(rt: MeshRuntime, ctx: SessionContext, pi: ExtensionAPI,
     return;
   }
   const lines = snap.peers.map(
-    (p) => `@${p.alias} rooms=${p.rooms.join(",")}${p.since !== undefined ? ` since=${p.since}` : ""}${p.via !== undefined ? ` via=${p.via} ⟵ other machine` : ""}`,
+    (p) => `@${p.alias} rooms=${p.rooms.join(",")}${p.since !== undefined ? ` since=${p.since}` : ""}${p.via !== undefined ? ` via=${p.via} ⟵ other machine` : ""}${formatPeerActivity(p, rt.client.activityIdleMs, rt.client.activityStuckMs)}`,
   );
   notify(ctx, `mesh peers (${snap.peers.length}):\n${lines.join("\n")}\nrooms: ${snap.rooms.join(", ") || "(none)"}`);
 }

@@ -1,6 +1,6 @@
 import type { MeshHud } from "./hud.js";
 import type { ExtensionAPI } from "./pi-types.js";
-import type { GetRuntime, MeshRuntime } from "./tools.js";
+import { type GetRuntime, type MeshRuntime } from "./tools.js";
 /**
  * Parse `/mesh join <room> [as <alias>] [observer]` args.
  * Pure, exported for tests.

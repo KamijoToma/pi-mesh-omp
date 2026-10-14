@@ -380,7 +380,7 @@ Receipt, transcript, ledger, and mailbox behavior is unchanged.
 Deferred frames form a separate, timer-free batch; the next user prompt
 queues it with `deliverAs: "nextTurn"` and **no** `triggerTurn`. It begins
 `[mesh deferred — N broadcast(s) not addressed to you]`. In the TUI,
-`mesh:deferred N` remains in the footer until that prompt starts.
+`inbox:N` remains in the single status row above the editor until that prompt starts.
 `/mesh inbox` lists sender, time, and a 120-character preview;
 `/mesh inbox flush` delivers the pending batch now as one triggered follow-up.
 An unrelated direct-message turn does not consume the deferred inbox.
@@ -391,6 +391,14 @@ deliver it twice). If prompt preflight is cancelled after input, messages
 already handed to Pi remain queued for the next successful prompt, not
 re-sent by flush. Deferred state is session-local and cleared on reset,
 reload, or shutdown; use the existing mesh history for older frames.
+
+### Unreleased
+
+- Replaced the peer-name HUD and duplicate footer entries with one non-wrapping
+  status row above the editor. Peer count excludes self and peers in unrelated rooms.
+- Merged deferred inbox counts into that row; live waits disappear on answer,
+  cancellation or expiry. Recent inbound previews no longer add a second row.
+- `/mesh status` now includes announced activity and the legacy idle/stuck fallback.
 
 ### v0.7.2-omp.2 portability changes
 
@@ -411,8 +419,8 @@ v0.7 highlights:
   from burning model turns: only broadcasts and orphan `replyAll` replies
   without a whole-alias mention are held. Direct messages, mission answers
   (LAUNCH wake-on-answer included), urgent/force, reminders and
-  reservations stay immediate. Held frames surface as `mesh:deferred N`
-  in the TUI footer and via `/mesh inbox`; `/mesh inbox flush` delivers
+  reservations stay immediate. Held frames surface as `inbox:N`
+  in the status row above the editor and via `/mesh inbox`; `/mesh inbox flush` delivers
   them now as one triggered follow-up. Receipts, ledger and mailbox
   behavior are unchanged. Contributed by @avifenesh (#7).
 - **`mesh:alias` event** — after connect/reconnect (and rename), mesh
@@ -494,9 +502,17 @@ ping <alias> · broker · help`.
   overwrite each other. Stale persisted reservations older than 24 h are
   dropped at load; if a crashed session still holds the alias, the client
   falls back to a random one (notified + persisted) instead of looping.
-- **HUD**: a live widget above the editor shows the connection dot, rooms,
-  peers with per-agent colors and turn-state markers (`●`/`○`/`✕`),
-  pending awaits, transcript state and the last inbound preview.
+- **HUD**: one live, non-wrapping row above the editor, for example
+  `mesh ● peers:7 · agent-22c8b9`. `●`/`◐`/`○` mean connected/connecting/offline;
+  connecting and offline states hide stale peer counts. The count includes only
+  other peers sharing a room with this session. Alerts (`!err:N`), live waits
+  (`wait:N`) and deferred messages (`inbox:N`) precede the full alias so narrow
+  terminals truncate details first. The sole `default` room and disabled transcript
+  are omitted; other memberships show `@ops+N`, zero rooms show `no-room`, and an
+  enabled transcript shows `log:on`. There is no mesh footer entry or activity
+  preview row. `/mesh status [room]` lists full aliases, rooms, activity and origins;
+  `/mesh broker` retains failure counts by category, `/mesh inbox` lists held
+  messages, and `/mesh log` reports the transcript setting.
 - `/mesh broker` reports the version, session file size and compaction
   count, with a `/mesh new` hint past 15 MB.
 - `/mesh stale` lists every reservation held by peers with its age —
@@ -542,7 +558,7 @@ MESH_BROKER_URL=tcp://<machine-A>:8712 MESH_BROKER_TOKEN=change-me pi
 - **Remote peers are visible**: every peer carries its connection origin
   (`via=tcp:<ip>` / `tls:<ip>`; broker-local unix peers have none) — shown in
   `mesh_status` (`via=… ⟵ other machine`), `/mesh status`, the session
-  context block, and the HUD peers line (`alias⌁<last-ip-octet>`).
+  context block. The compact HUD shows the count, not individual peers or IPs.
 - **Privacy note**: `via` exposes the peer IP as seen by the broker — fine
   on a trusted LAN/home mesh; for a multi-org mesh, gate or truncate it
   before it rides any presence broadcast (future policy hook).

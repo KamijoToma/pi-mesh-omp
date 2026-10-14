@@ -105,5 +105,14 @@ export declare function buildStatusSummary(peers: {
     to: string;
     status: string;
 }[], idleMs?: number, stuckMs?: number, now?: number): StatusSummary;
+/** Shared detail suffix; announced activity wins over the legacy idle heuristic. */
+export declare function formatPeerActivity(peer: {
+    activity?: {
+        state: "busy" | "idle" | "rate_limited" | "blocked";
+        at: string;
+    };
+    lastSeenAt?: string;
+    reservations?: readonly unknown[];
+}, idleMs: number, stuckMs: number, now?: number): string;
 export declare function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void;
 export { MAX_BODY_BYTES };

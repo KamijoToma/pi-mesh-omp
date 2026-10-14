@@ -1,4 +1,5 @@
 import type { ExtensionContext as OmpExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { Component } from "@mariozechner/pi-tui";
 /** JSON Schema object (plain, zero-dependency constraint). */
 export type JsonSchema = Record<string, unknown>;
 export interface ToolTextContent {
@@ -35,13 +36,8 @@ export interface SessionContext {
     }>;
     ui: {
         notify(message: string, severity?: "info" | "warning" | "error"): void;
-        /**
-        * Footer-widget above the editor by default; undefined clears it.
-        * SAFE form ONLY: string[] (pi wraps each line in a Text component and
-        * truncates itself). The factory form is FORBIDDEN here — its return
-        * value must be a component object with render(width), not string[].
-        */
-        setWidget(id: string, content: string[] | undefined): void;
+        /** Above the editor by default. A factory must return a component, not lines. */
+        setWidget(id: string, content: string[] | (() => Component) | undefined): void;
         /** Compact status in the built-in footer; undefined clears it. */
         setStatus(id: string, text: string | undefined): void;
         /** TUI theme (interactive sessions); absent in headless contexts. */

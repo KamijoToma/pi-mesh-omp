@@ -33,7 +33,10 @@ export class PendingReplies {
   /** Replies with no matching live pending (orphan/late), for observability. */
   unmatchedReplyCount = 0;
 
-  constructor(private readonly onRemind: (msgId: string) => void) {}
+  constructor(
+    private readonly onRemind: (msgId: string) => void,
+    private readonly onChanged?: () => void,
+  ) {}
 
   register(msgId: string, expiresAtMs: number, launch = false): Promise<PendingResolution> {
     this.cancel(msgId, "superseded");
@@ -64,9 +67,11 @@ export class PendingReplies {
         if (this.entries.delete(msgId)) {
           entry.timers.forEach(clearTimeout);
           resolve({ kind: "expired" }); // terminal 
+          this.onChanged?.();
         }
       });
       this.entries.set(msgId, entry);
+      this.onChanged?.();
     });
   }
 
@@ -91,6 +96,7 @@ export class PendingReplies {
     this.entries.delete(replyTo);
     entry.timers.forEach(clearTimeout);
     entry.resolve({ kind: "reply", frame });
+    this.onChanged?.();
     return true;
   }
 
@@ -104,6 +110,7 @@ export class PendingReplies {
     this.entries.delete(msgId);
     entry.timers.forEach(clearTimeout);
     entry.resolve({ kind: "error", reason });
+    this.onChanged?.();
   }
 
   /** shutdown with live pendings → all resolved error{shutting_down}. */

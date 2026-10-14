@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { DeferredInbox } from "../src/extension/deferred-inbox.js";
 import { attachClientListeners } from "../src/extension/attach.js";
+import { MeshHud } from "../src/extension/hud.js";
 import { MeshClient } from "../src/client/client.js";
 import type { MeshFrame } from "../src/protocol/envelope.js";
 import type { InboundMessage, SendMessageOptions, SessionHookHandler, SessionContext } from "../src/extension/pi-types.js";
@@ -80,23 +81,28 @@ describe("deferred inbox", () => {
 
 describe("attached inbound policy", () => {
   for (const mode of ["tui", "print"] as const) {
-    it(`separates mixed traffic, preserves matched replies, and guards footer (${mode})`, async () => {
+    it(`separates mixed traffic, preserves matched replies, and retains inbox until consumption (${mode})`, async () => {
       const client = new MeshClient({ alias: "bob", config: { inboundBroadcasts: "deferred", inboundBatchMs: 0 } });
       const sent: { msg: InboundMessage; opts?: SendMessageOptions }[] = [];
-      const statuses: (string | undefined)[] = [];
+      let widget: Parameters<SessionContext["ui"]["setWidget"]>[1];
       const hooks = new Map<string, SessionHookHandler>();
       const ctx: SessionContext = {
         cwd: "/tmp", mode, isIdle: () => true,
-        ui: { notify: () => {}, setWidget: () => {}, setStatus: (_id, text) => { statuses.push(text); } },
+        ui: { notify: () => {}, setWidget: (_id, content) => { widget = content; }, setStatus: () => {} },
       };
-      const rt = { client, ctx } as MeshRuntime;
+      const rt = {
+        client, ctx, transcript: { isEnabled: () => false },
+        ledgerFailures: 0, transcriptFailures: 0, injectionFailures: 0,
+      } as MeshRuntime;
+      const hud = new MeshHud({ getRuntime: () => rt });
+      hud.attach(ctx);
+      const status = (): string => (typeof widget === "function" ? widget().render(100) : widget ?? []).join("\n");
       const pi = {
         on: (event: string, hook: SessionHookHandler) => { hooks.set(event, hook); },
         sendMessage: (msg: InboundMessage, opts?: SendMessageOptions) => { sent.push({ msg, opts }); },
         appendEntry: () => {},
       };
-      attachClientListeners(pi as never, rt, () => null, ctx, client, () => {});
-      assert.equal(hooks.size, 0, "attachment does not register session lifecycle handlers");
+      attachClientListeners(pi as never, rt, () => hud, ctx, client, () => {});
       try {
         client.emit("inbound", frame);
         client.emit("inbound", { ...frame, broadcast: false, body: "direct" });
@@ -105,20 +111,22 @@ describe("attached inbound policy", () => {
         assert.equal(sent.length, 3);
         assert.ok(sent.every((s) => s.opts?.triggerTurn === true));
         assert.equal(rt.deferredInbox?.count, 1);
-        if (mode === "tui") assert.equal(statuses.at(-1), "mesh:deferred 1");
-        else assert.equal(statuses.length, 0);
+        assert.ok(status().includes("inbox:1"));
         rt.deferredInbox?.agentStarting();
         assert.equal(rt.deferredInbox?.count, 1);
+        assert.ok(status().includes("inbox:1"), "unrelated mesh turn must not hide the held batch");
         rt.deferredInbox?.queueForPrompt();
         assert.deepEqual(sent.at(-1)!.opts, { deliverAs: "nextTurn" });
         rt.deferredInbox?.promptStarting();
         rt.deferredInbox?.agentStarting();
         assert.equal(rt.deferredInbox?.count, 0);
+        assert.ok(!status().includes("inbox:"), "consuming prompt removes the inbox badge");
         rt.markDetached?.();
         client.emit("inbound", frame);
         rt.deferredInbox?.queueForPrompt();
         assert.equal(sent.length, 4);
       } finally {
+        hud.detach();
         await client.close();
       }
     });

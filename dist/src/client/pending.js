@@ -10,11 +10,13 @@ import { MAX_REMINDS } from "../shared/config.js";
  */
 export class PendingReplies {
     onRemind;
+    onChanged;
     entries = new Map();
     /** Replies with no matching live pending (orphan/late), for observability. */
     unmatchedReplyCount = 0;
-    constructor(onRemind) {
+    constructor(onRemind, onChanged) {
         this.onRemind = onRemind;
+        this.onChanged = onChanged;
     }
     register(msgId, expiresAtMs, launch = false) {
         this.cancel(msgId, "superseded");
@@ -48,9 +50,11 @@ export class PendingReplies {
                 if (this.entries.delete(msgId)) {
                     entry.timers.forEach(clearTimeout);
                     resolve({ kind: "expired" }); // terminal 
+                    this.onChanged?.();
                 }
             });
             this.entries.set(msgId, entry);
+            this.onChanged?.();
         });
     }
     /** True when msgId is a live LAUNCH mission (awaitReply + block:false).
@@ -73,6 +77,7 @@ export class PendingReplies {
         this.entries.delete(replyTo);
         entry.timers.forEach(clearTimeout);
         entry.resolve({ kind: "reply", frame });
+        this.onChanged?.();
         return true;
     }
     has(msgId) {
@@ -85,6 +90,7 @@ export class PendingReplies {
         this.entries.delete(msgId);
         entry.timers.forEach(clearTimeout);
         entry.resolve({ kind: "error", reason });
+        this.onChanged?.();
     }
     /** shutdown with live pendings → all resolved error{shutting_down}. */
     cancelAll(reason) {

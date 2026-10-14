@@ -169,24 +169,16 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
             }, { triggerTurn: true, deliverAs: batch.deliverAs });
         });
     });
-    const deferredInbox = new DeferredInbox(pi, (frame) => formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker), (count) => guarded(() => {
-        const currentCtx = rt.ctx ?? ctx;
-        if (currentCtx.mode === "tui")
-            currentCtx.ui.setStatus("mesh-inbox", count > 0 ? `mesh:deferred ${count}` : undefined);
-    }));
+    const deferredInbox = new DeferredInbox(pi, (frame) => formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker), () => guarded(() => getHud()?.refresh()));
     rt.deferredInbox = deferredInbox;
-    guarded(() => {
-        const currentCtx = rt.ctx ?? ctx;
-        if (currentCtx.mode === "tui")
-            currentCtx.ui.setStatus("mesh-inbox", undefined);
-    });
+    guarded(() => getHud()?.refresh());
     // rate-limited hold: while the provider rejects turns (429), inbound
     // frames are NOT injected — every injection would burn another failed
     // turn. They are queued and delivered when the hold expires.
     const heldFrames = [];
     const deliver = (frame, matchedReply) => {
         handleInboundSideEffects(frame, deps);
-        getHud()?.noteInbound(frame); // preview: transient memory only, never persisted
+        getHud()?.refresh();
         if (classifyInbound(frame, client.alias, client.inboundBroadcasts, matchedReply) === "deferred") {
             deferredInbox.push(frame);
             return;
@@ -392,8 +384,7 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
     });
     client.on("closed", () => { if (active())
         getHud()?.onClosed(); });
-    client.on("expired", ({ msgId }) => { if (active())
-        getHud()?.noteExpired(msgId); });
+    client.on("pending", () => guarded(() => getHud()?.refresh()));
     // async drop receipt: the broker dropped one of OUR messages from the
     // recipient's offline mailbox (TTL expiry or cap eviction). The client
     // already settled any live awaitReply mission; the session must LEARN

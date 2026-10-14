@@ -1,150 +1,104 @@
-// test/hud-widget.test.ts — REGRESSION for the pi TUI crash
-// "TypeError: child.render is not a function": MeshHud.refresh() used to pass
-// a FACTORY returning string[] to ctx.ui.setWidget; pi uses a factory's return
-// value directly as a component (needs render(width)) → crash. This capture
-// test proves EVERY setWidget payload is either undefined or a real string[].
+// Exercise the real TUI container and pending lifecycle, not widget payload shape.
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { HUD_STATUS_ID, HUD_WIDGET_ID, MeshHud } from "../src/extension/hud.js";
+import { Container, visibleWidth } from "@mariozechner/pi-tui";
+import { MeshClient } from "../src/client/client.js";
+import { attachClientListeners } from "../src/extension/attach.js";
+import { MeshHud } from "../src/extension/hud.js";
 import type { SessionContext } from "../src/extension/pi-types.js";
 import type { MeshRuntime } from "../src/extension/tools.js";
-import type { MeshFrame } from "../src/protocol/envelope.js";
+import { makeTempDirs, startTestBroker, waitFor } from "./helpers.js";
 
-type WidgetCall = { id: string; content: unknown };
-type StatusCall = { id: string; text: string | undefined };
-
-function makeCtx(): { ctx: SessionContext; widgets: WidgetCall[]; statuses: StatusCall[] } {
-  const widgets: WidgetCall[] = [];
-  const statuses: StatusCall[] = [];
+function surface(rt: MeshRuntime) {
+  let widget: Parameters<SessionContext["ui"]["setWidget"]>[1];
   const ctx: SessionContext = {
-    cwd: "/tmp",
+    cwd: "/tmp", mode: "tui",
     ui: {
       notify: () => {},
-      setWidget: (id, content) => {
-        widgets.push({ id, content });
-      },
-      setStatus: (id, text) => {
-        statuses.push({ id, text });
-      },
-      theme: { fg: (_c, t) => t },
+      setWidget: (_id, content) => { widget = content; },
+      setStatus: () => {},
+      theme: { fg: (_color, text) => `\u001b[32m${text}\u001b[0m` },
     },
   };
-  return { ctx, widgets, statuses };
+  const hud = new MeshHud({ getRuntime: () => rt });
+  hud.attach(ctx);
+  const render = (width: number): string[] => {
+    const container = new Container();
+    if (typeof widget !== "function") throw new Error("Expected an interactive component");
+    container.addChild(widget());
+    return container.render(width);
+  };
+  return { ctx, hud, render };
 }
 
-/** Assert pi-safe payload: undefined OR a real Array whose items are ALL strings. */
-function assertSafeWidgetPayload(call: WidgetCall): void {
-  if (call.content === undefined) return;
-  assert.ok(
-    Array.isArray(call.content),
-    `setWidget('${call.id}') got non-array payload: ${typeof call.content}`,
-  );
-  for (const line of call.content as unknown[]) {
-    assert.equal(typeof line, "string", `widget line not a string: ${String(line)}`);
-  }
-}
-
-/** Minimal fake runtime: online client "alice", transcript on, no failures. */
-function onlineRuntime(): MeshRuntime {
-  return {
-    client: {
-      alias: "alice",
-      isOnline: () => true,
-      pendingCount: 0,
-      status: async () => ({ peers: [], rooms: ["default"] }),
-    },
-    transcript: { isEnabled: () => true },
-    ledgerFailures: 0,
-    transcriptFailures: 0,
-    injectionFailures: 0,
-  } as unknown as MeshRuntime;
-}
-
-function frame(over: Partial<MeshFrame> = {}): MeshFrame {
-  return {
-    v: 1,
-    id: "m_1",
-    ts: Date.now(),
-    from: "bob",
-    room: "ops",
-    body: "salut alice",
-    ...over,
-  } as MeshFrame;
-}
-
-describe("hud-widget: pi-safe setWidget payloads (crash regression)", () => {
-  it("offline (no runtime): every payload is undefined or a string array", () => {
-    const { ctx, widgets } = makeCtx();
-    const hud = new MeshHud({ getRuntime: () => null });
-    hud.attach(ctx); // → refresh()
-    hud.refresh();
-    hud.noteExpired("m_abc123"); // 2-line activity variant
-    assert.ok(widgets.length >= 3);
-    for (const call of widgets) assertSafeWidgetPayload(call);
-    for (const call of widgets) {
-      if (Array.isArray(call.content)) assert.ok(call.content.length >= 1);
-    }
-  });
-
-  it("connecting: ◐ state payloads are string arrays", () => {
-    const { ctx, widgets } = makeCtx();
-    const hud = new MeshHud({ getRuntime: () => null });
-    hud.attach(ctx);
-    hud.setConnecting(true);
-    hud.onClosed(); // reconnect marker → still connecting
-    for (const call of widgets) assertSafeWidgetPayload(call);
-  });
-
-  it("online with inbound activity: payloads are string arrays, never functions", () => {
-    const { ctx, widgets } = makeCtx();
-    const hud = new MeshHud({ getRuntime: onlineRuntime });
-    hud.attach(ctx);
-    hud.noteInbound(frame()); // 2-line widget
-    hud.onLocalChange();
-    for (const call of widgets) assertSafeWidgetPayload(call);
-    for (const call of widgets) {
-      assert.notEqual(typeof call.content, "function", "factory form must be gone");
-    }
-  });
-
-  it("headless (no theme): falls back to plain string[] lines", () => {
-    const widgets: WidgetCall[] = [];
-    const ctx: SessionContext = {
-      cwd: "/tmp",
-      ui: {
-        notify: () => {},
-        setWidget: (id, content) => {
-          widgets.push({ id, content });
-        },
-        setStatus: () => {},
-        // no theme
+describe("compact HUD component", () => {
+  it("keeps alerts ahead of long details and never wraps on resize", () => {
+    const rt = {
+      client: {
+        alias: "agent-" + "x".repeat(80), rooms: ["ops", "review"],
+        isOnline: () => true, pendingCount: 2,
       },
-    };
-    const hud = new MeshHud({ getRuntime: () => null });
-    hud.attach(ctx);
-    assert.ok(widgets.length >= 1);
-    for (const call of widgets) assertSafeWidgetPayload(call);
-    const last = widgets.at(-1)!;
-    assert.ok(Array.isArray(last.content));
-    for (const line of last.content as string[]) {
-      assert.ok(!line.includes(""), "plain lines expected without theme");
+      deferredInbox: { count: 4 }, transcript: { isEnabled: () => true },
+      ledgerFailures: 1, transcriptFailures: 2, injectionFailures: 0,
+    } as unknown as MeshRuntime;
+    const { hud, render } = surface(rt);
+    try {
+      for (const width of [1, 8, 44, 86, 180]) {
+        const lines = render(width);
+        assert.equal(lines.length, 1, `wrapped at ${width} columns`);
+        assert.ok(visibleWidth(lines[0]!) <= width);
+      }
+      const narrow = render(44)[0]!;
+      assert.ok(narrow.includes("!err:3"));
+      assert.ok(narrow.includes("wait:2"));
+      assert.ok(narrow.includes("inbox:4"));
+      const wide = render(180)[0]!;
+      assert.ok(wide.includes(rt.client.alias));
+      assert.ok(wide.includes("@ops+1"));
+    } finally {
+      hud.detach();
     }
   });
 
-  it("detach(): clears widget (undefined) and status (undefined)", () => {
-    const { ctx, widgets, statuses } = makeCtx();
-    const hud = new MeshHud({ getRuntime: () => null });
-    hud.attach(ctx);
-    hud.detach();
-    const lastWidget = widgets.at(-1)!;
-    assert.equal(lastWidget.id, HUD_WIDGET_ID);
-    assert.equal(lastWidget.content, undefined);
-    const lastStatus = statuses.at(-1)!;
-    assert.equal(lastStatus.id, HUD_STATUS_ID);
-    assert.equal(lastStatus.text, undefined);
-    // detach is terminal: further refresh() is a no-op
-    const count = widgets.length;
-    hud.refresh();
-    assert.equal(widgets.length, count);
+  it("shows waits immediately and clears them on answer, abort and expiry", async () => {
+    const dirs = makeTempDirs("mesh-hud-");
+    const broker = await startTestBroker(dirs.runtimeDir);
+    const client = new MeshClient({ alias: "self", runtimeDir: dirs.runtimeDir, noReconnect: true });
+    const peer = new MeshClient({ alias: "peer", runtimeDir: dirs.runtimeDir, noReconnect: true });
+    const rt = {
+      client, transcript: { isEnabled: () => false },
+      ledgerFailures: 0, transcriptFailures: 0, injectionFailures: 0,
+    } as MeshRuntime;
+    const { ctx, hud, render } = surface(rt);
+    rt.ctx = ctx;
+    const text = () => render(100).join("\n");
+    try {
+      await Promise.all([client.connect(), peer.connect()]);
+      attachClientListeners({ sendMessage: () => {}, appendEntry: () => {} } as never,
+        rt, () => hud, ctx, client, () => {});
+      const sent = await client.send({ to: "peer", message: "answer", awaitReply: true, block: false, timeoutMs: 5000 });
+      if (sent.status !== "delivered") assert.fail(`Send failed: ${sent.status}`);
+      assert.ok(text().includes("wait:1"));
+      await peer.reply(sent.msgId, "done");
+      await waitFor(() => !text().includes("wait:"));
+
+      const controller = new AbortController();
+      const pending = client.send({ to: "peer", message: "cancel", awaitReply: true, timeoutMs: 5000, signal: controller.signal });
+      await waitFor(() => text().includes("wait:1"));
+      controller.abort();
+      const cancelled = await pending;
+      assert.equal(cancelled.status, "error");
+      assert.ok(!text().includes("wait:"));
+
+      await client.send({ to: "peer", message: "expire", awaitReply: true, block: false, timeoutMs: 1000 });
+      assert.ok(text().includes("wait:1"));
+      await waitFor(() => !text().includes("wait:"));
+    } finally {
+      rt.markDetached?.();
+      hud.detach();
+      await Promise.all([client.close(), peer.close()]);
+      await broker.close();
+      dirs.cleanup();
+    }
   });
 });

@@ -601,21 +601,8 @@ async function execMeshStatus(
       const since = p.since !== undefined ? ` since=${p.since}` : "";
   // D40: remote-machine peers (tcp/tls to the broker) carry their origin
       const via = p.via !== undefined ? ` via=${p.via} ⟵ other machine` : "";
-  // Phase 3: announced turn state wins; heuristic (lastSeenAt) as
-  // fallback for peers that never announce (old versions)
-      if (p.activity !== undefined) {
-        const tag = p.activity.state === "busy"
-          ? " ● working"
-          : p.activity.state === "rate_limited"
-            ? " ⛔ rate-limited"
-            : p.activity.state === "blocked"
-              ? " ✖ blocked (needs intervention)"
-              : ` ○ idle (since ${localTime(p.activity.at)})`;
-        return `  @${p.alias} rooms=${p.rooms.join(",")}${v}${skew}${since}${via}${tag}`;
-      }
-      const act = computePeerStatus(p.lastSeenAt, (p.reservations?.length ?? 0) > 0, rt.client.activityIdleMs, rt.client.activityStuckMs);
-      const actTag = act.status === "active" ? "" : act.status === "stuck" ? ` ✕stuck ${act.idleFor}` : ` ○idle ${act.idleFor}`;
-      return `  @${p.alias} rooms=${p.rooms.join(",")}${v}${skew}${since}${via}${actTag}`;
+      const activity = formatPeerActivity(p, rt.client.activityIdleMs, rt.client.activityStuckMs);
+      return `  @${p.alias} rooms=${p.rooms.join(",")}${v}${skew}${since}${via}${activity}`;
     }),
     `mesh rooms: ${snap.rooms.length > 0 ? snap.rooms.join(", ") : "(none)"}`,
   ];
@@ -772,6 +759,30 @@ export function buildStatusSummary(
     }
   }
   return { total: peers.length, working, idle, stuck, rateLimited, blocked, likelyDone };
+}
+
+/** Shared detail suffix; announced activity wins over the legacy idle heuristic. */
+export function formatPeerActivity(
+  peer: {
+    activity?: { state: "busy" | "idle" | "rate_limited" | "blocked"; at: string };
+    lastSeenAt?: string;
+    reservations?: readonly unknown[];
+  },
+  idleMs: number,
+  stuckMs: number,
+  now = Date.now(),
+): string {
+  if (peer.activity !== undefined) {
+    switch (peer.activity.state) {
+      case "busy": return " ● working";
+      case "rate_limited": return " ⛔ rate-limited";
+      case "blocked": return " ✖ blocked (needs intervention)";
+      case "idle": return ` ○ idle (since ${localTime(peer.activity.at)})`;
+    }
+  }
+  const activity = computePeerStatus(peer.lastSeenAt, (peer.reservations?.length ?? 0) > 0, idleMs, stuckMs, now);
+  return activity.status === "active" ? "" : activity.status === "stuck"
+    ? ` ✕stuck ${activity.idleFor}` : ` ○idle ${activity.idleFor}`;
 }
 
 /** Local HH:MM:SS from an ISO timestamp (best effort, display only). */

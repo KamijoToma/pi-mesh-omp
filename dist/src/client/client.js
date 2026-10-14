@@ -157,7 +157,7 @@ export class MeshClient extends EventEmitter {
         }
         if (opts.onFrame)
             this.on("frame", opts.onFrame);
-        this.pending = new PendingReplies((msgId) => this.sendRemind(msgId));
+        this.pending = new PendingReplies((msgId) => this.sendRemind(msgId), () => this.emit("pending"));
     }
     get alias() {
         return this.aliasInternal;
