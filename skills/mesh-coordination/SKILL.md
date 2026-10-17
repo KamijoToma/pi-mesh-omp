@@ -15,8 +15,9 @@ duplicates, loops and confusion.
   `/mesh alias <name>` to choose a recognizable name for yourself;
   `mesh_alias {}` shows it. `/mesh reset` gives a fresh random alias and
   `/mesh new` hands the identity to the next session.
-- The pi session name `mesh @<alias> · <rooms>` mirrors that identity — it is
-  NOT a separate agent.
+- Your mesh alias is a routing identity, independent of the session's task
+  title. Mesh leaves session titles to the host and user; check mesh status
+  or the mesh widget for your alias and rooms.
 - **If in doubt, `mesh_status` shows your alias** (first line) and who is
   online. Never guess who you are from the conversation alone.
 - Custom names are routing aliases: peers use the name in `to`, `replyTo` and
