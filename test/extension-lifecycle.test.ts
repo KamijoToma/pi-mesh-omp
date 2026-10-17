@@ -122,7 +122,7 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
   await emit("session_start");
   await ready;
   return {
-    dirs, observer, sent, notifications, timers, entries,
+    dirs, observer, sent, notifications, timers, entries, names,
     packageRoot,
     updateVersion: (version: string) => {
       fs.writeFileSync(path.join(packageRoot, "dist", "src", "shared", "version.js"),
@@ -167,6 +167,40 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
 }
 
 describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_000 }, () => {
+  it("both hosts keep task titles independent of mesh identity changes", async () => {
+    for (const omp of [true, false]) {
+      const fixture = await lifecycleFixture(omp);
+      try {
+        assert.equal(fixture.names.get("original"), undefined);
+        await fixture.command("join title-room");
+        assert.equal(fixture.names.get("original"), undefined);
+
+        fixture.names.set("original", "Review host-owned task");
+        await fixture.command("alias title-reviewer");
+        await fixture.tool("mesh_alias", { alias: "title-author" });
+        await fixture.command("leave title-room");
+        assert.equal(fixture.alias(), "title-author");
+        assert.deepEqual(fixture.identity.load("original")?.rooms, ["default"]);
+        assert.equal(fixture.names.get("original"), "Review host-owned task");
+
+        // Existing mesh-looking titles belong to the host too; do not migrate them implicitly.
+        fixture.names.set("original", "mesh @legacy · default");
+        await fixture.command("reset");
+        await fixture.switchTo("original", "resume");
+        assert.equal(fixture.names.get("original"), "mesh @legacy · default");
+        assert.equal(fixture.identity.load("original")?.alias, fixture.alias());
+
+        await fixture.switchTo("untitled-session", "new");
+        assert.equal(fixture.names.get("untitled-session"), undefined);
+        fixture.names.set("fork-session", "Inherited task title");
+        await fixture.switchTo("fork-session", "fork");
+        assert.equal(fixture.names.get("fork-session"), "Inherited task title");
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
   it("both hosts switch out of every old room while join stays additive, and resume restores only the destination", async () => {
     for (const omp of [true, false]) {
       const fixture = await lifecycleFixture(omp);

@@ -25,14 +25,6 @@ export declare function buildReconnectDiff(prev: readonly string[], next: readon
 /** Public, process-local identity bridge for other extensions. */
 export declare function exposeAlias(pi: ExtensionAPI, alias: string, rooms: readonly string[]): void;
 /**
- * name the pi session so /resume and the session selector show the mesh
- * identity AND the conversation: `mesh @agent-1 · cs-room — <first message>`.
- * A user-defined name is NEVER overwritten; the mesh name is refreshed on
- * ready/rename/join/leave. The first message is kept exactly like pi's
- * default display (session.name ?? session.firstMessage) so nothing is lost.
- */
-export declare function updateSessionName(pi: ExtensionAPI, rt: MeshRuntime): void;
-/**
  * Attach every client event handler to `client`. `rt` is the CURRENT runtime
  * object (its `.client` field may be replaced later by /mesh reset — the
  * handlers always read the runtime they were attached with, so the reset path

@@ -262,8 +262,11 @@ a whole-name mention of the new alias is delivered immediately.
 Names use the existing routing alias, not a separate display-name registry:
 2–32 ASCII characters, starting with a letter, then letters, digits or hyphens.
 Leading `@`, surrounding whitespace and uppercase are normalized. Live-peer
-collisions are refused and the previous alias is restored. The session identity,
-session title and mesh status follow the name, including after reload/resume.
+collisions are refused and the previous alias is restored. Mesh identity and
+status follow the name, including after reload/resume. Session titles remain
+owned by the host and user: mesh never automatically sets or refreshes them,
+so host-generated task titles remain available. Existing mesh-prefixed titles
+are left unchanged; use the host's `/rename` to replace them.
 Choose names before dispatching missions: renaming briefly reconnects the client
 and cancels in-flight requests. Tell collaborators the new name; old aliases do
 not redirect to it.

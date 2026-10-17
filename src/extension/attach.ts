@@ -1,7 +1,6 @@
 // extension/attach.ts — client→session wiring, shared by session_start and
 // /mesh reset: both need a fully-wired MeshClient, and reset must be
 // able to REPLACE the client in-place without a pi reload.
-import * as fs from "node:fs";
 import type { MeshClient, WelcomeInfo } from "../client/client.js";
 import type { MeshFrame } from "../protocol/envelope.js";
 import { buildBatchMessage, bypassesBatch, batchDetails, InboundBatcher } from "./batcher.js";
@@ -57,66 +56,6 @@ export function buildReconnectDiff(prev: readonly string[], next: readonly strin
 export function exposeAlias(pi: ExtensionAPI, alias: string, rooms: readonly string[]): void {
   (globalThis as Record<symbol, unknown>)[Symbol.for("pi-mesh:alias")] = alias;
   pi.events?.emit("mesh:alias", { alias, rooms: [...rooms] });
-}
-
-/** session name keeps the first user message after the mesh identity. */
-const SESSION_NAME_MSG_MAX = 80;
-
-const SESSION_NAME_SCAN_BYTES = 256 * 1024; // first 256 KiB of the session file
-
-/**
- * Read the FIRST user message of the session file (what pi's /resume shows
- * when no name is set). Best effort; the scan stops at the first user text.
- */
-function firstUserMessage(sessionFile: string | undefined): string | undefined {
-  if (sessionFile === undefined || sessionFile === "") return undefined;
-  let head: string;
-  try {
-    head = fs.readFileSync(sessionFile, "utf8").slice(0, SESSION_NAME_SCAN_BYTES);
-  } catch {
-    return undefined;
-  }
-  for (const line of head.split("\n")) {
-    if (line.trim() === "") continue;
-    let entry: { type?: string; message?: { role?: string; content?: unknown } };
-    try {
-      entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
-    } catch {
-      continue;
-    }
-    if (entry.type !== "message" || entry.message?.role !== "user") continue;
-    const content = entry.message.content;
-    const text = Array.isArray(content)
-      ? content
-          .map((c) => (typeof c === "object" && c !== null && (c as { type?: string; text?: string }).type === "text" ? (c as { text?: string }).text ?? "" : ""))
-          .join(" ")
-          .trim()
-      : typeof content === "string"
-        ? content.trim()
-        : "";
-    if (text.length > 0) return text.length > SESSION_NAME_MSG_MAX ? `${text.slice(0, SESSION_NAME_MSG_MAX - 1)}…` : text;
-  }
-  return undefined;
-}
-
-/**
- * name the pi session so /resume and the session selector show the mesh
- * identity AND the conversation: `mesh @agent-1 · cs-room — <first message>`.
- * A user-defined name is NEVER overwritten; the mesh name is refreshed on
- * ready/rename/join/leave. The first message is kept exactly like pi's
- * default display (session.name ?? session.firstMessage) so nothing is lost.
- */
-export function updateSessionName(pi: ExtensionAPI, rt: MeshRuntime): void {
-  try {
-    if (typeof pi.getSessionName !== "function" || typeof pi.setSessionName !== "function") return;
-    const current = pi.getSessionName();
-    if (current !== undefined && current !== "" && !current.startsWith("mesh ")) return;
-    const rooms = rt.client.rooms.length > 0 ? ` · ${rt.client.rooms.join(",")}` : "";
-    const first = firstUserMessage(rt.ctx?.sessionManager?.getSessionFile?.());
-    pi.setSessionName(`mesh @${rt.client.alias}${rooms}${first !== undefined ? ` — ${first}` : ""}`);
-  } catch {
-  // best effort
-  }
 }
 
 /**
@@ -387,7 +326,6 @@ export function attachClientListeners(
   client.on("ready", (welcome: WelcomeInfo) => {
     if (!active()) return;
     guarded(() => exposeAlias(pi, client.alias, client.rooms));
-    guarded(() => updateSessionName(pi, rt));
     getHud()?.setConnecting(false);
     getHud()?.fetchStatus(); // fire-and-forget, never blocks session_start
   // persist identity as soon as we are connected (covers the very
@@ -476,7 +414,6 @@ export function attachClientListeners(
   client.on("renamed", () => {
     if (!active()) return;
     guarded(() => exposeAlias(pi, client.alias, client.rooms));
-    guarded(() => updateSessionName(pi, rt));
     saveIdentity(rt); // disk-only
   });
   client.on("alias_fallback", ({ from, to }: { from: string; to: string }) => {

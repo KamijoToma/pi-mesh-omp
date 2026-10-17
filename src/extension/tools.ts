@@ -593,7 +593,7 @@ async function execMeshAlias(
     return textResult(`blocked: ${renamed.reason} — current alias @${rt.client.alias}`,
       { status: "blocked", reason: renamed.reason, alias: rt.client.alias });
   }
-  // attach.ts synchronizes persistence, session name and HUD on ready/renamed.
+  // attach.ts synchronizes persistence and the public identity bridge on ready/renamed.
   const status = renamed.unchanged === true ? "unchanged" : "renamed";
   const text = renamed.unchanged === true
     ? `mesh alias: @${renamed.alias} (unchanged)`

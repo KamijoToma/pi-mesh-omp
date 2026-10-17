@@ -6,7 +6,7 @@ import { MeshClient } from "../client/client.js";
 import { loadConfig, TAILSCALE_DIAGNOSTIC_MAX_CHARS } from "../shared/config.js";
 import { brokerLockPath, brokerSocketPath } from "../shared/paths.js";
 import { MESH_VERSION } from "../shared/version.js";
-import { attachClientListeners, updateSessionName } from "./attach.js";
+import { attachClientListeners } from "./attach.js";
 import { identityFromClient } from "../shared/identity-store.js";
 import { formatPeerActivity } from "./tools.js";
 import { isOmpHost, reportConnectionError } from "./host.js";
@@ -85,7 +85,7 @@ async function cmdStatus(rt, ctx, pi, room) {
     const lines = snap.peers.map((p) => `@${p.alias} rooms=${p.rooms.join(",")}${p.since !== undefined ? ` since=${p.since}` : ""}${p.via !== undefined ? ` via=${p.via} (network origin)` : ""}${formatPeerActivity(p, rt.client.activityIdleMs, rt.client.activityStuckMs)}`);
     notify(ctx, `mesh peers (${snap.peers.length}):\n${lines.join("\n")}\nrooms: ${snap.rooms.join(", ") || "(none)"}`);
 }
-async function cmdJoin(rt, ctx, room, observer, asAlias, pi, mode = "join") {
+async function cmdJoin(rt, ctx, room, observer, asAlias, mode = "join") {
     if (mode === "switch" && room === undefined) {
         notify(ctx, "usage: /mesh switch <room> [as <alias>] [observer]");
         return;
@@ -135,10 +135,9 @@ async function cmdJoin(rt, ctx, room, observer, asAlias, pi, mode = "join") {
     finally {
         // A failed leave may follow successful joins/leaves; persist the actual state.
         persistIdentity(rt);
-        updateSessionName(pi, rt);
     }
 }
-async function cmdLeave(rt, ctx, room, pi) {
+async function cmdLeave(rt, ctx, room) {
     if (room === undefined) {
         notify(ctx, "usage: /mesh leave <room>");
         return;
@@ -147,7 +146,6 @@ async function cmdLeave(rt, ctx, room, pi) {
         await rt.client.leave(room);
         notify(ctx, `mesh: left ${room}`);
         persistIdentity(rt);
-        updateSessionName(pi, rt);
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -162,7 +160,7 @@ async function cmdLeave(rt, ctx, room, pi) {
         }
     }
 }
-async function cmdAlias(rt, ctx, alias, pi) {
+async function cmdAlias(rt, ctx, alias) {
     if (alias === undefined) {
         notify(ctx, `mesh alias: @${rt.client.alias}`);
         return;
@@ -172,7 +170,6 @@ async function cmdAlias(rt, ctx, alias, pi) {
         if (renamed.unchanged !== true) {
             notify(ctx, `mesh: alias changed @${renamed.alias}`);
             persistIdentity(rt);
-            updateSessionName(pi, rt);
         }
         else {
             notify(ctx, `mesh alias: @${rt.client.alias}`);
@@ -266,7 +263,6 @@ async function cmdReset(rt, ctx, pi, getHud, getRuntime, resetActivity) {
             await fresh.close().catch(() => { });
             return;
         }
-        updateSessionName(pi, rt);
         notify(ctx, `mesh: identity reset — was @${oldAlias}, now @${fresh.alias} (rooms: ${fresh.rooms.join(",") || "default"})`);
     }
     catch (error) {
@@ -453,7 +449,6 @@ async function cmdTailnet(rt, ctx, args, pi, getRuntime, getHud) {
             if (!isCurrent())
                 return;
             persistIdentity(rt);
-            updateSessionName(pi, rt);
             result.details.connected = true;
             result.text = `mesh ${client.brokerInfo?.meshId} connected at ${client.connectionTarget?.url} as @${client.alias}; selection saved`;
         }
@@ -501,16 +496,16 @@ getHud = () => null, resetActivity) {
                 case "join":
                 case "switch": {
                     const parsed = parseJoinArgs(rest);
-                    await cmdJoin(rt, ctx, parsed.room, parsed.observer, parsed.asAlias, pi, sub);
+                    await cmdJoin(rt, ctx, parsed.room, parsed.observer, parsed.asAlias, sub);
                     onChanged?.();
                     break;
                 }
                 case "leave":
-                    await cmdLeave(rt, ctx, rest[0], pi);
+                    await cmdLeave(rt, ctx, rest[0]);
                     onChanged?.();
                     break;
                 case "alias":
-                    await cmdAlias(rt, ctx, rest[0], pi);
+                    await cmdAlias(rt, ctx, rest[0]);
                     onChanged?.();
                     break;
                 case "log":

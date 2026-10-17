@@ -107,9 +107,6 @@ export interface ExtensionAPI {
     registerCommand(name: string, def: CommandDefinition): void;
     sendMessage(msg: InboundMessage, opts?: SendMessageOptions): void;
     appendEntry(customType: string, data?: unknown): void;
-    /** Session display name — shown in /resume and the session selector. */
-    setSessionName?(name: string): void;
-    getSessionName?(): string | undefined;
     /** Register a custom renderer for CustomMessageEntry: colors). */
     registerMessageRenderer?<T = unknown>(customType: string, renderer: MessageRenderer<T>): void;
     /** Register a renderer for CustomEntry — LIVE display outside the LLM
