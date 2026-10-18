@@ -11,12 +11,14 @@ import { MAX_REMINDS } from "../shared/config.js";
 export class PendingReplies {
     onRemind;
     onChanged;
+    onSettled;
     entries = new Map();
     /** Replies with no matching live pending (orphan/late), for observability. */
     unmatchedReplyCount = 0;
-    constructor(onRemind, onChanged) {
+    constructor(onRemind, onChanged, onSettled) {
         this.onRemind = onRemind;
         this.onChanged = onChanged;
+        this.onSettled = onSettled;
     }
     register(msgId, expiresAtMs, launch = false) {
         this.cancel(msgId, "superseded");
@@ -49,7 +51,9 @@ export class PendingReplies {
             schedule(total, () => {
                 if (this.entries.delete(msgId)) {
                     entry.timers.forEach(clearTimeout);
-                    resolve({ kind: "expired" }); // terminal 
+                    const resolution = { kind: "expired" };
+                    this.onSettled?.(msgId, resolution);
+                    resolve(resolution);
                     this.onChanged?.();
                 }
             });
@@ -76,7 +80,9 @@ export class PendingReplies {
         }
         this.entries.delete(replyTo);
         entry.timers.forEach(clearTimeout);
-        entry.resolve({ kind: "reply", frame });
+        const resolution = { kind: "reply", frame };
+        this.onSettled?.(replyTo, resolution);
+        entry.resolve(resolution);
         this.onChanged?.();
         return true;
     }
@@ -89,10 +95,12 @@ export class PendingReplies {
             return;
         this.entries.delete(msgId);
         entry.timers.forEach(clearTimeout);
-        entry.resolve({ kind: "error", reason });
+        const resolution = { kind: "error", reason };
+        this.onSettled?.(msgId, resolution);
+        entry.resolve(resolution);
         this.onChanged?.();
     }
-    /** shutdown with live pendings → all resolved error{shutting_down}. */
+    /** Resolve all live entries with the caller's lifecycle reason. */
     cancelAll(reason) {
         for (const msgId of [...this.entries.keys()])
             this.cancel(msgId, reason);

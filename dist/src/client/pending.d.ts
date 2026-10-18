@@ -15,10 +15,11 @@ export interface PendingResolution {
 export declare class PendingReplies {
     private readonly onRemind;
     private readonly onChanged?;
+    private readonly onSettled?;
     private readonly entries;
     /** Replies with no matching live pending (orphan/late), for observability. */
     unmatchedReplyCount: number;
-    constructor(onRemind: (msgId: string) => void, onChanged?: (() => void) | undefined);
+    constructor(onRemind: (msgId: string) => void, onChanged?: (() => void) | undefined, onSettled?: ((msgId: string, resolution: PendingResolution) => void) | undefined);
     register(msgId: string, expiresAtMs: number, launch?: boolean): Promise<PendingResolution>;
     /** True when msgId is a live LAUNCH mission (awaitReply + block:false).
      *  Consulted by the client BEFORE handleReply consumes the entry. */
@@ -27,7 +28,7 @@ export declare class PendingReplies {
     handleReply(frame: MeshFrame): boolean;
     has(msgId: string): boolean;
     cancel(msgId: string, reason: string): void;
-    /** shutdown with live pendings → all resolved error{shutting_down}. */
+    /** Resolve all live entries with the caller's lifecycle reason. */
     cancelAll(reason: string): void;
     get size(): number;
 }

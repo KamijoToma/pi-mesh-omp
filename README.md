@@ -45,7 +45,9 @@ upstream npm package.
 - **Rooms & roles** — presence per room, `member` / `observer` roles,
   declarative policy (allow/deny lists, `force` authorization, rate limits).
 - **Offline mailbox** — per-alias queue (cap 100, TTL 1 h) flushed at the next
-  hello; senders get the honest `queued_offline` status.
+  hello; senders get `queued_offline`, followed by an asynchronous delivery
+  notice after a successful write. Failed writes retain undelivered entries;
+  unencodable envelopes produce explicit drop notices, never false delivery counts.
 - **Broadcast & reply variants** — `broadcast: true` fans out to a whole
   room (honest `deliveredCount/totalCount`), `mesh_reply` supports
   `replyAll` and targeted `to:` replies. `mesh_send` `replyTo: [aliases]`
@@ -62,9 +64,12 @@ upstream npm package.
   Expired or failed missions remain listed as missing even if they settle
   before the wait starts; a batch with only terminal missing missions returns
   immediately rather than reporting a false success.
-  A blocking `mesh_send` (default) can be aborted with
-  ESC — the pending settles immediately as `cancelled` and a late reply is
-  still injected.
+  Actionable new messages yield the passive wait without aborting the turn;
+  a previously-online target leaving the mission room returns an error without
+  cancelling its task. Initially offline queued tasks still wait for reconnect.
+  A blocking `mesh_send` can be aborted with ESC before/during connection or
+  delivery; its reason is `aborted`. After a write, delivery may be unknown:
+  a cancellation is not proof of non-delivery, and late replies still arrive.
 - **Inbound batching** — bursts are held while the agent is busy (long tool
   call) and injected as ONE batched message; live preview entries show the
   burst in real time while it happens (zero LLM tokens).
@@ -248,13 +253,27 @@ sessions, including a compiled host with no plugin-local SDK dependencies.
 |---|---|---|
 | `mesh_send` | `to?`, `message`, `room?`, `broadcast?`, `priority?`, `reason?`, `awaitReply?`, `block?`, `timeoutMs?`, `refs?`, `replyTo?` | `delivered` / `queued_offline` / `reply: …` / `expired` / `blocked: …` — impossible targets (`"*"`, `"<room>-broadcast"`) refused **locally**; unseen aliases get a soft warning; `awaitReply` toward a peer busy longer than the timeout gets a burst-pattern advisory |
 | `mesh_reply` | `msgId`, `message`, `replyAll?`, `to?`, `refs?` | `delivered` or `blocked: reply_without_target` |
-| `mesh_wait_all` | `timeoutMs?` | block the turn until every awaited mission is answered (or timeout) — group verdict: who answered (with the answer), who is missing |
+| `mesh_wait_all` | `timeoutMs?` | `complete` / `timeout` / `error` / `interrupted` / `cancelled`, with complete answers, missing tasks, `reason`, and an optional triggering message ID |
 | `mesh_alias` | `alias?` (omit = show current name) | current alias / `renamed` / `unchanged` / `blocked: invalid_alias` or `alias_taken`; changes this agent's routing name, preserving rooms and reservations |
-| `mesh_status` | `room?`, `all?` | live broker snapshot — peers sharing a room, per-peer version (`⚠` on skew), turn state (`● working / ○ idle / ✕ stuck`), `likely done` summary, read receipts, missions, broker counters |
+| `mesh_status` | `room?`, `all?` | live broker snapshot — peers, versions, activity, read receipts, missions and counters; query failures return `error` with the actual reason, never a fabricated empty mesh |
 | `mesh_ledger` | `limit?`, `from?`, `to?`, `room?`, `event?` | durable **hash-only** history — bodies never stored, survives restarts |
 | `mesh_history` | `limit?`, `withBodies?` | local **memory ring** (debug — never the ledger) |
 | `mesh_reserve` | `paths`, `reason?`, `autoReleaseMs?` | reserve files/dirs — peers' `edit`/`write` get blocked on them; claims expire for conflict checks after `reservationTtlMs` (default 6 h, re-reserve to renew) and can self-release (`autoReleaseMs`) |
 | `mesh_release` | `paths?` (omit = all) | release reservations, peers notified immediately |
+
+Wait errors distinguish `target_offline`, `connection_lost`, and terminal
+mission failures. New actionable input returns `interrupted` with
+`reason: inbound_message` and `interruptedBy`; it reaches the next model call
+as `steer`, without using force or aborting the turn. Deferred broadcasts,
+machine receipts and reply-to-reply metadata do not wake the wait.
+Errors, interruptions and cancellations do not consume partial answers:
+pending tasks remain reportable on a later wait. Explicit batch clearing
+instead cancels the tasks and returns a final snapshot with `missions_cancelled`.
+
+Broker mailboxes are memory-only. A reboot can make an unconfirmed queued
+delivery uncertain (`broker_state_lost_delivery_unknown`); this does **not**
+prove that the task never executed. Confirmed-delivered tasks survive the
+broker restart and can still reply after reconnect.
 
 **Custom agent names:** call `mesh_alias({ alias: "reviewer" })` to give this
 agent a recognizable name; `mesh_alias({})` shows its current name. The existing
@@ -291,8 +310,9 @@ and in the bundled skill):
    background and ADAPTIVE text (dark on light backgrounds, light on dark
    ones — always readable), separated by empty lines (display-only, zero
    LLM tokens).
-3. Re-send ONLY to the missing (`✗ NOT ANSWERED`). Never poll with
-   `mesh_history`.
+3. Process new input or restore connectivity before waiting again. Missing
+   does not mean safe to resend: confirm a request was actually dropped or
+   otherwise cannot execute before redispatching it. Never poll `mesh_history`.
 
 **Delivery modes** — `normal` → followUp · `urgent` → steer (interrupts the
 current reflection) · `force` → controlled abort of the recipient's turn +
@@ -368,6 +388,13 @@ its queued mailbox; if the original session returns it gets a fresh alias
 (a documented steal). Read receipts are emitted ONLY in interactive TTY
 mode at render time (`--no-read` opts out; `--json`/pipes never read).
 No activity announcements: peers see the idle heuristic.
+
+Live status failures are explicit: `pimesh status --json` returns an error
+and exit code 1; the HUD shows an unknown peer count rather than zero.
+`pimesh sessions` still lists persisted identities when live status fails,
+but reports presence as `unknown` (`online: null` in JSON), warns on stderr,
+and exits with partial-result code 4. Library `MeshClient.status()` rejects
+offline, timeout and protocol failures; callers must handle rejection.
 
 **Observer (`watch`)** — `pimesh watch [room]` joins as an observer and
 streams frames live; bodies are NEVER shown, only `bodyHash` (text and
@@ -492,6 +519,19 @@ implementation. Use the existing mesh history for older frames.
   CLI adoption; cancel outgoing auto-release deadlines on identity reset.
 - Honor receipt file configuration and the batch max-hold environment
   override; reject fractional integer settings instead of rounding to zero.
+- Yield passive waits for actionable incoming messages without aborting the
+  host turn; report target/connection failures with intact partial results.
+- Settle renamed/cancelled missions and active batch snapshots consistently;
+  retain actual cancellation reasons instead of attributing every exit to ESC.
+- Honor send cancellation before writes and during connection/ACK waits,
+  including delivery uncertainty after a frame was written.
+- Clean old rooms, roles and reservations before accepting socket takeover.
+- Count mailbox delivery only after successful writes, preserve retryable
+  entries with their original age, and explicitly report unencodable drops.
+- Distinguish reboot-lost queued delivery from confirmed-delivered tasks
+  that can still finish after reconnect.
+- Propagate status query errors through tools, CLI and HUD instead of
+  presenting an empty mesh or falsely marking persisted identities offline.
 
 ### v0.7.2-omp.3
 

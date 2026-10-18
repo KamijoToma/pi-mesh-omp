@@ -133,6 +133,13 @@ export async function cmdAttach(opts) {
         },
         config: resolveCliConfig(),
     });
+    client.on("inbound", (frame, meta) => {
+        if (meta?.matchedReply === true || frame.receipt === true)
+            return;
+        if (frame.type === "reply" && frame.replyTo !== undefined && client.isReplyToReply(frame.replyTo))
+            return;
+        client.interruptWaitAll("inbound_message", frame.id);
+    });
     let welcome;
     try {
         welcome = await client.connect();
@@ -404,6 +411,8 @@ function printResultJson(r) {
         base.msgId = r.msgId;
     if ("reason" in r && r.reason !== undefined)
         base.reason = r.reason;
+    if ("delivery" in r && r.delivery !== undefined)
+        base.delivery = r.delivery;
     if ("response" in r)
         base.response = r.response;
     if ("deliveredCount" in r && r.deliveredCount !== undefined)

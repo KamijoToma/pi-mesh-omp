@@ -2,6 +2,7 @@
 // Covers E3, E4, E11, E12, E13, E14 (+forceDowngrade variant), E15, E16, E17,
 // E18, E19 (disconnect → presence offline; closePeer unit), E21.
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import type { Socket } from "node:net";
 import { describe, it } from "node:test";
 import { closePeer, pruneStaleKnownAliases, type RunningBroker } from "../src/broker/broker.js";
@@ -60,6 +61,58 @@ describe("broker: identity & handshake", () => {
       return e.length === 1 ? e : undefined;
     });
     assert.equal(taken.length, 1);
+  });
+
+  it("destroyed-socket takeover clears old rooms, observer role and reservations before replacement", async (t) => {
+    const { broker, sock } = await withBroker(t);
+    const watcher = trackRaw(t, await RawClient.connect(sock));
+    watcher.hello("watcher", ["default", "proj"]);
+    await watcher.waitFrame((f) => f.type === "welcome");
+
+    const oldAccepted = once(broker.server, "connection");
+    const old = trackRaw(t, await RawClient.connect(sock));
+    const [oldSocket] = await oldAccepted as [Socket];
+    old.send({
+      type: "hello",
+      from: "race0",
+      rooms: ["default", "proj"],
+      role: "observer",
+      reservations: [{ pattern: "src/old.ts" }],
+    });
+    await old.waitFrame((f) => f.type === "welcome");
+    await watcher.waitFrame((f) => f.type === "reserve" && f.from === "race0" && f.reservations?.length === 1);
+
+    const replacementAccepted = once(broker.server, "connection");
+    const replacement = trackRaw(t, await RawClient.connect(sock));
+    const [replacementSocket] = await replacementAccepted as [Socket];
+    const oldClosed = once(oldSocket, "close");
+    // Real stream ordering: destroy the old server socket immediately before
+    // the broker handles the new hello, with its close event still deferred.
+    replacementSocket.prependOnceListener("data", () => oldSocket.destroy());
+    replacement.hello("race0", ["default"]);
+    const welcome = await replacement.waitFrame((f) => f.type === "welcome");
+    await oldClosed;
+    assert.deepEqual(welcome.rooms, ["default"]);
+    const current = welcome.peers?.find((p) => p.alias === "race0");
+    assert.deepEqual(current?.rooms, ["default"]);
+    assert.equal(current?.role, "member");
+    assert.equal(current?.reservations, undefined);
+    await watcher.waitFrame((f) => f.type === "reserve" && f.from === "race0" && f.reservations?.length === 0);
+    const presence = await watcher.waitFrames((f) => f.type === "presence" && f.from === "race0", 5);
+    assert.deepEqual(presence.map((f) => [f.room, f.status]), [
+      ["default", "online"], ["proj", "online"],
+      ["default", "offline"], ["proj", "offline"], ["default", "online"],
+    ]);
+
+    watcher.send({ type: "msg", id: "m_proj_only", from: "watcher", room: "proj", broadcast: true, body: "not for race0" });
+    const refusal = await watcher.waitFrame((f) => f.type === "error" && f.id === "m_proj_only");
+    assert.equal(refusal.code, "peer_not_found");
+    replacement.send({ type: "ping", id: "m_still_online", from: "race0" });
+    await replacement.waitFrame((f) => f.type === "pong" && f.id === "m_still_online");
+    assert.equal(replacement.frames.some((f) => f.id === "m_proj_only"), false);
+    watcher.send({ type: "status_req", id: "m_current_identity", from: "watcher" });
+    const status = await watcher.waitFrame((f) => f.type === "status_res" && f.id === "m_current_identity");
+    assert.deepEqual(status.peers?.find((p) => p.alias === "race0")?.rooms, ["default"]);
   });
 
   it("E12: uppercase/underscore aliases → invalid_alias; valid → welcome", async (t) => {
@@ -317,7 +370,7 @@ describe("broker: presence (E19)", () => {
 });
 
 describe("broker: B2 stale write-failure guard (T-B2)", () => {
-  it("stale write-failure after re-hello keeps the NEW peer, no presence(offline)", async (t) => {
+  it("stale write-failure after re-hello keeps the NEW peer and emits no extra offline presence", async (t) => {
     const { broker, sock } = await withBroker(t);
     const { state } = broker;
     const obs = trackRaw(t, await RawClient.connect(sock));
@@ -365,6 +418,13 @@ describe("broker: B2 stale write-failure guard (T-B2)", () => {
     await obs.waitFrame(
       (f) => f.type === "presence" && f.from === "victim" && f.status === "online",
     );
+    await obs.waitFrame(
+      (f) => f.type === "presence" && f.from === "victim" && f.status === "offline",
+    );
+    const offlineAfterTakeover = obs.frames.filter(
+      (f) => f.type === "presence" && f.from === "victim" && f.status === "offline",
+    ).length;
+    assert.equal(offlineAfterTakeover, 1, "takeover fully cleans the dead old identity");
     // The orphaned old client socket finally goes away: no peer record points
     // at it anymore, so the broker close handler must NOT closePeer anything.
     victim1.close();
@@ -384,8 +444,8 @@ describe("broker: B2 stale write-failure guard (T-B2)", () => {
       obs.frames.filter(
         (f) => f.type === "presence" && f.from === "victim" && f.status === "offline",
       ).length,
-      0,
-      "no presence(offline) broadcast for the healthy re-hello'd peer",
+      offlineAfterTakeover,
+      "late close/write callbacks do not broadcast offline for the healthy replacement",
     );
     assert.equal(victim2.closed, false);
   });

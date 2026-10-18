@@ -1,5 +1,5 @@
 // test/pending.test.ts — strict replyTo correlation, expiry timing, remind cap
-// 2, late reply counted, cancelAll shutting_down (D8, E7/E8/E23 primitives).
+// 2, late reply counted, cancelAll closed (D8, E7/E8/E23 primitives).
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { PendingReplies } from "../src/client/pending.js";
@@ -50,15 +50,16 @@ describe("pending: correlation & resolution", () => {
     assert.equal(p.unmatchedReplyCount, 1);
   });
 
-  it("E23 primitive: cancelAll resolves every pending with shutting_down", async () => {
+  it("E23 primitive: cancelAll resolves every pending with closed", async () => {
     const p = new PendingReplies(() => {});
     const r1 = p.register("m_s1_11111111", Date.now() + 5000);
     const r2 = p.register("m_s2_11111111", Date.now() + 5000);
-    p.cancelAll("shutting_down");
+    p.cancelAll("closed");
     const [res1, res2] = await Promise.all([r1, r2]);
     assert.equal(res1.kind, "error");
-    assert.equal(res1.reason, "shutting_down");
+    assert.equal(res1.reason, "closed");
     assert.equal(res2.kind, "error");
+    assert.equal(res2.reason, "closed");
     assert.equal(p.size, 0);
   });
 

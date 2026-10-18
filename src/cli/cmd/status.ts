@@ -6,7 +6,7 @@
 import { say, sayErr, jsonLine } from "../out.js";
 import { EXIT_OK, EXIT_MESH_FAILURE } from "../codes.js";
 import { ephemeralClient } from "../ctx.js";
-import { computePeerStatus, formatDurationShort, type MeshClient } from "../../client/client.js";
+import { computePeerStatus, formatDurationShort, type MeshClient, type StatusSnapshot } from "../../client/client.js";
 import { MESH_VERSION } from "../../shared/version.js";
 
 export const STATUS_USAGE = "usage: mesh status [room] [--all] [--reservations] [--json]  (alias: peers)";
@@ -55,13 +55,17 @@ export interface StatusOpts {
 
 export async function cmdStatus(opts: StatusOpts): Promise<number> {
   const client = ephemeralClient();
+  let snap: StatusSnapshot;
   try {
     await client.connect();
-  } catch {
-    say("blocked: broker_unavailable");
+    snap = await client.status(opts.all && opts.room === undefined ? undefined : opts.room);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (opts.json) jsonLine({ status: "error", reason });
+    else sayErr(`error: ${reason}`);
+    await client.close();
     return EXIT_MESH_FAILURE;
   }
-  const snap = await client.status(opts.all && opts.room === undefined ? undefined : opts.room);
   const stats = snap.stats;
 
   if (opts.json) {

@@ -193,9 +193,11 @@ export function injectInbound(pi, ctx, frame, opts = {}) {
         ? "followUp"
         : frame.type === "reply" && opts.replyChain === true
             ? "followUp"
-            : frame.type === "remind"
-                ? "followUp"
-                : mapReplyDelivery(frame);
+            : opts.wakeWaiting === true
+                ? "steer"
+                : frame.type === "remind"
+                    ? "followUp"
+                    : mapReplyDelivery(frame);
     if (isReceipt) {
         const message = buildInboundMessage(frame, opts);
         sendInjectedInbound(pi, message, { triggerTurn: false, deliverAs: "followUp" }, opts);

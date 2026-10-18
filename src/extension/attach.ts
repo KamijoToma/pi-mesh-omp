@@ -177,13 +177,20 @@ export function attachClientListeners(
       deferredInbox.push(frame);
       return;
     }
+    const wakeWaiting =
+      !matchedReply &&
+      frame.priority !== "force" &&
+      frame.receipt !== true &&
+      !("__replyChain" in frame && frame.__replyChain === true) &&
+      client.interruptWaitAll("inbound_message", frame.id);
     const opts: FormatOpts = {
       ...formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker),
     };
-    if (bypassesBatch(frame) || client.inboundBatchMs <= 0) {
+    if (wakeWaiting || bypassesBatch(frame) || client.inboundBatchMs <= 0) {
       batcher.flushNow(); // deliver any pending batch first (ordering)
       const injectOpts: InjectOpts = {
         ...opts,
+        wakeWaiting,
         replyChain: "__replyChain" in frame && frame.__replyChain === true,
         onInjected: () => recordInboundDelivery(frame, deps),
       };

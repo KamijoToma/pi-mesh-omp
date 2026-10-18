@@ -70,7 +70,15 @@ export async function cmdReserve(args) {
         }
     }
     // dry-run conflict report against the peers' CURRENT claims
-    const conflicts = await conflictsFor(client, paths);
+    let conflicts;
+    try {
+        conflicts = await conflictsFor(client, paths);
+    }
+    catch (error) {
+        sayErr(`cannot query reservation conflicts: ${error instanceof Error ? error.message : String(error)}`);
+        await client.close();
+        return EXIT_MESH_FAILURE;
+    }
     for (const line of conflicts)
         sayErr(line);
     if (holdMs === undefined) {

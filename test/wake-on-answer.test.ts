@@ -8,7 +8,10 @@ import { rmSync } from "node:fs";
 import { MeshClient } from "../src/client/client.js";
 import type { MeshFrame } from "../src/protocol/envelope.js";
 import { registerTools, type MeshRuntime } from "../src/extension/tools.js";
-import type { ExtensionAPI, SessionContext, ToolDefinition } from "../src/extension/pi-types.js";
+import { attachClientListeners } from "../src/extension/attach.js";
+import { MeshLedger } from "../src/extension/ledger.js";
+import { MeshTranscript } from "../src/extension/transcript.js";
+import type { ExtensionAPI, InboundMessage, SendMessageOptions, SessionContext, ToolDefinition, ToolResult } from "../src/extension/pi-types.js";
 import { makeTempDirs, sleep, startTestBroker, waitFor, type TempDirs } from "./helpers.js";
 
 describe("wake-on-answer (LAUNCH missions)", () => {
@@ -195,7 +198,7 @@ describe("wake-on-answer (LAUNCH missions)", () => {
     setTimeout(() => ac.abort(), 250).unref();
     const res = await p;
     assert.equal(res.status, "error");
-    assert.equal(res.reason, "cancelled");
+    assert.equal(res.reason, "aborted");
     assert.ok(Date.now() - t0 < 5000, "settles at the abort, not the 30-min timeout");
     assert.equal(lead.pendingCount, 0, "pending cancelled");
     const m = lead.missionStatus().find((x) => x.msgId === res.msgId);
@@ -209,5 +212,115 @@ describe("wake-on-answer (LAUNCH missions)", () => {
     assert.equal(injected.replyTo, res.msgId);
     assert.equal(injected.body, "late bob");
     lead.removeAllListeners("inbound");
+  });
+});
+
+describe("actionable inbound messages during passive waits", () => {
+  async function fixture() {
+    const dirs = makeTempDirs("mesh-wait-inbound-");
+    const broker = await startTestBroker(dirs.runtimeDir);
+    const lead = new MeshClient({
+      alias: "lead", runtimeDir: dirs.runtimeDir, noReconnect: true,
+      config: { inboundBroadcasts: "deferred" },
+    });
+    const carol = new MeshClient({ alias: "carol", runtimeDir: dirs.runtimeDir, noReconnect: true });
+    const bob = new MeshClient({ alias: "bob", runtimeDir: dirs.runtimeDir, noReconnect: true });
+    await Promise.all([lead.connect(), carol.connect(), bob.connect()]);
+    const tools = new Map<string, ToolDefinition>();
+    const injected: { message: InboundMessage; options?: SendMessageOptions }[] = [];
+    let aborts = 0;
+    const ctx = {
+      cwd: dirs.root, isIdle: () => false, abort: () => { aborts += 1; },
+      ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+    } as unknown as SessionContext;
+    const rt = {
+      client: lead, ctx, sessionId: "wait-inbound",
+      ledger: new MeshLedger(dirs.stateDir),
+      transcript: new MeshTranscript(dirs.stateDir, false),
+      ledgerFailures: 0, transcriptFailures: 0, injectionFailures: 0,
+    } as MeshRuntime;
+    const pi = {
+      registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
+      sendMessage: (message: InboundMessage, options?: SendMessageOptions) => injected.push({ message, options }),
+      appendEntry: () => {},
+    } as unknown as ExtensionAPI;
+    registerTools(pi, () => rt);
+    attachClientListeners(pi, rt, () => null, ctx, lead, () => {});
+    return {
+      lead, carol, bob, rt, tools, injected, ctx,
+      abortCount: () => aborts,
+      async cleanup() {
+        rt.markDetached?.();
+        await Promise.all([lead.close(), carol.close(), bob.close()]);
+        await broker.close();
+        dirs.cleanup();
+      },
+    };
+  }
+
+  for (const priority of ["normal", "urgent"] as const) {
+    it(`${priority} input yields the wait without aborting or consuming partial answers`, { timeout: 10_000 }, async () => {
+      const f = await fixture();
+      try {
+        const first = await f.lead.send({ to: "carol", message: "first task", awaitReply: true, block: false, timeoutMs: 5000 });
+        const second = await f.lead.send({ to: "bob", message: "second task", awaitReply: true, block: false, timeoutMs: 5000 });
+        assert.equal(first.status, "delivered");
+        assert.equal(second.status, "delivered");
+        await waitFor(() => f.carol.peekInbox(first.msgId!) !== undefined && f.bob.peekInbox(second.msgId!) !== undefined);
+        let result: ToolResult | undefined;
+        const waiting = f.tools.get("mesh_wait_all")!.execute("wait", { timeoutMs: 5000 }, undefined, undefined, f.ctx)
+          .then((value) => { result = value; return value; });
+        await f.carol.reply(first.msgId!, "partial report");
+        await waitFor(() => f.lead.missionStatus().some((mission) => mission.msgId === first.msgId && mission.answered));
+        const incoming = await f.carol.send({ to: "lead", message: "new actionable input", priority });
+        await waitFor(() => result !== undefined, 2000);
+        const interrupted = await waiting;
+        assert.equal(interrupted.details?.status, "interrupted");
+        assert.equal(interrupted.details?.reason, "inbound_message");
+        assert.equal(interrupted.details?.interruptedBy, incoming.msgId);
+        assert.deepEqual(interrupted.details?.answers, [{ msgId: first.msgId, to: "carol", response: "partial report" }]);
+        const missing = interrupted.details?.missing as { msgId: string; to: string }[];
+        assert.deepEqual(missing.map(({ msgId, to }) => ({ msgId, to })), [{ msgId: second.msgId, to: "bob" }]);
+        const delivery = f.injected.find((item) => item.message.content.includes("new actionable input"));
+        assert.equal(delivery?.options?.deliverAs, "steer", "input must be visible at the next model call, not after the turn");
+        assert.equal(delivery?.options?.triggerTurn, true);
+        assert.equal(f.abortCount(), 0);
+        assert.equal(f.lead.pendingCount, 1);
+        await f.bob.reply(second.msgId!, "remaining report");
+        const resumed = await f.lead.waitAll(2000);
+        assert.equal(resumed.status, "complete");
+        assert.deepEqual(resumed.answers, [
+          { msgId: first.msgId, to: "carol", response: "partial report" },
+          { msgId: second.msgId, to: "bob", response: "remaining report" },
+        ]);
+      } finally {
+        await f.cleanup();
+      }
+    });
+  }
+
+  it("deferred broadcasts and machine receipts do not wake a wait", { timeout: 10_000 }, async () => {
+    const f = await fixture();
+    try {
+      const task = await f.lead.send({ to: "carol", message: "keep waiting", awaitReply: true, block: false, timeoutMs: 5000 });
+      assert.equal(task.status, "delivered");
+      let settled = false;
+      const waiting = f.lead.waitAll(5000).then((result) => { settled = true; return result; });
+      const observed: MeshFrame[] = [];
+      f.lead.on("frame", (frame: MeshFrame) => observed.push(frame));
+      await f.carol.send({ broadcast: true, room: "default", message: "deferred chatter" });
+      await f.carol.reply(task.msgId!, "machine metadata", { receipt: true });
+      await waitFor(() => observed.some((frame) => frame.receipt === true));
+      assert.equal(f.rt.deferredInbox?.count, 1);
+      assert.equal(settled, false);
+      assert.equal(f.lead.pendingCount, 1);
+      await f.carol.reply(task.msgId!, "actual answer");
+      const completed = await waiting;
+      assert.equal(completed.status, "complete");
+      assert.deepEqual(completed.answers, [{ msgId: task.msgId, to: "carol", response: "actual answer" }]);
+      assert.equal(f.abortCount(), 0);
+    } finally {
+      await f.cleanup();
+    }
   });
 });

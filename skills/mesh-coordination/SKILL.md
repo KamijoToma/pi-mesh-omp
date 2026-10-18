@@ -102,17 +102,25 @@ duplicates, loops and confusion.
    a batch containing only terminal missing missions returns immediately.
    While it runs, answers are carried by the verdict, not injected again.
    Reach for it only when you must collect the whole batch before continuing.
-3. **ESC cancels a pending `mesh_wait_all`** — the verdict says
-   `(CANCELLED — ESC)` and reports NOTHING: the missions stay reportable,
-   so a later `mesh_wait_all` re-lists them. Use it to abort a long wait
-   without losing the batch.
-4. Re-send ONLY to the missing (`✗ NOT ANSWERED`).
-- Never poll with `mesh_history`/`mesh_status` to check who answered —
-  that is what `mesh_wait_all` is for.
-- `block: false` without `awaitReply` is refused; `awaitReply` without
-  `block: false` blocks the turn until that one reply (fine for a single
-  awaited send — and ESC now cancels it: the mission is dropped and a
-  late reply is still injected).
+3. **A wait can yield without cancelling its tasks.** Actionable normal or
+   urgent input returns `interrupted` (`reason: inbound_message`); the message
+   reaches the next model call as steer, without force or a host-turn abort.
+   Deferred broadcasts, machine receipts and reply-to-reply metadata do not
+   wake it. A previously-online target leaving the mission room returns
+   `error: target_offline`; initial `queued_offline` tasks still wait normally.
+   Own connection loss reports `connection_lost`, not a remote task failure.
+4. **ESC cancels a pending wait**, with `status: cancelled` and `reason: aborted`.
+   Interrupted/error/cancelled verdicts do not consume partial answers:
+   tasks and answers remain reportable by the next `mesh_wait_all`.
+   Explicit batch clearing cancels the tasks instead (`missions_cancelled`).
+5. **Do not resend solely because a task is missing.** Handle new input or
+   reconnect, then wait again. Broker mailboxes are memory-only:
+   `broker_state_lost_delivery_unknown` does not prove non-execution.
+   Confirmed-delivered tasks can still finish after the broker restarts.
+- Never poll with `mesh_history`/`mesh_status` to check who answered.
+- `block: false` without `awaitReply` is refused. ESC on a blocking send
+  returns `aborted`; a pre-write abort sends nothing, but after a write
+  delivery can be unknown. Late replies still arrive; do not duplicate work.
 
 ## Orchestrator rhythm (delay-free)
 

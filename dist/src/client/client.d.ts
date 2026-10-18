@@ -47,10 +47,8 @@ export interface SendOpts {
     *  and a reason — a last-resort unblocking lever, rate-limited and
     *  policy-gated exactly like force. */
     interrupt?: boolean;
-    /** Abort a BLOCKING awaitReply send (ESC): cancels the pending, cleans
-     *  the mission, and returns {status:"error", reason:"cancelled"} — a
-     *  late reply still arrives via the orphan-inject path. Ignored for
-     *  LAUNCH sends (they never block). */
+    /** Abort before writing without delivery; after writing, stop waiting only.
+     *  A written frame may still arrive, and late replies remain injectable. */
     signal?: AbortSignal;
 }
 export interface ReplyOpts {
@@ -86,6 +84,7 @@ export type SendResult = {
     status: "expired" | "blocked" | "error";
     msgId?: string;
     reason: string;
+    delivery?: "delivered" | "queued_offline" | "unknown";
 };
 export declare function isBroadcastResult(res: SendResult): res is Extract<SendResult, {
     deliveredCount?: number;
@@ -122,6 +121,11 @@ interface AwaitedMission {
     room: string;
     status: "waiting" | "answered" | "expired" | "failed";
     answered: boolean;
+    reason?: string;
+    unavailableReason?: string;
+    targetOnline?: boolean;
+    delivery?: "delivered" | "queued_offline";
+    brokerBootId?: string;
     response?: string;
     at?: string;
 }
@@ -144,13 +148,16 @@ export interface MeshClientReloadState {
     pinnedBrokerId?: string;
 }
 export interface WaitAllSummary {
-    status: "complete" | "timeout" | "cancelled";
+    status: "complete" | "timeout" | "cancelled" | "error" | "interrupted";
+    reason?: string;
+    interruptedBy?: string;
     total: number;
     answered: number;
     elapsedMs: number;
     missing: {
         msgId: string;
         to: string;
+        reason?: string;
     }[];
     answers: {
         msgId: string;
@@ -192,7 +199,8 @@ export declare class MeshClient extends EventEmitter {
      *  LAUNCH answers skip session injection (the verdict carries that
      *  batch). */
     private waitAllInFlight;
-    private readonly waitAllCancels;
+    private readonly waitAllStops;
+    private waitStopReason;
     /** Memory-only ring buffer of last frames (bodies included) for mesh_history. */
     readonly transcript: MeshFrame[];
     /** Own file reservations — declared at hello, updated via reserve/release. */
@@ -223,6 +231,7 @@ export declare class MeshClient extends EventEmitter {
     /** Aliases seen online (welcome + presence join) — send-guard hints.
     *  Best-effort: a missing entry is a WARNING, never a block. */
     private readonly knownPeers;
+    private readonly knownPeerRooms;
     /**
     * replyTo msgIds already answered/handled: the FIRST reply to a given
     * message is consumed (pending match) or injected (orphan); later replies
@@ -262,6 +271,9 @@ export declare class MeshClient extends EventEmitter {
     }[];
     /** Cancel pending replies and clear every mission from the previous batch. */
     cancelAllAwaited(): void;
+    /** End active group waits without cancelling missions or the host turn. */
+    interruptWaitAll(reason: string, msgId?: string): boolean;
+    private stopWaitAll;
     /** bound the awaitedMissions history (oldest dropped first). */
     private pruneAwaitedMissions;
     /** bound the read-receipt store (oldest dropped first). */
@@ -276,6 +288,7 @@ export declare class MeshClient extends EventEmitter {
         to: string;
         answered: boolean;
         status: string;
+        reason?: string;
     }[];
     /**
     * block until EVERY awaited mission is answered (or timeout), then
@@ -285,7 +298,7 @@ export declare class MeshClient extends EventEmitter {
     * Snapshot every unreported mission, including answers and terminal failures
     * that arrived before this call. Missing missions remain reportable on retry.
     */
-    waitAll(timeoutMs: number, signal?: AbortSignal): Promise<WaitAllSummary>;
+    waitAll(timeoutMs?: number, signal?: AbortSignal): Promise<WaitAllSummary>;
     private summarize;
     /** Announce this session's turn state to the mesh (busy on tool_call,
     *  idle on agent_settled, rate_limited on provider 429s). Fire-and-forget;

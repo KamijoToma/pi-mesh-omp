@@ -148,6 +148,11 @@ export async function cmdAttach(opts: AttachOpts): Promise<number> {
     },
     config: resolveCliConfig(),
   });
+  client.on("inbound", (frame: MeshFrame, meta?: { matchedReply?: boolean }) => {
+    if (meta?.matchedReply === true || frame.receipt === true) return;
+    if (frame.type === "reply" && frame.replyTo !== undefined && client.isReplyToReply(frame.replyTo)) return;
+    client.interruptWaitAll("inbound_message", frame.id);
+  });
 
   let welcome;
   try {
@@ -402,6 +407,7 @@ function printResultJson(r: SendResult): Record<string, unknown> {
   const base: Record<string, unknown> = { status: r.status };
   if ("msgId" in r && r.msgId !== undefined) base.msgId = r.msgId;
   if ("reason" in r && r.reason !== undefined) base.reason = r.reason;
+  if ("delivery" in r && r.delivery !== undefined) base.delivery = r.delivery;
   if ("response" in r) base.response = r.response;
   if ("deliveredCount" in r && r.deliveredCount !== undefined) base.deliveredCount = r.deliveredCount;
   if ("totalCount" in r && r.totalCount !== undefined) base.totalCount = r.totalCount;

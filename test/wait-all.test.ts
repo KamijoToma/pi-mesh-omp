@@ -1,14 +1,15 @@
 // test/wait-all.test.ts — D42: mesh_wait_all (group await with honest summary).
-import { after, before, describe, it } from "node:test";
+import { after, before, describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
+import type { RunningBroker } from "../src/broker/broker.js";
 import { MeshClient } from "../src/client/client.js";
 import type { MeshFrame } from "../src/protocol/envelope.js";
 import { makeTempDirs, startTestBroker, waitFor, type TempDirs } from "./helpers.js";
 
 describe("waitAll (D42)", () => {
   let dirs: TempDirs;
-  let broker: Awaited<ReturnType<typeof startTestBroker>>;
+  let broker: RunningBroker;
   let lead: MeshClient;
   let bob: MeshClient;
   let carol: MeshClient;
@@ -182,11 +183,11 @@ describe("waitAll (D42)", () => {
       });
       assert.equal(blocked.status, "blocked");
       const verdict = await lead.waitAll(50);
-      assert.equal(verdict.status, "timeout");
+      assert.equal(verdict.status, "error");
       assert.equal(verdict.total, 2);
       assert.deepEqual(verdict.missing, [
-        { msgId: queued.msgId, to: "bob" },
-        { msgId: blocked.msgId, to: "unknown-recipient" },
+        { msgId: queued.msgId, to: "bob", reason: "dropped_offline" },
+        { msgId: blocked.msgId, to: "unknown-recipient", reason: "peer_not_found" },
       ]);
       lead.cancelAllAwaited();
       assert.deepEqual(lead.missionStatus(), []);
@@ -206,6 +207,7 @@ describe("waitAll (D42)", () => {
     setTimeout(() => ac.abort(), 300).unref();
     const verdict = await p;
     assert.equal(verdict.status, "cancelled");
+    assert.equal(verdict.reason, "aborted");
     assert.equal(verdict.total, 1);
     assert.equal(verdict.answered, 0);
     assert.equal(verdict.missing.length, 1);
@@ -220,3 +222,194 @@ describe("waitAll (D42)", () => {
 });
 
 
+async function isolatedWaitFixture(t: TestContext) {
+  const dirs = makeTempDirs("mesh-wait-lifecycle-");
+  const broker = await startTestBroker(dirs.runtimeDir);
+  const lead = new MeshClient({ alias: "lead", runtimeDir: dirs.runtimeDir, noReconnect: true });
+  const bob = new MeshClient({ alias: "bob", runtimeDir: dirs.runtimeDir, noReconnect: true });
+  const carol = new MeshClient({ alias: "carol", runtimeDir: dirs.runtimeDir, noReconnect: true });
+  t.after(async () => {
+    await Promise.all([lead.close(), bob.close(), carol.close()]);
+    await broker.close();
+    dirs.cleanup();
+  });
+  await lead.connect();
+  await bob.connect();
+  await carol.connect();
+  return { lead, bob, carol, broker };
+}
+
+describe("waitAll: non-destructive lifecycle exits", () => {
+  for (const timing of ["before", "during"] as const) {
+    it(`reports a previously-online target going offline ${timing} the wait and permits re-wait`, { timeout: 5000 }, async (t) => {
+      const { lead, bob } = await isolatedWaitFixture(t);
+      const sent = await lead.send({ to: "bob", message: "keep working", awaitReply: true, block: false });
+      assert.ok(sent.msgId);
+      const waiting = timing === "during" ? lead.waitAll(2000) : undefined;
+      await bob.close();
+      await waitFor(() => lead.missionStatus().some((mission) => mission.reason === "target_offline"));
+      const result = await (waiting ?? lead.waitAll(2000));
+      assert.equal(result.status, "error");
+      assert.equal(result.reason, "target_offline");
+      assert.deepEqual(result.missing, [{ msgId: sent.msgId, to: "bob", reason: "target_offline" }]);
+      assert.equal(lead.pendingCount, 1, "presence loss must not cancel the mission");
+      await bob.connect();
+      await waitFor(() => lead.knowsPeer("bob"));
+      const again = lead.waitAll(2000);
+      assert.equal((await bob.reply(sent.msgId, "back with the answer")).status, "delivered");
+      const completed = await again;
+      assert.equal(completed.status, "complete");
+      assert.deepEqual(completed.answers, [{ msgId: sent.msgId, to: "bob", response: "back with the answer" }]);
+    });
+  }
+
+  it("does not confuse leaving an unrelated room with losing the mission target", { timeout: 5000 }, async (t) => {
+    const { lead, bob } = await isolatedWaitFixture(t);
+    await lead.join("unrelated");
+    await bob.join("unrelated");
+    const presence: MeshFrame[] = [];
+    lead.on("presence", (frame: MeshFrame) => presence.push(frame));
+    const sent = await lead.send({ to: "bob", room: "default", message: "stay here", awaitReply: true, block: false });
+    assert.ok(sent.msgId);
+    const waiting = lead.waitAll(2000);
+    await bob.leave("unrelated");
+    await waitFor(() => presence.some((frame) => frame.from === "bob" && frame.room === "unrelated" && frame.status === "offline"));
+    assert.equal(lead.knowsPeer("bob"), true);
+    assert.equal((await bob.reply(sent.msgId, "still in default")).status, "delivered");
+    assert.equal((await waiting).status, "complete");
+  });
+
+  it("keeps an initially queued-offline mission waiting until mailbox reconnect and reply", { timeout: 5000 }, async (t) => {
+    const { lead, bob } = await isolatedWaitFixture(t);
+    await bob.close();
+    await waitFor(() => !lead.knowsPeer("bob"));
+    const sent = await lead.send({ to: "bob", message: "intentional mailbox", awaitReply: true, block: false });
+    assert.equal(sent.status, "queued_offline");
+    assert.ok(sent.msgId);
+    const waiting = lead.waitAll(2000);
+    await bob.connect();
+    await waitFor(() => bob.peekInbox(sent.msgId!) !== undefined);
+    assert.equal((await bob.reply(sent.msgId, "mailbox completed")).status, "delivered");
+    assert.equal((await waiting).status, "complete");
+  });
+
+  it("interrupts active waits only, preserving partial answers and pending work for a new wait", { timeout: 5000 }, async (t) => {
+    const { lead, bob, carol } = await isolatedWaitFixture(t);
+    const first = await lead.send({ to: "bob", message: "first", awaitReply: true, block: false });
+    const second = await lead.send({ to: "carol", message: "second", awaitReply: true, block: false });
+    assert.ok(first.msgId && second.msgId);
+    const inbound: MeshFrame[] = [];
+    lead.on("inbound", (frame: MeshFrame) => inbound.push(frame));
+    const waiting = lead.waitAll(2000);
+    await bob.reply(first.msgId, "partial answer");
+    await waitFor(() => lead.missionStatus().some((mission) => mission.msgId === first.msgId && mission.answered));
+    assert.equal(lead.interruptWaitAll("incoming_message", "m_incoming_12345678"), true);
+    assert.equal(lead.interruptWaitAll("nothing_active"), false);
+    const interrupted = await waiting;
+    assert.equal(interrupted.status, "interrupted");
+    assert.equal(interrupted.reason, "incoming_message");
+    assert.equal(interrupted.interruptedBy, "m_incoming_12345678");
+    assert.equal(interrupted.total, 2);
+    assert.deepEqual(interrupted.answers, [{ msgId: first.msgId, to: "bob", response: "partial answer" }]);
+    assert.deepEqual(interrupted.missing, [{ msgId: second.msgId, to: "carol" }]);
+    assert.equal(lead.pendingCount, 1);
+    assert.deepEqual(inbound, [], "matched replies belong only to the active aggregate");
+    const again = lead.waitAll(2000);
+    await carol.reply(second.msgId, "final answer");
+    const complete = await again;
+    assert.equal(complete.status, "complete");
+    assert.equal(complete.answered, 2);
+    assert.equal((await lead.waitAll(50)).total, 0, "normal answer-once semantics are unchanged");
+  });
+
+  it("snapshots an explicitly cancelled batch before clearing all mission maps", { timeout: 5000 }, async (t) => {
+    const { lead, bob } = await isolatedWaitFixture(t);
+    const answered = await lead.send({ to: "bob", message: "answer", awaitReply: true, block: false });
+    const missing = await lead.send({ to: "carol", message: "missing", awaitReply: true, block: false });
+    assert.ok(answered.msgId && missing.msgId);
+    await bob.reply(answered.msgId, "already answered");
+    await waitFor(() => lead.missionStatus().some((mission) => mission.msgId === answered.msgId && mission.answered));
+    const waiting = lead.waitAll(2000);
+    lead.cancelAllAwaited();
+    const result = await waiting;
+    assert.equal(result.status, "cancelled");
+    assert.equal(result.reason, "missions_cancelled");
+    assert.equal(result.total, 2);
+    assert.equal(result.answered, 1);
+    assert.deepEqual(result.missing, [{ msgId: missing.msgId, to: "carol" }]);
+    assert.equal(lead.pendingCount, 0);
+    assert.deepEqual(lead.missionStatus(), []);
+    assert.equal((await lead.waitAll(50)).total, 0);
+  });
+
+  it("synchronizes both launch and blocking mission failures on rename", { timeout: 5000 }, async (t) => {
+    const { lead, bob } = await isolatedWaitFixture(t);
+    const launched = await lead.send({ to: "bob", message: "launched", awaitReply: true, block: false });
+    const blocking = lead.send({ to: "bob", message: "blocking", awaitReply: true });
+    await waitFor(() => lead.pendingCount === 2 && bob.transcript.filter((frame) => frame.type === "msg").length === 2);
+    const waiting = lead.waitAll(2000);
+    assert.equal((await lead.rename("new-lead")).ok, true);
+    const cancelled = await waiting;
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(cancelled.reason, "renamed");
+    assert.equal(cancelled.total, 2);
+    const blockResult = await blocking;
+    assert.equal(blockResult.status, "error");
+    if (blockResult.status === "error") assert.equal(blockResult.reason, "renamed");
+    assert.equal(lead.pendingCount, 0);
+    assert.ok(lead.missionStatus().every((mission) => mission.status === "failed" && mission.reason === "renamed"));
+    const result = await lead.waitAll(2000);
+    assert.equal(result.status, "error");
+    assert.equal(result.reason, "renamed");
+    assert.equal(result.missing.length, 2);
+    assert.ok(result.missing.some((mission) => mission.msgId === launched.msgId));
+  });
+
+  it("reports own transport loss as connection loss without cancelling remote work", { timeout: 5000 }, async (t) => {
+    const { lead, broker } = await isolatedWaitFixture(t);
+    await lead.send({ to: "bob", message: "remote work remains", awaitReply: true, block: false });
+    const waiting = lead.waitAll(2000);
+    broker.state.peers.get("lead")!.socket.destroy();
+    const result = await waiting;
+    assert.equal(result.status, "error");
+    assert.equal(result.reason, "connection_lost");
+    assert.equal(result.total, 1);
+    assert.equal(result.missing.length, 1);
+    assert.equal(lead.pendingCount, 1);
+  });
+});
+
+it("waitAll scopes a target's departure and recovery to the mission room", { timeout: 5000 }, async (t) => {
+  const { lead, bob } = await isolatedWaitFixture(t);
+  await lead.join("mission-room");
+  await bob.join("mission-room");
+  const sent = await lead.send({
+    to: "bob", room: "mission-room", message: "room-scoped work", awaitReply: true, block: false,
+  });
+  assert.ok(sent.msgId);
+  await bob.leave("mission-room");
+  await waitFor(() => lead.missionStatus().some((mission) => mission.reason === "target_offline"));
+  assert.equal(lead.knowsPeer("bob"), true, "bob remains online in default");
+  const unavailable = await lead.waitAll(2000);
+  assert.equal(unavailable.status, "error");
+  assert.equal(unavailable.reason, "target_offline");
+  assert.equal(lead.pendingCount, 1);
+  await bob.join("mission-room");
+  await waitFor(() => lead.missionStatus().every((mission) => mission.reason === undefined));
+  const waiting = lead.waitAll(2000);
+  await bob.reply(sent.msgId, "room work resumed");
+  assert.equal((await waiting).status, "complete");
+});
+
+it("waitAll intentional close settles immediately with an honest intact snapshot", { timeout: 5000 }, async (t) => {
+  const { lead } = await isolatedWaitFixture(t);
+  const sent = await lead.send({ to: "bob", message: "closing", awaitReply: true, block: false });
+  const waiting = lead.waitAll(2000);
+  await lead.close();
+  const closed = await waiting;
+  assert.equal(closed.status, "cancelled");
+  assert.equal(closed.reason, "closed");
+  assert.equal(closed.total, 1);
+  assert.deepEqual(closed.missing, [{ msgId: sent.msgId, to: "bob" }]);
+  assert.equal(lead.pendingCount, 0);
+});

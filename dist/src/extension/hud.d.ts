@@ -20,6 +20,7 @@ export interface HudState {
     alias: string;
     rooms: string[];
     peerCount: number;
+    statusError?: string;
     pending: number;
     inbox: number;
     transcriptOn: boolean;
@@ -37,6 +38,7 @@ export declare class MeshHud {
     private connecting;
     private statusTimer;
     private lastStatusFetchAt;
+    private statusError;
     constructor(deps: {
         getRuntime: GetRuntime;
     });

@@ -77,7 +77,14 @@ async function cmdStatus(rt, ctx, pi, room) {
             return;
         }
     }
-    const snap = await rt.client.status(room);
+    let snap;
+    try {
+        snap = await rt.client.status(room);
+    }
+    catch (error) {
+        ctx.ui.notify(`mesh status failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+        return;
+    }
     if (snap.peers.length === 0) {
         notify(ctx, `mesh: no online peers${room !== undefined ? ` in room ${room}` : ""}`);
         return;

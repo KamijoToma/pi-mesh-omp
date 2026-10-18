@@ -52,6 +52,7 @@ export interface HudState {
   alias: string;
   rooms: string[];
   peerCount: number;
+  statusError?: string;
   pending: number;
   inbox: number;
   transcriptOn: boolean;
@@ -70,7 +71,11 @@ export function renderHudLines(state: HudState, theme?: UiTheme): [string] {
     const alert = `!err:${failures}`;
     line += ` ${theme?.fg("error", alert) ?? alert}`;
   }
-  line += state.connected ? ` peers:${state.peerCount}` : state.connecting ? " connecting" : " offline";
+  line += state.connected
+    ? state.statusError !== undefined
+      ? ` peers:? status:${state.statusError}`
+      : ` peers:${state.peerCount}`
+    : state.connecting ? " connecting" : " offline";
   if (state.pending > 0) line += ` · wait:${state.pending}`;
   if (state.inbox > 0) line += ` · inbox:${state.inbox}`;
   line += ` · ${theme?.fg(agentColor(state.alias), state.alias) ?? state.alias}`;
@@ -91,6 +96,7 @@ export class MeshHud {
   private connecting = false;
   private statusTimer: NodeJS.Timeout | null = null;
   private lastStatusFetchAt = 0;
+  private statusError: string | undefined;
 
   constructor(private readonly deps: { getRuntime: GetRuntime }) {}
 
@@ -123,6 +129,7 @@ export class MeshHud {
   /** 'closed': mark offline + clear peers (client auto-reconnects → ◐). */
   onClosed(): void {
     this.snapshot = null;
+    this.statusError = undefined;
     this.connecting = true;
     this.refresh();
   }
@@ -155,10 +162,16 @@ export class MeshHud {
     rt.client
       .status()
       .then((snap) => {
+        if (this.deps.getRuntime() !== rt) return;
+        this.statusError = undefined;
         this.snapshot = snap;
         this.refresh();
       })
-      .catch(() => {});
+      .catch((error: unknown) => {
+        if (this.deps.getRuntime() !== rt) return;
+        this.statusError = error instanceof Error ? error.message : String(error);
+        this.refresh();
+      });
   }
 
   refresh(): void {
@@ -187,6 +200,7 @@ export class MeshHud {
       alias: self !== "" ? self : "?",
       rooms,
       peerCount: visiblePeerCount(this.snapshot, self, rooms),
+      statusError: this.statusError,
       pending: rt?.client.pendingCount ?? 0,
       inbox: rt?.deferredInbox?.count ?? 0,
       transcriptOn: rt?.transcript.isEnabled() === true,

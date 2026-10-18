@@ -40,10 +40,7 @@ function resultText(res) {
         case "blocked":
             return `blocked: ${res.reason}`;
         case "error":
-            if (res.reason === "cancelled") {
-                return `cancelled ${res.msgId ?? ""} (ESC — mission dropped; a late reply is still delivered and injected)`;
-            }
-            return `error: ${res.reason}`;
+            return `error: ${res.reason}${res.delivery !== undefined ? ` (delivery=${res.delivery}; a late reply may still arrive)` : ""}`;
     }
 }
 /** Best-effort ledger append — a ledger failure never crashes the session. */
@@ -167,6 +164,9 @@ async function execMeshSend(getRuntime, params, signal) {
     const rt = getRuntime();
     if (rt === null)
         return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
+    if (signal?.aborted === true) {
+        return textResult("error: aborted (not sent)", sendDetails({ status: "error", reason: "aborted" }));
+    }
     const broadcast = params.broadcast === true;
     const toRaw = str(params.to);
     const message = str(params.message);
@@ -237,16 +237,6 @@ async function execMeshSend(getRuntime, params, signal) {
         });
         return textResult(`blocked: ${guard.reason}`, sendDetails({ status: "blocked", reason: guard.reason, to, room, priority, bodyHash }));
     }
-    if (!rt.client.isOnline()) {
-        // broker absent → tools answer blocked, never crash the session.
-        try {
-            await rt.client.connect();
-        }
-        catch (error) {
-            safeLedger(rt, { event: "blocked", from: rt.client.alias, to, room, priority, bodyHash, refs, code: "broker_unavailable" });
-            return brokerUnavailableResult(error, sendDetails({ status: "blocked", reason: "broker_unavailable", to, room, priority, bodyHash }));
-        }
-    }
     // transcript: outbound frame WITH body (redacted at record time) — opt-in only.
     if (rt.transcript.isEnabled()) {
         rt.transcript.record("out", buildFrame({ type: "msg", from: rt.client.alias, to, room, priority, body: message, refs, broadcast: broadcast ? true : undefined }));
@@ -258,7 +248,7 @@ async function execMeshSend(getRuntime, params, signal) {
     const res = await rt.client.send({
         to: broadcast ? undefined : to,
         message, room, priority, reason, interrupt, awaitReply, block, timeoutMs, refs, broadcast, replyTo,
-        signal: !launch && signal !== undefined ? signal : undefined,
+        signal,
     });
     // `delivered` is ledgered ONLY here — after the broker ack (client.send
     // resolves delivered exclusively post-ack).
@@ -296,6 +286,7 @@ async function execMeshSend(getRuntime, params, signal) {
         deliveredCount: "deliveredCount" in res ? res.deliveredCount : undefined,
         totalCount: "totalCount" in res ? res.totalCount : undefined,
         reason: "reason" in res ? res.reason : undefined,
+        delivery: "delivery" in res ? res.delivery : undefined,
     });
     if (guard.warnings.includes(LOOP_GUARD_WARNING))
         details.loopGuard = "matched";
@@ -480,7 +471,16 @@ async function execMeshStatus(getRuntime, params) {
             return brokerUnavailableResult(error, sendDetails({ status: "blocked", reason: "broker_unavailable" }));
         }
     }
-    const snap = await rt.client.status(room);
+    let snap;
+    try {
+        snap = await rt.client.status(room);
+    }
+    catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        return textResult(`error: status_query_failed: ${reason}`, {
+            schema: "mesh.status.v1", status: "error", reason,
+        });
+    }
     // by default, only peers VISIBLE from this session (sharing at least
     // one room) are listed — an agent alone in "voice" must not see the
     // cs-room agents. all:true (or an explicit room filter) lifts that.
@@ -665,7 +665,10 @@ async function execMeshWaitAll(getRuntime, params, signal) {
         return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
     const timeoutMs = Math.min(MAX_AWAIT_REPLY_TIMEOUT_MS, Math.max(MIN_AWAIT_REPLY_TIMEOUT_MS, typeof params.timeoutMs === "number" ? params.timeoutMs : DEFAULT_WAIT_ALL_TIMEOUT_MS));
     const res = await rt.client.waitAll(timeoutMs, signal);
-    const head = `wait_all: ${res.answered}/${res.total} answered${res.status === "timeout" ? " (TIMEOUT)" : res.status === "cancelled" ? " (CANCELLED — ESC)" : ""} after ${formatElapsed(res.elapsedMs)}`;
+    const outcome = res.status === "complete"
+        ? ""
+        : ` (${res.status.toUpperCase()}${res.reason !== undefined ? ` — ${res.reason}` : ""})`;
+    const head = `wait_all: ${res.answered}/${res.total} answered${outcome} after ${formatElapsed(res.elapsedMs)}`;
     const lines = [head];
     for (const a of res.answers) {
         lines.push(`  ✓ @${a.to} (${a.msgId}):\n${a.response}`);
@@ -673,16 +676,21 @@ async function execMeshWaitAll(getRuntime, params, signal) {
     for (const m of res.missing) {
         const act = rt.client.activityOf(m.to)?.state;
         const busyMs = rt.client.busyForMs(m.to);
-        const reason = busyMs !== undefined && busyMs > 60_000
-            ? ` — still busy (${formatElapsed(busyMs)})`
-            : act === "rate_limited"
-                ? " — rate-limited, retry later"
-                : act === "blocked"
-                    ? " — blocked (provider error, needs intervention)"
-                    : "";
+        const reason = m.reason !== undefined
+            ? ` — ${m.reason}`
+            : busyMs !== undefined && busyMs > 60_000
+                ? ` — still busy (${formatElapsed(busyMs)})`
+                : act === "rate_limited"
+                    ? " — rate-limited, retry later"
+                    : act === "blocked"
+                        ? " — blocked (provider error, needs intervention)"
+                        : "";
         lines.push(`  ✗ @${m.to}: NOT ANSWERED (${m.msgId.slice(0, 18)})${reason}`);
     }
-    if (res.total === 0)
+    if (res.interruptedBy !== undefined) {
+        lines.push(`  interrupted by inbound ${res.interruptedBy}; missions remain tracked for the next wait`);
+    }
+    if (res.total === 0 && res.status === "complete")
         lines.push("  (no awaited missions — send with awaitReply: true first)");
     // display the colored verdict entry (agent colors + agent-color backgrounds)
     if (rt.appendEntry !== undefined) {
@@ -690,7 +698,7 @@ async function execMeshWaitAll(getRuntime, params, signal) {
             rt.appendEntry("mesh-verdict", {
                 head,
                 answers: res.answers.map((a) => ({ to: a.to, response: a.response })),
-                missing: res.missing.map((m) => ({ to: m.to, msgId: m.msgId })),
+                missing: res.missing.map((m) => ({ to: m.to, msgId: m.msgId, reason: m.reason })),
             });
         }
         catch {
@@ -700,6 +708,8 @@ async function execMeshWaitAll(getRuntime, params, signal) {
     return textResult(lines.join("\n"), {
         schema: "mesh.wait-all.v1",
         status: res.status,
+        reason: res.reason,
+        interruptedBy: res.interruptedBy,
         total: res.total,
         answered: res.answered,
         elapsedMs: res.elapsedMs,
@@ -934,9 +944,9 @@ export function registerTools(pi, getRuntime) {
     pi.registerTool({
         name: "mesh_wait_all",
         label: "Mesh Wait All",
-        description: "Block this turn until EVERY mission sent with awaitReply:true is answered " +
-            "(or timeout), then return the group summary — who answered, who is missing. " +
-            "The honest alternative to sleep-while-waiting: no wasted tokens, no polling.",
+        description: "Wait for missions sent with awaitReply:true and return complete answers and missing tasks. " +
+            "Returns early on peer/connection errors, cancellation, or a new actionable inbound message. " +
+            "Interruption preserves tasks and partial answers for a later wait; it does not abort the turn.",
         promptSnippet: "Wait for all pending mission replies and get the summary.",
         parameters: MESH_WAIT_ALL_PARAMETERS,
         execute: (_toolCallId, params, signal, _onUpdate, _ctx) => execMeshWaitAll(getRuntime, params, signal),

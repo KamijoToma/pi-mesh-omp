@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { MeshClient } from "../src/client/client.js";
 import type { MeshFrame } from "../src/protocol/envelope.js";
-import { brokerSocketPathOf, makeTempDirs, RawClient, startTestBroker, sleep, type TempDirs } from "./helpers.js";
+import { brokerSocketPathOf, makeTempDirs, RawClient, startTestBroker, sleep, waitFor, type TempDirs } from "./helpers.js";
 import type { RunningBroker } from "../src/broker/broker.js";
 
 describe("drop notice: client settles a live mission when the mailbox drops the message", () => {
@@ -62,4 +62,40 @@ describe("drop notice: client settles a live mission when the mailbox drops the 
     assert.equal(mission.status, "failed");
     assert.equal(broker.state.stats.mailboxDropped, 1);
   });
+});
+
+it("mailbox envelope growth explicitly fails the live mission while the recipient stays online", async (t) => {
+  const dirs = makeTempDirs("mesh-mailbox-growth-");
+  t.after(() => dirs.cleanup());
+  const broker = await startTestBroker(dirs.runtimeDir);
+  t.after(() => broker.close());
+  const alice = new MeshClient({ alias: "alice", runtimeDir: dirs.runtimeDir });
+  t.after(() => alice.close());
+  await alice.connect();
+  const bob1 = await RawClient.connect(brokerSocketPathOf(dirs.runtimeDir));
+  bob1.hello("bob");
+  await bob1.waitFrame((f) => f.type === "welcome");
+  bob1.close();
+  await waitFor(() => !broker.state.peers.has("bob"));
+
+  const sent = await alice.send({
+    to: "bob", message: "\\".repeat(32629), awaitReply: true, block: false,
+  });
+  assert.equal(sent.status, "queued_offline");
+  assert.equal(alice.pendingCount, 1);
+  let noticed: MeshFrame | undefined;
+  alice.once("dropped_offline", (frame: MeshFrame) => { noticed = frame; });
+  const bob2 = await RawClient.connect(brokerSocketPathOf(dirs.runtimeDir));
+  t.after(() => bob2.close());
+  bob2.hello("bob");
+  await bob2.waitFrame((f) => f.type === "welcome");
+  const drop = await waitFor(() => noticed);
+  assert.equal(drop.id, sent.msgId);
+  assert.equal(alice.pendingCount, 0);
+  assert.equal(alice.missionStatus().find((m) => m.msgId === sent.msgId)?.status, "failed");
+  assert.equal(broker.state.stats.mailboxDelivered, 0);
+  assert.equal(broker.state.stats.mailboxDropped, 1);
+  bob2.send({ type: "ping", from: "bob", id: "m_after_drop" });
+  await bob2.waitFrame((f) => f.type === "pong" && f.id === "m_after_drop");
+  assert.equal(bob2.frames.some((f) => f.type === "mailbox"), false);
 });

@@ -9,13 +9,14 @@ import type { BrokerState, StoredMsg } from "./state.js";
 export declare function enqueueMailbox(state: BrokerState, config: MeshConfig, alias: string, frame: MeshFrame, now?: number): StoredMsg[];
 /** Periodic TTL purge across all aliases. Returns everything dropped. */
 export declare function purgeAllExpired(state: BrokerState, config: MeshConfig, now?: number): StoredMsg[];
-export declare function mailboxSize(state: BrokerState, config: MeshConfig, alias: string): number;
 /**
- * Drain the mailbox at hello: returns stored frames (as `mailbox` frames with
- * queuedAt) in enqueue order, clears the queue, and surfaces any entries
- * that expired while the owner was away (for drop notices).
+ * Return the fresh queue at hello without consuming it. Entries stay queued
+ * until a write is attempted; only the broker's successful write callback
+ * records delivery.
  */
 export declare function flushMailbox(state: BrokerState, config: MeshConfig, alias: string, now?: number): {
-    frames: MeshFrame[];
+    entries: StoredMsg[];
     dropped: StoredMsg[];
 };
+/** Restore a failed write at its original age and position, honoring TTL/cap. */
+export declare function requeueMailbox(state: BrokerState, config: MeshConfig, alias: string, stored: StoredMsg, now?: number): StoredMsg[];

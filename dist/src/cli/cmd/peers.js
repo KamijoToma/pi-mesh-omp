@@ -1,17 +1,19 @@
 // cli/cmd/peers.ts — live broker snapshot, one line per peer.
-import { say } from "../out.js";
+import { say, sayErr } from "../out.js";
 import { EXIT_OK, EXIT_MESH_FAILURE } from "../codes.js";
 import { ephemeralClient } from "../ctx.js";
 export async function cmdPeers(room) {
     const client = ephemeralClient();
+    let snap;
     try {
         await client.connect();
+        snap = await client.status(room);
     }
-    catch {
-        say("blocked: broker_unavailable");
+    catch (error) {
+        sayErr(`error: ${error instanceof Error ? error.message : String(error)}`);
+        await client.close();
         return EXIT_MESH_FAILURE;
     }
-    const snap = await client.status(room);
     for (const p of snap.peers) {
         const v = p.clientVersion !== undefined && p.clientVersion !== "" ? `v${p.clientVersion}` : "v?";
         say(`${p.alias}\trooms=${p.rooms.join(",")}\tv=${v}\tsince=${p.since ?? "?"}`);

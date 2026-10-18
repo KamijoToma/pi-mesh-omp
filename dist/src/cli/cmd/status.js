@@ -3,7 +3,7 @@
 // Activity and reservation TTLs reuse the CLIENT's own config getters and
 // computePeerStatus() — the same semantics the extension renders, never a
 // parallel hardcoded heuristic.
-import { say, jsonLine } from "../out.js";
+import { say, sayErr, jsonLine } from "../out.js";
 import { EXIT_OK, EXIT_MESH_FAILURE } from "../codes.js";
 import { ephemeralClient } from "../ctx.js";
 import { computePeerStatus, formatDurationShort } from "../../client/client.js";
@@ -49,14 +49,20 @@ function reservationTtlState(since, ttlMs) {
 }
 export async function cmdStatus(opts) {
     const client = ephemeralClient();
+    let snap;
     try {
         await client.connect();
+        snap = await client.status(opts.all && opts.room === undefined ? undefined : opts.room);
     }
-    catch {
-        say("blocked: broker_unavailable");
+    catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (opts.json)
+            jsonLine({ status: "error", reason });
+        else
+            sayErr(`error: ${reason}`);
+        await client.close();
         return EXIT_MESH_FAILURE;
     }
-    const snap = await client.status(opts.all && opts.room === undefined ? undefined : opts.room);
     const stats = snap.stats;
     if (opts.json) {
         jsonLine({

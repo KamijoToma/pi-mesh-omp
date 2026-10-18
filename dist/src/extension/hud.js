@@ -42,7 +42,11 @@ export function renderHudLines(state, theme) {
         const alert = `!err:${failures}`;
         line += ` ${theme?.fg("error", alert) ?? alert}`;
     }
-    line += state.connected ? ` peers:${state.peerCount}` : state.connecting ? " connecting" : " offline";
+    line += state.connected
+        ? state.statusError !== undefined
+            ? ` peers:? status:${state.statusError}`
+            : ` peers:${state.peerCount}`
+        : state.connecting ? " connecting" : " offline";
     if (state.pending > 0)
         line += ` · wait:${state.pending}`;
     if (state.inbox > 0)
@@ -67,6 +71,7 @@ export class MeshHud {
     connecting = false;
     statusTimer = null;
     lastStatusFetchAt = 0;
+    statusError;
     constructor(deps) {
         this.deps = deps;
     }
@@ -96,6 +101,7 @@ export class MeshHud {
     /** 'closed': mark offline + clear peers (client auto-reconnects → ◐). */
     onClosed() {
         this.snapshot = null;
+        this.statusError = undefined;
         this.connecting = true;
         this.refresh();
     }
@@ -126,10 +132,18 @@ export class MeshHud {
         rt.client
             .status()
             .then((snap) => {
+            if (this.deps.getRuntime() !== rt)
+                return;
+            this.statusError = undefined;
             this.snapshot = snap;
             this.refresh();
         })
-            .catch(() => { });
+            .catch((error) => {
+            if (this.deps.getRuntime() !== rt)
+                return;
+            this.statusError = error instanceof Error ? error.message : String(error);
+            this.refresh();
+        });
     }
     refresh() {
         const ctx = this.ctx;
@@ -157,6 +171,7 @@ export class MeshHud {
             alias: self !== "" ? self : "?",
             rooms,
             peerCount: visiblePeerCount(this.snapshot, self, rooms),
+            statusError: this.statusError,
             pending: rt?.client.pendingCount ?? 0,
             inbox: rt?.deferredInbox?.count ?? 0,
             transcriptOn: rt?.transcript.isEnabled() === true,

@@ -6,6 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { MeshClient } from "../src/client/client.js";
+import type { MeshFrame } from "../src/protocol/envelope.js";
 import { MeshIdentity, identityFromClient } from "../src/shared/identity-store.js";
 import { makeTempDirs, startTestBroker, sleep, spawnCli, waitFor, type CliProcess } from "./helpers.js";
 
@@ -209,6 +210,50 @@ test("attach --session adopts an explicitly empty room set without rejoining def
   } finally {
     await proc?.cleanup();
     await observer.close();
+    await broker.close();
+    dirs.cleanup();
+  }
+});
+
+test("attach --json: new input interrupts wait without cancelling the awaited send", { timeout: 15_000 }, async () => {
+  const dirs = makeTempDirs("cli-attach-wait-");
+  const broker = await startTestBroker(dirs.runtimeDir);
+  const peer = new MeshClient({ alias: "peer", runtimeDir: dirs.runtimeDir, noReconnect: true });
+  await peer.connect();
+  let original: MeshFrame | undefined;
+  peer.on("inbound", (frame: MeshFrame) => {
+    if (frame.body === "awaited task") original = frame;
+  });
+  let proc: CliProcess | undefined;
+  try {
+    proc = spawnCli(["attach", "wait-node", "--json"], hermeticEnv({
+      MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir,
+    }));
+    await waitFor(() => proc?.out.includes('"attach-start"'));
+    proc.child.stdin!.write(JSON.stringify({ ref: "task", cmd: "send", to: "peer", message: "awaited task", awaitReply: true, timeoutMs: 10_000 }) + "\n");
+    await waitFor(() => original !== undefined);
+    proc.child.stdin!.write(JSON.stringify({ ref: "waiting", cmd: "wait", timeoutMs: 10_000 }) + "\n");
+    proc.child.stdin!.write(JSON.stringify({ ref: "barrier", cmd: "status" }) + "\n");
+    await waitFor(() => proc?.out.includes('"ref":"barrier"'));
+    const incoming = await peer.send({ to: "wait-node", message: "new directive" });
+    await waitFor(() => proc?.out.includes('"ref":"waiting"'), 2000);
+    const events = proc.out.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    const verdict = events.find((event) => event.ref === "waiting")?.verdict;
+    assert.equal(verdict.status, "interrupted");
+    assert.equal(verdict.reason, "inbound_message");
+    assert.equal(verdict.interruptedBy, incoming.msgId);
+    assert.equal(verdict.missing[0]?.msgId, original!.id);
+    assert.equal(events.some((event) => event.ref === "task"), false, "yielding the wait must not cancel the blocking request");
+    await peer.reply(original!.id, "task completed");
+    await waitFor(() => proc?.out.includes('"ref":"task"'));
+    const taskLine = proc.out.split("\n").find((line) => line.includes('"ref":"task"'));
+    assert.equal(JSON.parse(taskLine!).result.status, "reply");
+    assert.equal(JSON.parse(taskLine!).result.response, "task completed");
+    proc.child.stdin!.write(JSON.stringify({ cmd: "exit" }) + "\n");
+    assert.equal(await proc.done, 0);
+  } finally {
+    await proc?.cleanup();
+    await peer.close();
     await broker.close();
     dirs.cleanup();
   }

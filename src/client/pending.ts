@@ -36,6 +36,7 @@ export class PendingReplies {
   constructor(
     private readonly onRemind: (msgId: string) => void,
     private readonly onChanged?: () => void,
+    private readonly onSettled?: (msgId: string, resolution: PendingResolution) => void,
   ) {}
 
   register(msgId: string, expiresAtMs: number, launch = false): Promise<PendingResolution> {
@@ -66,7 +67,9 @@ export class PendingReplies {
       schedule(total, () => {
         if (this.entries.delete(msgId)) {
           entry.timers.forEach(clearTimeout);
-          resolve({ kind: "expired" }); // terminal 
+          const resolution: PendingResolution = { kind: "expired" };
+          this.onSettled?.(msgId, resolution);
+          resolve(resolution);
           this.onChanged?.();
         }
       });
@@ -95,7 +98,9 @@ export class PendingReplies {
     }
     this.entries.delete(replyTo);
     entry.timers.forEach(clearTimeout);
-    entry.resolve({ kind: "reply", frame });
+    const resolution: PendingResolution = { kind: "reply", frame };
+    this.onSettled?.(replyTo, resolution);
+    entry.resolve(resolution);
     this.onChanged?.();
     return true;
   }
@@ -109,11 +114,13 @@ export class PendingReplies {
     if (!entry) return;
     this.entries.delete(msgId);
     entry.timers.forEach(clearTimeout);
-    entry.resolve({ kind: "error", reason });
+    const resolution: PendingResolution = { kind: "error", reason };
+    this.onSettled?.(msgId, resolution);
+    entry.resolve(resolution);
     this.onChanged?.();
   }
 
-  /** shutdown with live pendings → all resolved error{shutting_down}. */
+  /** Resolve all live entries with the caller's lifecycle reason. */
   cancelAll(reason: string): void {
     for (const msgId of [...this.entries.keys()]) this.cancel(msgId, reason);
   }

@@ -30,6 +30,8 @@ export interface InterruptReport {
 
 export interface InjectOpts extends FormatOpts {
   replyChain?: boolean;
+  /** A passive mesh wait yielded: surface this message at the next model call. */
+  wakeWaiting?: boolean;
   /** Called only after sendMessage successfully hands the message to the host. */
   onInjected?: () => void;
   /** Called once successful delivery concludes the interrupt handling. */
@@ -289,9 +291,11 @@ export function injectInbound(
     ? "followUp"
     : frame.type === "reply" && opts.replyChain === true
       ? "followUp"
-      : frame.type === "remind"
-        ? "followUp"
-        : mapReplyDelivery(frame);
+      : opts.wakeWaiting === true
+        ? "steer"
+        : frame.type === "remind"
+          ? "followUp"
+          : mapReplyDelivery(frame);
   if (isReceipt) {
     const message = buildInboundMessage(frame, opts);
     sendInjectedInbound(pi, message, { triggerTurn: false, deliverAs: "followUp" }, opts);

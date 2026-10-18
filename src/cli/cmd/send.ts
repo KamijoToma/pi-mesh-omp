@@ -57,7 +57,7 @@ export function printResult(r: SendResult): void {
       say(`blocked: ${r.reason}`);
       break;
     case "error":
-      say(`error: ${r.reason}`);
+      say(`error: ${r.reason}${r.delivery !== undefined ? ` (delivery=${r.delivery})` : ""}`);
       break;
   }
 }
@@ -65,8 +65,8 @@ export function printResult(r: SendResult): void {
 /** Honest exit code for a SendResult (D5 contract). */
 export function exitCodeFor(r: SendResult, requireOnline: boolean): number {
   if (r.status === "error") {
-    // cancelled (SIGINT on --await) is an honest, agreed outcome — not a failure
-    if (r.reason === "cancelled") return EXIT_OK;
+    // Explicit cancellation is an agreed outcome, not a transport failure.
+    if (r.reason === "aborted" || r.reason === "missions_cancelled") return EXIT_OK;
     return EXIT_MESH_FAILURE;
   }
   if (r.status === "blocked") return EXIT_MESH_FAILURE;

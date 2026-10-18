@@ -30,7 +30,7 @@ import {
 } from "../shared/config.js";
 import { brokerLockPath, brokerSocketPath, runtimeDir, stateDir } from "../shared/paths.js";
 import { loadOrCreateBrokerId } from "../shared/broker-identity.js";
-import { enqueueMailbox, flushMailbox, mailboxSize, purgeAllExpired } from "./mailbox.js";
+import { enqueueMailbox, flushMailbox, purgeAllExpired, requeueMailbox } from "./mailbox.js";
 import { evaluatePolicy, loadPolicy, type MeshPolicy } from "./policy.js";
 import { checkRate, type RateKind } from "./ratelimit.js";
 import {
@@ -67,7 +67,7 @@ export interface RunningBroker {
   purgeMailboxExpired: (now?: number) => void;
 }
 
-type WriteCallback = (ok: boolean) => void;
+type WriteCallback = (ok: boolean, unencodable?: boolean) => void;
 
 /** Bounded write (5 s). cb(false) on timeout/error; socket destroyed. */
 function writeFrame(
@@ -94,7 +94,7 @@ function writeFrame(
   } catch {
     clearTimeout(timer);
     settled = true;
-    cb(false);
+    cb(false, true);
     return;
   }
   if (socket.destroyed || !socket.writable) {
@@ -174,6 +174,46 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
         buildFrame({ type: "ack", id: frame.id, status: "dropped_offline", to: frame.to }),
       );
     }
+  };
+
+  // Only one mailbox write per alias may be in flight, even across takeover.
+  // A replacement waits for the old write to settle before retrying its entry.
+  const mailboxWrites = new Set<string>();
+  const welcomed = new WeakSet<PeerRecord>();
+  const deliverMailbox = (alias: string): void => {
+    const peer = state.peers.get(alias);
+    if (peer === undefined || !welcomed.has(peer) || peer.socket.destroyed || mailboxWrites.has(alias)) return;
+    const { entries, dropped } = flushMailbox(state, config, alias);
+    notifyDropped(dropped);
+    const stored = entries.shift();
+    if (entries.length === 0) state.mailbox.delete(alias);
+    if (stored === undefined) return;
+    mailboxWrites.add(alias);
+    const frame: MeshFrame = {
+      ...stored.frame,
+      type: "mailbox",
+      queuedAt: new Date(stored.enqueuedAt).toISOString(),
+    };
+    writeFrame(peer.socket, frame, config.maxFrameBytes, (ok, unencodable) => {
+      mailboxWrites.delete(alias);
+      if (ok) {
+        state.stats.mailboxDelivered += 1;
+        const sender = stored.frame.from !== undefined ? state.peers.get(stored.frame.from) : undefined;
+        if (sender !== undefined && sender.helloDone && !sender.socket.destroyed) {
+          sendAck(sender, stored.frame.id, "delivered");
+        }
+      } else if (unencodable) {
+        // A valid ingress frame can exceed the cap once queuedAt is added.
+        // This is a dead letter, not a broken recipient connection.
+        state.stats.mailboxDropped += 1;
+        notifyDropped([stored]);
+      } else {
+        notifyDropped(requeueMailbox(state, config, alias, stored));
+        if (state.peers.get(alias) === peer) closePeer(state, alias, "write_failure", config.maxFrameBytes);
+      }
+      // Encode failures settle synchronously; avoid recursive queue draining.
+      queueMicrotask(() => deliverMailbox(alias));
+    });
   };
 
   /** replyAll — fan the answer out to every ONLINE room member (except the
@@ -278,7 +318,9 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
       socket.destroy();
       return;
     }
-    if (existing) state.peers.delete(alias);
+    if (existing && state.peers.get(alias) === existing) {
+      closePeer(state, alias, "hello_takeover", config.maxFrameBytes);
+    }
 
     const peer: PeerRecord = {
       alias,
@@ -323,24 +365,33 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
       }
     }
 
-    const { frames: mailboxFrames, dropped: mailboxDropped } = flushMailbox(state, config, alias);
-    if (mailboxDropped.length > 0) notifyDropped(mailboxDropped);
-    sendTo(
-      peer,
+    const { entries: mailboxEntries, dropped: mailboxDropped } = flushMailbox(state, config, alias);
+    notifyDropped(mailboxDropped);
+    writeFrame(
+      peer.socket,
       buildFrame({
         type: "welcome",
         id: frame.id,
         from: alias,
         rooms: [...peer.rooms.keys()],
         peers: peersSnapshot(state),
-        mailboxCount: mailboxFrames.length,
+        mailboxCount: mailboxEntries.length,
         broker: brokerInfo,
       }),
+      config.maxFrameBytes,
+      (ok) => {
+        if (!ok) {
+          if (state.peers.get(alias) === peer) closePeer(state, alias, "write_failure", config.maxFrameBytes);
+          return; // Nothing was consumed from the mailbox.
+        }
+        if (state.peers.get(alias) !== peer || peer.socket.destroyed) return;
+        welcomed.add(peer);
+        announceOnline(state, peer, sendTo);
+        // Existing peers learn the newcomer's reservations (like presence).
+        if (peer.reservations.length > 0) broadcastReservations(state, peer, sendTo);
+        deliverMailbox(alias);
+      },
     );
-    for (const mf of mailboxFrames) sendTo(peer, mf); // mailbox frames right after welcome
-    announceOnline(state, peer, sendTo);
-  // existing peers learn the newcomer's reservations (like presence)
-    if (peer.reservations.length > 0) broadcastReservations(state, peer, sendTo);
   };
 
   const routeMsg = (from: PeerRecord, frame: MeshFrame): void => {

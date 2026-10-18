@@ -1,13 +1,18 @@
 // test/mailbox.test.ts — E5 (queued_offline + delivery at hello + body intact),
 // E6 (cap drop oldest), TTL expiry, delivery order (D9, §7.7).
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import net, { type Socket } from "node:net";
 import { describe, it } from "node:test";
+import { buildFrame } from "../src/protocol/envelope.js";
+import { encodeFrame } from "../src/protocol/frames.js";
 import {
   brokerSocketPathOf,
   makeTempDirs,
   RawClient,
   startTestBroker,
   sleep,
+  waitFor,
   type TempDirs,
 } from "./helpers.js";
 import type { RunningBroker } from "../src/broker/broker.js";
@@ -53,7 +58,151 @@ describe("mailbox: offline queue", () => {
     assert.equal(mf.body, "while-you-were-out"); // body intact
     assert.equal(mf.from, "alice");
     assert.ok(typeof mf.queuedAt === "string");
+    const delivered = await alice.waitFrame((f) => f.type === "ack" && f.id === mf.id && f.status === "delivered");
+    assert.equal(delivered.id, ack.id, "delivery confirmation correlates the original queued message");
     assert.equal(broker.state.stats.mailboxDelivered, 1);
+
+    bob2.close();
+    await alice.waitFrames((f) => f.type === "presence" && f.from === "bob" && f.status === "offline", 2);
+    const bob3 = await RawClient.connect(sock);
+    t.after(() => bob3.close());
+    bob3.hello("bob");
+    const again = await bob3.waitFrame((f) => f.type === "welcome");
+    assert.equal(again.mailboxCount, 0, "successfully written entries must not replay on reconnect");
+    bob3.send({ type: "ping", from: "bob", id: "m_after_flush" });
+    await bob3.waitFrame((f) => f.type === "pong" && f.id === "m_after_flush");
+    assert.equal(bob3.frames.some((f) => f.type === "mailbox"), false);
+  });
+
+  it("a valid 65528-byte ingress that grows past the default cap is explicitly dropped without closing the recipient", async (t) => {
+    const { broker, sock } = await setup(t);
+    const alice = await RawClient.connect(sock);
+    t.after(() => alice.close());
+    alice.hello("alice");
+    await alice.waitFrame((f) => f.type === "welcome");
+    const bob1 = await RawClient.connect(sock);
+    bob1.hello("bob");
+    await bob1.waitFrame((f) => f.type === "welcome");
+    bob1.close();
+    await alice.waitFrame((f) => f.type === "presence" && f.from === "bob" && f.status === "offline");
+    const original = buildFrame({
+      type: "msg", id: "m_mailbox_full_0001", from: "alice", to: "bob",
+      room: "default", priority: "normal", body: "\\".repeat(32629),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    assert.equal(encodeFrame(original, 65536).byteLength, 65528);
+    alice.sendFrame(original);
+    await alice.waitFrame((f) => f.type === "ack" && f.id === original.id && f.status === "queued_offline");
+
+    const bob2 = await RawClient.connect(sock);
+    t.after(() => bob2.close());
+    bob2.hello("bob");
+    await bob2.waitFrame((f) => f.type === "welcome");
+    const dropped = await alice.waitFrame((f) => f.type === "ack" && f.id === original.id && f.status === "dropped_offline");
+    assert.equal(dropped.to, "bob");
+    bob2.send({ type: "ping", from: "bob", id: "m_after_dead_letter" });
+    await bob2.waitFrame((f) => f.type === "pong" && f.id === "m_after_dead_letter");
+    assert.equal(bob2.frames.some((f) => f.type === "mailbox"), false);
+    assert.equal(bob2.closed, false);
+    assert.equal(broker.state.stats.mailboxDelivered, 0);
+    assert.equal(broker.state.stats.mailboxDropped, 1);
+    assert.equal(alice.frames.some((f) => f.type === "ack" && f.id === original.id && f.status === "delivered"), false);
+  });
+
+  it("a whole welcome encode failure retains the mailbox for a later successful hello", async (t) => {
+    const { broker, sock } = await setup(t, { config: { maxFrameBytes: 1024 } });
+    const alice = await RawClient.connect(sock, 1024);
+    t.after(() => alice.close());
+    alice.hello("alice");
+    await alice.waitFrame((f) => f.type === "welcome");
+    const bob1 = await RawClient.connect(sock, 1024);
+    bob1.hello("bob");
+    await bob1.waitFrame((f) => f.type === "welcome");
+    bob1.close();
+    await alice.waitFrame((f) => f.type === "presence" && f.from === "bob" && f.status === "offline");
+    alice.send({ type: "msg", id: "m_welcome_retry", from: "alice", to: "bob", body: "keep until hello succeeds" });
+    await alice.waitFrame((f) => f.type === "ack" && f.id === "m_welcome_retry");
+    alice.send({
+      type: "reserve", id: "m_large_snapshot", from: "alice",
+      reservations: [{ pattern: "p".repeat(400), reason: "r".repeat(200) }],
+    });
+    await alice.waitFrame((f) => f.type === "ack" && f.id === "m_large_snapshot");
+    const rejected = await RawClient.connect(sock, 1024);
+    rejected.hello("bob");
+    await rejected.waitClosed();
+    assert.equal(rejected.frames.some((f) => f.type === "welcome" || f.type === "mailbox"), false);
+    assert.equal(broker.state.stats.mailboxDelivered, 0);
+    assert.equal(broker.state.stats.mailboxDropped, 0);
+
+    alice.send({ type: "reserve", id: "m_small_snapshot", from: "alice", reservations: [] });
+    await alice.waitFrame((f) => f.type === "ack" && f.id === "m_small_snapshot");
+    const bob2 = await RawClient.connect(sock, 1024);
+    t.after(() => bob2.close());
+    bob2.hello("bob");
+    const welcome = await bob2.waitFrame((f) => f.type === "welcome");
+    assert.equal(welcome.mailboxCount, 1);
+    const received = await bob2.waitFrame((f) => f.type === "mailbox" && f.id === "m_welcome_retry");
+    assert.equal(received.body, "keep until hello succeeds");
+    await alice.waitFrame((f) => f.type === "ack" && f.id === received.id && f.status === "delivered");
+    assert.equal(broker.state.stats.mailboxDelivered, 1);
+  });
+
+  it("real socket backpressure and failure retries only unwritten entries at their original age", async (t) => {
+    const count = 32;
+    const { broker, sock } = await setup(t, {
+      policy: { rateLimits: { msgPerMin: 100, urgentPerMin: 15, forcePerMin: 1 } },
+    });
+    const alice = await RawClient.connect(sock);
+    t.after(() => alice.close());
+    alice.hello("alice");
+    await alice.waitFrame((f) => f.type === "welcome");
+    const bob1 = await RawClient.connect(sock);
+    bob1.hello("bob");
+    await bob1.waitFrame((f) => f.type === "welcome");
+    bob1.close();
+    await alice.waitFrame((f) => f.type === "presence" && f.from === "bob" && f.status === "offline");
+    const queuedAfter = Date.now();
+    for (let i = 0; i < count; i += 1) {
+      alice.send({ type: "msg", id: `m_retry_${i}`, from: "alice", to: "bob", body: "x".repeat(32700) });
+    }
+    await alice.waitFrames((f) => f.type === "ack" && f.status === "queued_offline", count);
+    const queuedBefore = Date.now();
+
+    const accepted = once(broker.server, "connection");
+    const stalled = net.createConnection(sock);
+    t.after(() => stalled.destroy());
+    await once(stalled, "connect");
+    stalled.on("error", () => {}); // Reset is expected when the blocked stream is destroyed.
+    const [serverSocket] = await accepted as [Socket];
+    stalled.pause(); // A real non-reading recipient fills the unix socket buffers.
+    stalled.write(encodeFrame(buildFrame({ type: "hello", from: "bob" }), 65536));
+    await alice.waitFrame((f) => f.type === "ack" && f.status === "delivered");
+    await waitFor(() => serverSocket.writableLength > 0);
+    await sleep(50); // A retry must not reset queuedAt to this later time.
+    const closed = once(serverSocket, "close");
+    serverSocket.destroy();
+    stalled.destroy();
+    await closed;
+    alice.send({ type: "status_req", id: "m_failed_write_barrier", from: "alice" });
+    await alice.waitFrame((f) => f.type === "status_res" && f.id === "m_failed_write_barrier");
+    const written = new Set(alice.frames.filter((f) => f.type === "ack" && f.status === "delivered").map((f) => f.id));
+    assert.ok(written.size > 0 && written.size < count, "the socket failed partway through the real flush");
+    assert.equal(broker.state.stats.mailboxDropped, 0);
+
+    const bob2 = await RawClient.connect(sock);
+    t.after(() => bob2.close());
+    bob2.hello("bob");
+    const welcome = await bob2.waitFrame((f) => f.type === "welcome");
+    assert.equal(welcome.mailboxCount, count - written.size);
+    const retry = await bob2.waitFrames((f) => f.type === "mailbox", count - written.size);
+    for (const frame of retry) {
+      assert.equal(written.has(frame.id), false, "already-written entries must never replay");
+      const queuedAt = Date.parse(frame.queuedAt ?? "");
+      assert.ok(queuedAt >= queuedAfter && queuedAt <= queuedBefore, "failure preserves the original enqueue time");
+    }
+    await alice.waitFrames((f) => f.type === "ack" && f.status === "delivered", count);
+    assert.equal(new Set([...written, ...retry.map((f) => f.id)]).size, count);
+    assert.equal(broker.state.stats.mailboxDelivered, count);
   });
 
   it("E6: mailbox cap 3, send 5 → oldest dropped, 3 delivered at hello", async (t) => {

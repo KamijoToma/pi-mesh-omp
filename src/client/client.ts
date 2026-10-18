@@ -87,10 +87,8 @@ export interface SendOpts {
   *  and a reason — a last-resort unblocking lever, rate-limited and
   *  policy-gated exactly like force. */
   interrupt?: boolean;
-  /** Abort a BLOCKING awaitReply send (ESC): cancels the pending, cleans
-   *  the mission, and returns {status:"error", reason:"cancelled"} — a
-   *  late reply still arrives via the orphan-inject path. Ignored for
-   *  LAUNCH sends (they never block). */
+  /** Abort before writing without delivery; after writing, stop waiting only.
+   *  A written frame may still arrive, and late replies remain injectable. */
   signal?: AbortSignal;
 }
 
@@ -113,7 +111,8 @@ export type SendResult =
   | { status: "delivered"; msgId: string; deliveredCount?: number; totalCount?: number }
   | { status: "queued_offline"; msgId: string; deliveredCount?: number; totalCount?: number }
   | { status: "reply"; msgId: string; response: string; outputHash: string }
-  | { status: "expired" | "blocked" | "error"; msgId?: string; reason: string };
+  | { status: "expired" | "blocked" | "error"; msgId?: string; reason: string;
+      delivery?: "delivered" | "queued_offline" | "unknown" };
 
 export function isBroadcastResult(res: SendResult): res is Extract<SendResult, { deliveredCount?: number }> {
   return res.status === "delivered" || res.status === "queued_offline";
@@ -178,6 +177,11 @@ interface AwaitedMission {
   room: string;
   status: "waiting" | "answered" | "expired" | "failed";
   answered: boolean;
+  reason?: string;
+  unavailableReason?: string;
+  targetOnline?: boolean;
+  delivery?: "delivered" | "queued_offline";
+  brokerBootId?: string;
   response?: string;
   at?: string;
 }
@@ -223,11 +227,13 @@ const ALIAS_RETRY_DELAY_MS = 250;
 const HANDLED_REPLY_WINDOW_MS = 1_800_000;
 
 export interface WaitAllSummary {
-  status: "complete" | "timeout" | "cancelled";
+  status: "complete" | "timeout" | "cancelled" | "error" | "interrupted";
+  reason?: string;
+  interruptedBy?: string;
   total: number;
   answered: number;
   elapsedMs: number;
-  missing: { msgId: string; to: string }[];
+  missing: { msgId: string; to: string; reason?: string }[];
   answers: { msgId: string; to: string; response: string }[];
 }
 
@@ -287,7 +293,8 @@ export class MeshClient extends EventEmitter {
    *  LAUNCH answers skip session injection (the verdict carries that
    *  batch). */
   private waitAllInFlight = 0;
-  private readonly waitAllCancels = new Set<() => void>();
+  private readonly waitAllStops = new Set<(status: WaitAllSummary["status"], reason: string, msgId?: string) => void>();
+  private waitStopReason = "closed";
   /** Memory-only ring buffer of last frames (bodies included) for mesh_history. */
   readonly transcript: MeshFrame[] = [];
   /** Own file reservations — declared at hello, updated via reserve/release. */
@@ -318,6 +325,7 @@ export class MeshClient extends EventEmitter {
   /** Aliases seen online (welcome + presence join) — send-guard hints.
   *  Best-effort: a missing entry is a WARNING, never a block. */
   private readonly knownPeers = new Set<string>();
+  private readonly knownPeerRooms = new Map<string, Set<string>>();
   /**
   * replyTo msgIds already answered/handled: the FIRST reply to a given
   * message is consumed (pending match) or injected (orphan); later replies
@@ -347,6 +355,27 @@ export class MeshClient extends EventEmitter {
     this.pending = new PendingReplies(
       (msgId) => this.sendRemind(msgId),
       () => this.emit("pending"),
+      (msgId, resolution) => {
+        this.awaitTargets.delete(msgId);
+        const mission = this.awaitedMissions.get(msgId);
+        if (mission !== undefined) {
+          if (resolution.kind === "reply" && resolution.frame !== undefined) {
+            mission.status = "answered";
+            mission.answered = true;
+            mission.response = resolution.frame.body ?? "";
+            mission.at = resolution.frame.ts;
+            delete mission.reason;
+            delete mission.unavailableReason;
+          } else if (resolution.kind === "expired") {
+            mission.status = "expired";
+            this.emit("expired", { msgId });
+          } else {
+            mission.status = "failed";
+            mission.reason = resolution.reason ?? "error";
+          }
+        }
+        this.emit("missions");
+      },
     );
   }
 
@@ -410,12 +439,24 @@ export class MeshClient extends EventEmitter {
 
   /** Cancel pending replies and clear every mission from the previous batch. */
   cancelAllAwaited(): void {
+    this.stopWaitAll("cancelled", "missions_cancelled");
     for (const id of [...this.awaitTargets.keys()]) {
-      this.pending.cancel(id, "cancelled");
+      this.pending.cancel(id, "missions_cancelled");
     }
     this.awaitTargets.clear();
     this.awaitedMissions.clear();
     this.reportedMissions.clear();
+  }
+
+  /** End active group waits without cancelling missions or the host turn. */
+  interruptWaitAll(reason: string, msgId?: string): boolean {
+    const interrupted = this.waitAllStops.size > 0;
+    this.stopWaitAll("interrupted", reason, msgId);
+    return interrupted;
+  }
+
+  private stopWaitAll(status: WaitAllSummary["status"], reason: string, msgId?: string): void {
+    for (const stop of this.waitAllStops) stop(status, reason, msgId);
   }
 
   /** bound the awaitedMissions history (oldest dropped first). */
@@ -448,13 +489,15 @@ export class MeshClient extends EventEmitter {
 
   /** Missions sent with awaitReply and their answer state: status is
   *  honest — waiting/answered/expired/failed). */
-  missionStatus(): { msgId: string; to: string; answered: boolean; status: string }[] {
+  missionStatus(): { msgId: string; to: string; answered: boolean; status: string; reason?: string }[] {
     this.pruneAwaitedMissions();
     return [...this.awaitedMissions.entries()].map(([msgId, m]) => ({
       msgId,
       to: m.to,
       answered: m.answered,
       status: m.status,
+      ...(m.reason !== undefined || m.unavailableReason !== undefined
+        ? { reason: m.reason ?? m.unavailableReason } : {}),
     }));
   }
 
@@ -466,101 +509,96 @@ export class MeshClient extends EventEmitter {
   * Snapshot every unreported mission, including answers and terminal failures
   * that arrived before this call. Missing missions remain reportable on retry.
   */
-  async waitAll(timeoutMs: number, signal?: AbortSignal): Promise<WaitAllSummary> {
+  async waitAll(timeoutMs = DEFAULT_AWAIT_REPLY_TIMEOUT_MS, signal?: AbortSignal): Promise<WaitAllSummary> {
     const start = Date.now();
-    const deadline = start + Math.max(25, timeoutMs);
+    const deadline = start + Math.min(MAX_AWAIT_REPLY_TIMEOUT_MS, Math.max(25, timeoutMs));
     const targets = new Set<string>(this.awaitTargets.keys());
     for (const id of this.awaitedMissions.keys()) {
       if (!this.reportedMissions.has(id)) targets.add(id);
     }
     const targetList = [...targets];
     if (this.#selection !== null || this.intentionallyClosed) {
-      return this.summarize(start, "cancelled", targetList);
+      return this.summarize(start, "cancelled", targetList, this.waitStopReason);
     }
-    this.waitAllInFlight += 1; // answers arriving now are carried by the verdict
-    return new Promise((resolve) => {
-      let settled = false;
-      let timer: NodeJS.Timeout | null = null;
-      const done = (status: "complete" | "timeout" | "cancelled"): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer ?? undefined);
-        timer = null;
-        this.waitAllCancels.delete(onAbort);
-        this.waitAllInFlight -= 1;
-        if (signal !== undefined) signal.removeEventListener("abort", onAbort);
-        if (status !== "cancelled") {
-  // answered missions of this verdict are reported once — a
-  // later wait_all (next batch) must not re-list them. Missions still
-  // missing stay reportable (the agent may wait again for them). A
-  // CANCELLED verdict reports nothing: the agent may re-wait for the
-  // same batch after the interrupt.
-          for (const id of targetList) {
-            if (this.awaitedMissions.get(id)?.answered === true) this.reportedMissions.add(id);
-          }
-          if (this.reportedMissions.size > 512) {
-            let dropped = 0;
-            for (const id of this.reportedMissions) {
-              if (dropped >= 256) break;
-              this.reportedMissions.delete(id);
-              dropped += 1;
-            }
+    this.waitAllInFlight += 1;
+    let resolve!: (summary: WaitAllSummary) => void;
+    const promise = new Promise<WaitAllSummary>((settle) => { resolve = settle; });
+    let settled = false;
+    let timer: NodeJS.Timeout | null = null;
+    const done = (status: WaitAllSummary["status"], reason?: string, interruptedBy?: string): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer ?? undefined);
+      this.waitAllStops.delete(done);
+      this.removeListener("missions", tick);
+      this.waitAllInFlight -= 1;
+      signal?.removeEventListener("abort", onAbort);
+      // Only normal verdicts consume answers. Interrupted/error/cancelled
+      // waits may be retried with their partial answers intact.
+      if (status === "complete" || status === "timeout") {
+        for (const id of targetList) {
+          if (this.awaitedMissions.get(id)?.answered === true) this.reportedMissions.add(id);
+        }
+        if (this.reportedMissions.size > 512) {
+          let dropped = 0;
+          for (const id of this.reportedMissions) {
+            if (dropped >= 256) break;
+            this.reportedMissions.delete(id);
+            dropped += 1;
           }
         }
-        resolve(this.summarize(start, status, targetList));
-      };
-      const onAbort = (): void => done("cancelled");
-      this.waitAllCancels.add(onAbort);
-      if (signal !== undefined) {
-        if (signal.aborted) {
-          done("cancelled");
-          return;
-        }
-        signal.addEventListener("abort", onAbort, { once: true });
       }
-      const tick = (): void => {
-        if (settled) return;
-        const missing = targetList.filter((id) => this.awaitedMissions.get(id)?.answered !== true);
-        if (missing.length === 0) {
-          done("complete");
-          return;
-        }
-        if (missing.every((id) => {
-          const status = this.awaitedMissions.get(id)?.status;
-          return status === "expired" || status === "failed";
-        })) {
-          done("timeout");
-          return;
-        }
-        if (Date.now() >= deadline) {
-          done("timeout");
-          return;
-        }
-        timer = setTimeout(tick, 200);
-        timer.unref();
-      };
+      resolve(this.summarize(start, status, targetList, reason, interruptedBy));
+    };
+    const onAbort = (): void => done("cancelled", "aborted");
+    const tick = (): void => {
+      if (settled) return;
+      clearTimeout(timer ?? undefined);
+      const missing = targetList.filter((id) => this.awaitedMissions.get(id)?.answered !== true);
+      if (missing.length === 0) return done("complete");
+      if (!this.online) return done("error", this.#connectionError ?? "connection_lost");
+      const failure = missing.map((id) => this.awaitedMissions.get(id))
+        .find((mission) => mission?.status === "failed" || mission?.unavailableReason !== undefined);
+      if (failure !== undefined) return done("error", failure.reason ?? failure.unavailableReason ?? "error");
+      if (missing.every((id) => this.awaitedMissions.get(id)?.status === "expired") || Date.now() >= deadline) {
+        return done("timeout");
+      }
+      timer = setTimeout(tick, Math.min(200, Math.max(1, deadline - Date.now())));
+      timer.unref();
+    };
+    this.waitAllStops.add(done);
+    this.on("missions", tick);
+    if (signal?.aborted) onAbort();
+    else {
+      signal?.addEventListener("abort", onAbort, { once: true });
       tick();
-    });
+    }
+    return promise;
   }
 
   private summarize(
     startMs: number,
-    status: "complete" | "timeout" | "cancelled",
+    status: WaitAllSummary["status"],
     targets: string[],
+    reason?: string,
+    interruptedBy?: string,
   ): WaitAllSummary {
-    const answers: { msgId: string; to: string; response: string }[] = [];
-    const missing: { msgId: string; to: string }[] = [];
+    const answers: WaitAllSummary["answers"] = [];
+    const missing: WaitAllSummary["missing"] = [];
     for (const msgId of targets) {
       const m = this.awaitedMissions.get(msgId);
       if (m === undefined) continue;
       if (m.answered && m.response !== undefined) {
         answers.push({ msgId, to: m.to, response: m.response });
       } else {
-        missing.push({ msgId, to: m.to });
+        const missingReason = m.reason ?? m.unavailableReason;
+        missing.push({ msgId, to: m.to, ...(missingReason !== undefined ? { reason: missingReason } : {}) });
       }
     }
     return {
       status,
+      ...(reason !== undefined ? { reason } : {}),
+      ...(interruptedBy !== undefined ? { interruptedBy } : {}),
       total: targets.length,
       answered: answers.length,
       elapsedMs: Date.now() - startMs,
@@ -851,7 +889,7 @@ export class MeshClient extends EventEmitter {
     const generation = ++this.#selectionGeneration;
     const selecting = Promise.resolve().then(async () => {
       if (generation !== this.#selectionGeneration) throw new Error("connection_cancelled");
-      await this.#closeConnection();
+      await this.#closeConnection("reset");
       if (generation !== this.#selectionGeneration) throw new Error("connection_cancelled");
       this.config = { ...config, rooms: [...this.joinedRooms.keys()] };
       this.#connectionTarget = null;
@@ -882,6 +920,7 @@ export class MeshClient extends EventEmitter {
     this.peerReservations.clear();
     this.peerActivity.clear();
     this.knownPeers.clear();
+    this.knownPeerRooms.clear();
   }
 
   #awaitConnection<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -1072,11 +1111,32 @@ export class MeshClient extends EventEmitter {
                 }
               }
   // send-guard cache: aliases present in the welcome are known online
-              if (previous !== undefined && broker !== undefined && previous.brokerId === broker.brokerId && previous.bootId !== broker.bootId) {
+              if (previous !== undefined && broker !== undefined && previous.bootId !== broker.bootId) {
+                for (const [id, mission] of this.awaitedMissions) {
+                  if (!mission.answered && mission.delivery !== "delivered"
+                    && mission.brokerBootId === previous.bootId && this.pending.has(id)) {
+                    this.pending.cancel(id, "broker_state_lost_delivery_unknown");
+                  }
+                }
                 this.emit("broker_restart", { previous, current: broker });
               }
               for (const p of frame.peers ?? []) {
-                if (p.alias !== undefined && p.alias !== this.alias) this.knownPeers.add(p.alias);
+                if (p.alias !== undefined && p.alias !== this.alias) {
+                  this.knownPeers.add(p.alias);
+                  this.knownPeerRooms.set(p.alias, new Set(p.rooms));
+                  for (const mission of this.awaitedMissions.values()) {
+                    if (mission.to === p.alias && p.rooms.includes(mission.room)) {
+                      mission.targetOnline = true;
+                      delete mission.unavailableReason;
+                    }
+                  }
+                }
+              }
+              for (const mission of this.awaitedMissions.values()) {
+                if (!mission.answered && mission.targetOnline
+                  && this.knownPeerRooms.get(mission.to)?.has(mission.room) !== true) {
+                  mission.unavailableReason = "target_offline";
+                }
               }
               this.debug("handshake: welcome received");
               resolve({
@@ -1137,6 +1197,10 @@ export class MeshClient extends EventEmitter {
     const wasOnline = this.online;
     this.online = false;
     this.socket = null;
+    if (wasOnline) {
+      this.#connectionError = "connection_lost";
+      this.stopWaitAll("error", "connection_lost");
+    }
     this.stopHeartbeat();
   // in-flight sends: honest error, never delivered)
     for (const [id, w] of this.ackWaiters) {
@@ -1148,7 +1212,7 @@ export class MeshClient extends EventEmitter {
     this.ackWaiters.clear();
     for (const [id, w] of this.statusWaiters) {
       clearTimeout(w.timer);
-      w.resolve(buildFrame({ type: "error", code: "internal", id }));
+      w.resolve(buildFrame({ type: "error", code: "internal", id, status: "connection_lost" }));
     }
     this.statusWaiters.clear();
     if (this.intentionallyClosed || this.noReconnect) {
@@ -1180,6 +1244,16 @@ export class MeshClient extends EventEmitter {
     this.ring(frame);
     switch (frame.type) {
       case "ack": {
+        const mission = this.awaitedMissions.get(frame.id);
+        if (mission !== undefined && frame.status === "delivered") {
+          mission.delivery = "delivered";
+          mission.targetOnline = true;
+          delete mission.unavailableReason;
+        } else if (mission !== undefined && frame.status === "queued_offline" && mission.delivery !== "delivered") {
+          mission.delivery = "queued_offline";
+          mission.targetOnline = false;
+          delete mission.unavailableReason;
+        }
         const w = this.ackWaiters.get(frame.id);
         if (w) {
           this.ackWaiters.delete(frame.id);
@@ -1194,10 +1268,10 @@ export class MeshClient extends EventEmitter {
   // extension so the session learns the message will not arrive.
         if (frame.status === "dropped_offline") {
           if (this.pending.has(frame.id)) this.pending.cancel(frame.id, "dropped_offline");
-          const m = this.awaitedMissions.get(frame.id);
-          if (m !== undefined) {
-            m.status = "failed";
-            m.response = "dropped_offline";
+          if (mission !== undefined && !mission.answered) {
+            mission.status = "failed";
+            mission.reason = "dropped_offline";
+            this.emit("missions");
           }
           this.emit("dropped_offline", frame);
         }
@@ -1288,6 +1362,16 @@ export class MeshClient extends EventEmitter {
   // replied to). Without this, mesh_reply returned "delivered" yet
   // the sender never saw the response.
           if (replyTo !== undefined) this.markReplyHandled(replyTo, body);
+          const mission = replyTo !== undefined ? this.awaitedMissions.get(replyTo) : undefined;
+          if (mission !== undefined) {
+            mission.status = "answered";
+            mission.answered = true;
+            mission.response = body;
+            mission.at = frame.ts;
+            delete mission.reason;
+            delete mission.unavailableReason;
+            this.emit("missions");
+          }
           if (frame.id) {
             this.inbox.set(frame.id, frame);
             this.pruneInbox();
@@ -1313,16 +1397,36 @@ export class MeshClient extends EventEmitter {
         this.emit("frame", frame);
         break;
       }
-      case "presence":
-        if (frame.status === "offline") {
-          this.peerReservations.delete(frame.from ?? "");
-          this.peerActivity.delete(frame.from ?? ""); // gone — forget its state
-          this.knownPeers.delete(frame.from ?? "");
-        } else if (frame.status === "online" && frame.from !== undefined) {
-          this.knownPeers.add(frame.from); // joined — the send guard knows it
+      case "presence": {
+        const alias = frame.from;
+        const room = frame.room;
+        if (alias !== undefined && room !== undefined) {
+          const rooms = this.knownPeerRooms.get(alias) ?? new Set<string>();
+          if (frame.status === "online") rooms.add(room);
+          else if (frame.status === "offline") rooms.delete(room);
+          if (rooms.size > 0) {
+            this.knownPeerRooms.set(alias, rooms);
+            this.knownPeers.add(alias);
+          } else {
+            this.knownPeerRooms.delete(alias);
+            this.knownPeers.delete(alias);
+            this.peerReservations.delete(alias);
+            this.peerActivity.delete(alias);
+          }
+          for (const mission of this.awaitedMissions.values()) {
+            if (mission.to !== alias || mission.room !== room || mission.answered) continue;
+            if (frame.status === "online") {
+              mission.targetOnline = true;
+              delete mission.unavailableReason;
+            } else if (frame.status === "offline" && mission.targetOnline) {
+              mission.unavailableReason = "target_offline";
+            }
+          }
+          this.emit("missions");
         }
         this.emit("presence", frame);
         break;
+      }
       case "pong":
         break;
       case "error": {
@@ -1423,6 +1527,7 @@ export class MeshClient extends EventEmitter {
   // ---- send / reply ----
 
   async send(opts: SendOpts): Promise<SendResult> {
+    if (opts.signal?.aborted) return { status: "error", reason: "aborted" };
     const broadcast = opts.broadcast === true;
     const to = opts.to !== undefined ? normalizeAlias(opts.to) : undefined;
     if (broadcast) {
@@ -1484,15 +1589,16 @@ export class MeshClient extends EventEmitter {
     const selectionGeneration = this.#selectionGeneration;
     if (!this.online || this.#selection !== null) {
       try {
-        await this.connect();
+        await this.#awaitConnection(this.connect(), opts.signal);
       } catch (error) {
+        if (opts.signal?.aborted) return { status: "error", reason: "aborted" };
         return {
           status: "blocked",
-          reason: error instanceof Error && error.message === "connection_cancelled"
-            ? "connection_cancelled" : "broker_unavailable",
+          reason: error instanceof Error ? error.message : String(error),
         };
       }
     }
+    if (opts.signal?.aborted) return { status: "error", reason: "aborted" };
     if (selectionGeneration !== this.#selectionGeneration || !this.online) {
       return { status: "blocked", reason: "connection_cancelled" };
     }
@@ -1523,135 +1629,80 @@ export class MeshClient extends EventEmitter {
     let pendingPromise: Promise<import("./pending.js").PendingResolution> | null = null;
     if (opts.awaitReply) {
       this.awaitTargets.set(frame.id, { to: to ?? "*", room });
-      this.awaitedMissions.set(frame.id, { to: to ?? "*", room, status: "waiting", answered: false });
+      this.awaitedMissions.set(frame.id, {
+        to: to ?? "*", room, status: "waiting", answered: false,
+        targetOnline: to !== undefined && this.knownPeerRooms.get(to)?.has(room) === true,
+        brokerBootId: this.#brokerInfo?.bootId,
+      });
       this.pruneAwaitedMissions();
       pendingPromise = this.pending.register(frame.id, Date.now() + timeoutMs, launch);
     }
 
+    let written = false;
+    let confirmedDelivery: AwaitedMission["delivery"];
     const ackPromise = this.waitAck(frame.id);
-    this.writeOrQueue(frame, encoded);
-    this.ring(frame);
-    const ack = await ackPromise;
-
-    if (ack.type === "error") {
-      if (opts.awaitReply) {
-        this.pending.cancel(frame.id, ack.code ?? "error");
-        this.awaitTargets.delete(frame.id);
-  // the mission is DEAD (blocked/rate_limited/…) — never "waiting".
-        const m = this.awaitedMissions.get(frame.id);
-        if (m !== undefined) {
-          m.status = "failed";
-          m.response = ack.code ?? "error";
-        }
+    const onAbort = (): void => {
+      confirmedDelivery = this.awaitedMissions.get(frame.id)?.delivery ?? confirmedDelivery;
+      const waiter = this.ackWaiters.get(frame.id);
+      if (waiter !== undefined) {
+        clearTimeout(waiter.timer);
+        this.ackWaiters.delete(frame.id);
+        waiter.resolve(buildFrame({ type: "error", id: frame.id, code: "internal", status: "aborted" }));
       }
-      const code = ack.code ?? "internal";
-      if (BLOCKED_CODES.has(code)) return { status: "blocked", msgId: frame.id, reason: code };
-      return { status: "error", msgId: frame.id, reason: code };
-    }
-
-    if (!opts.awaitReply || pendingPromise === null) {
-      if (ack.status === "delivered") {
-        return {
-          status: "delivered",
-          msgId: frame.id,
-          deliveredCount: ack.deliveredCount,
-          totalCount: ack.totalCount,
-        };
-      }
-      if (ack.status === "queued_offline") {
-        return {
-          status: "queued_offline",
-          msgId: frame.id,
-          deliveredCount: ack.deliveredCount,
-          totalCount: ack.totalCount,
-        };
-      }
-  // an unknown/unexpected ack status (e.g. dropped_offline on a msg)
-  // is an honest error — never misreported as delivered.
-      return {
-        status: "error",
-        msgId: frame.id,
-        reason: `unexpected_ack_status: ${ack.status ?? "missing"}`,
-      };
-    }
-
-  // LAUNCH mode — the delivery result returns immediately; the
-  // pending stays live in the background (reminds at T/2 & 3T/4, expiry,
-  // answered tracking) and mesh_wait_all reports the group verdict later.
-    if (launch) {
-      void pendingPromise.then((resolution) => {
-        this.awaitTargets.delete(frame.id);
-        if (resolution.kind === "expired") {
-          const m = this.awaitedMissions.get(frame.id);
-          if (m !== undefined) m.status = "expired"; // in the background too
-          this.emit("expired", { msgId: frame.id });
-        }
-      });
-      if (ack.status === "delivered") {
-        return {
-          status: "delivered",
-          msgId: frame.id,
-          deliveredCount: ack.deliveredCount,
-          totalCount: ack.totalCount,
-        };
-      }
-      if (ack.status === "queued_offline") {
-        return {
-          status: "queued_offline",
-          msgId: frame.id,
-          deliveredCount: ack.deliveredCount,
-          totalCount: ack.totalCount,
-        };
-      }
-      return {
-        status: "error",
-        msgId: frame.id,
-        reason: `unexpected_ack_status: ${ack.status ?? "missing"}`,
-      };
-    }
-
-    // ESC on a blocking send: settle immediately instead of hanging until
-    // the mission timeout (signal → pending.cancel → resolution error).
-    let onAbort: (() => void) | undefined;
-    if (opts.signal !== undefined) {
-      if (opts.signal.aborted) {
-        this.pending.cancel(frame.id, "cancelled");
-      } else {
-        onAbort = () => this.pending.cancel(frame.id, "cancelled");
-        opts.signal.addEventListener("abort", onAbort, { once: true });
-      }
-    }
-    let resolution: import("./pending.js").PendingResolution;
-    try {
-      resolution = await pendingPromise;
-    } finally {
-      if (onAbort !== undefined && opts.signal !== undefined) {
-        opts.signal.removeEventListener("abort", onAbort);
-      }
-    }
-    this.awaitTargets.delete(frame.id);
-    if (resolution.kind === "reply" && resolution.frame) {
-      return {
-        status: "reply",
-        msgId: frame.id,
-        response: resolution.frame.body ?? "",
-        outputHash: resolution.frame.bodyHash ?? "",
-      };
-    }
-    if (resolution.kind === "expired") {
-  // expired missions are NOT "waiting" forever in missionStatus.
-      const m = this.awaitedMissions.get(frame.id);
-      if (m !== undefined) m.status = "expired";
-      this.emit("expired", { msgId: frame.id });
-      return { status: "expired", msgId: frame.id, reason: "expired" };
-    }
-    // cancelled = the sender aborted: drop the mission entirely (a late
-    // reply takes the orphan path and is injected) — never "waiting".
-    if (resolution.kind === "error" && resolution.reason === "cancelled") {
+      this.pending.cancel(frame.id, "aborted");
       this.awaitedMissions.delete(frame.id);
-      return { status: "error", msgId: frame.id, reason: "cancelled" };
+    };
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      if (opts.signal?.aborted) {
+        onAbort();
+      } else if (this.online && this.socket !== null && !this.socket.destroyed) {
+        // No unsent send frame may escape through a later outbox flush.
+        this.socket.write(encoded);
+        written = true;
+        this.ring(frame);
+      } else {
+        const waiter = this.ackWaiters.get(frame.id);
+        if (waiter !== undefined) {
+          clearTimeout(waiter.timer);
+          this.ackWaiters.delete(frame.id);
+          waiter.resolve(buildFrame({ type: "error", id: frame.id, code: "internal", status: "connection_lost" }));
+        }
+      }
+      const ack = await ackPromise;
+      if (ack.type === "error") {
+        const reason = ack.status ?? ack.code ?? "internal";
+        this.pending.cancel(frame.id, reason);
+        const delivery = written ? confirmedDelivery ?? this.awaitedMissions.get(frame.id)?.delivery ?? "unknown" : undefined;
+        if (BLOCKED_CODES.has(reason)) return { status: "blocked", msgId: frame.id, reason };
+        return { status: "error", msgId: frame.id, reason, ...(delivery !== undefined ? { delivery } : {}) };
+      }
+      const mission = this.awaitedMissions.get(frame.id);
+      const delivery = confirmedDelivery ?? mission?.delivery ?? ack.status;
+      if (delivery !== "delivered" && delivery !== "queued_offline") {
+        const reason = `unexpected_ack_status: ${ack.status ?? "missing"}`;
+        this.pending.cancel(frame.id, reason);
+        return { status: "error", msgId: frame.id, reason, delivery: "unknown" };
+      }
+      confirmedDelivery = delivery;
+      if (opts.signal?.aborted) {
+        return { status: "error", msgId: frame.id, reason: "aborted", delivery };
+      }
+      if (!opts.awaitReply || pendingPromise === null || launch) {
+        return { status: delivery, msgId: frame.id, deliveredCount: ack.deliveredCount, totalCount: ack.totalCount };
+      }
+      const resolution = await pendingPromise;
+      if (resolution.kind === "reply" && resolution.frame !== undefined) {
+        return {
+          status: "reply", msgId: frame.id, response: resolution.frame.body ?? "",
+          outputHash: resolution.frame.bodyHash ?? "",
+        };
+      }
+      if (resolution.kind === "expired") return { status: "expired", msgId: frame.id, reason: "expired" };
+      return { status: "error", msgId: frame.id, reason: resolution.reason ?? "error", delivery };
+    } finally {
+      opts.signal?.removeEventListener("abort", onAbort);
     }
-    return { status: "error", msgId: frame.id, reason: resolution.reason ?? "error" };
   }
 
   async reply(msgId: string, body: string, opts: ReplyOpts = {}): Promise<SendResult> {
@@ -1808,7 +1859,7 @@ export class MeshClient extends EventEmitter {
     }
     const frame = buildFrame({ type: "reserve", from: this.alias, reservations: merged });
     const ack = await this.roundTrip(frame);
-    if (ack.type === "error") return { status: "error", reason: ack.code ?? "internal" };
+    if (ack.type === "error") return { status: "error", reason: ack.status ?? ack.code ?? "internal" };
     this.setOwnReservations(merged);
     this.emit("reservations", { from: this.alias, reservations: merged });
     return { status: "delivered", msgId: frame.id };
@@ -1833,7 +1884,7 @@ export class MeshClient extends EventEmitter {
     }
     const frame = buildFrame({ type: "reserve", from: this.alias, reservations: merged });
     const ack = await this.roundTrip(frame);
-    if (ack.type === "error") return { status: "error", reason: ack.code ?? "internal", released: [] };
+    if (ack.type === "error") return { status: "error", reason: ack.status ?? ack.code ?? "internal", released: [] };
     this.setOwnReservations(merged);
     this.emit("reservations", { from: this.alias, reservations: merged });
     return { status: "delivered", msgId: frame.id, released: releasing };
@@ -1853,26 +1904,25 @@ export class MeshClient extends EventEmitter {
   // ---- status / rooms / close ----
 
   status(room?: string): Promise<StatusSnapshot> {
-    return new Promise((resolve) => {
-      if (!this.online) {
-        resolve({ peers: [], rooms: [] });
-        return;
-      }
+    if (!this.online) {
+      return Promise.reject(new Error(this.intentionallyClosed ? this.waitStopReason : this.#connectionError ?? "offline"));
+    }
+    return new Promise<StatusSnapshot>((resolve, reject) => {
       const frame = buildFrame({ type: "status_req", from: this.alias, room });
       const timer = setTimeout(() => {
         this.statusWaiters.delete(frame.id);
-        resolve({ peers: [], rooms: [] });
+        reject(new Error("timeout"));
       }, STATUS_REQ_TIMEOUT_MS);
       timer.unref();
       this.statusWaiters.set(frame.id, {
         timer,
-        resolve: (res) =>
-          resolve({
-            peers: res.peers ?? [],
-            rooms: res.rooms ?? [],
-            stats: res.stats,
-            broker: res.broker,
-          }),
+        resolve: (res) => {
+          if (res.type !== "status_res") {
+            reject(new Error(res.status ?? res.code ?? "internal"));
+            return;
+          }
+          resolve({ peers: res.peers ?? [], rooms: res.rooms ?? [], stats: res.stats, broker: res.broker });
+        },
       });
       this.writeOrQueue(frame);
     });
@@ -1881,7 +1931,7 @@ export class MeshClient extends EventEmitter {
   async join(room: string, role: MeshRole = "member"): Promise<void> {
     const frame = buildFrame({ type: "join", from: this.alias, room, role });
     const ack = await this.roundTrip(frame);
-    if (ack.type === "error") throw new Error(ack.code ?? "internal");
+    if (ack.type === "error") throw new Error(ack.status ?? ack.code ?? "internal");
     this.joinedRooms.set(room, role);
   }
 
@@ -1894,7 +1944,7 @@ export class MeshClient extends EventEmitter {
   // future reconnect does not try to rejoin it.
         this.joinedRooms.delete(room);
       }
-      throw new Error(ack.code ?? "internal");
+      throw new Error(ack.status ?? ack.code ?? "internal");
     }
     this.joinedRooms.delete(room);
   }
@@ -1934,7 +1984,19 @@ export class MeshClient extends EventEmitter {
   // 1. detach the old alias (no reconnect loop — intentionallyClosed)
     this.intentionallyClosed = true;
     this.stopHeartbeat();
+    this.waitStopReason = "renamed";
+    this.stopWaitAll("cancelled", "renamed");
     this.pending.cancelAll("renamed");
+    for (const [id, waiter] of this.ackWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(buildFrame({ type: "error", code: "internal", status: "renamed", id }));
+    }
+    this.ackWaiters.clear();
+    for (const [id, waiter] of this.statusWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(buildFrame({ type: "error", code: "internal", status: "renamed", id }));
+    }
+    this.statusWaiters.clear();
     this.socket = null;
     this.online = false;
     if (oldSocket && !oldSocket.destroyed) {
@@ -2000,8 +2062,8 @@ export class MeshClient extends EventEmitter {
     if (!this.online) {
       try {
         await this.connect();
-      } catch {
-        return buildFrame({ type: "error", code: "shutting_down", id: frame.id });
+      } catch (error) {
+        return buildFrame({ type: "error", code: "internal", status: error instanceof Error ? error.message : String(error), id: frame.id });
       }
     }
     const ackPromise = this.waitAck(frame.id);
@@ -2014,8 +2076,9 @@ export class MeshClient extends EventEmitter {
     return this.#closeConnection();
   }
 
-  async #closeConnection(): Promise<void> {
+  async #closeConnection(reason = "closed"): Promise<void> {
     this.intentionallyClosed = true;
+    this.waitStopReason = reason;
     this.#connectionGeneration += 1;
     this.#connectAbort?.abort();
     this.#connectAbort = null;
@@ -2026,20 +2089,20 @@ export class MeshClient extends EventEmitter {
     this.reconnectTimer = null;
     this.stopHeartbeat();
     this.stopWatchdog();
-    // Snapshot cancelled verdicts before selection clears the old missions.
-    for (const cancel of this.waitAllCancels) cancel();
-    this.pending.cancelAll("shutting_down");
+    // Settle snapshots before reset clears their mission maps.
+    this.stopWaitAll("cancelled", reason);
+    this.pending.cancelAll(reason);
     const socket = this.socket;
     this.socket = null;
     this.online = false;
     for (const [id, waiter] of this.ackWaiters) {
       clearTimeout(waiter.timer);
-      waiter.resolve(buildFrame({ type: "error", code: "shutting_down", id }));
+      waiter.resolve(buildFrame({ type: "error", code: "internal", status: reason, id }));
     }
     this.ackWaiters.clear();
     for (const [id, waiter] of this.statusWaiters) {
       clearTimeout(waiter.timer);
-      waiter.resolve(buildFrame({ type: "error", code: "shutting_down", id }));
+      waiter.resolve(buildFrame({ type: "error", code: "internal", status: reason, id }));
     }
     this.statusWaiters.clear();
     if (socket && !socket.destroyed) {

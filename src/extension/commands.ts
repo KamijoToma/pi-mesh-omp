@@ -2,7 +2,7 @@
 import * as fs from "node:fs";
 import { stripVTControlCharacters } from "node:util";
 import { parseTailnetArgs, TAILSCALE_USAGE } from "../cli/cmd/tailscale.js";
-import { MeshClient } from "../client/client.js";
+import { MeshClient, type StatusSnapshot } from "../client/client.js";
 import type { MeshRole } from "../protocol/envelope.js";
 import { loadConfig, TAILSCALE_DIAGNOSTIC_MAX_CHARS } from "../shared/config.js";
 import { brokerLockPath, brokerSocketPath } from "../shared/paths.js";
@@ -85,7 +85,13 @@ async function cmdStatus(rt: MeshRuntime, ctx: SessionContext, pi: ExtensionAPI,
       return;
     }
   }
-  const snap = await rt.client.status(room);
+  let snap: StatusSnapshot;
+  try {
+    snap = await rt.client.status(room);
+  } catch (error) {
+    ctx.ui.notify(`mesh status failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    return;
+  }
   if (snap.peers.length === 0) {
     notify(ctx, `mesh: no online peers${room !== undefined ? ` in room ${room}` : ""}`);
     return;

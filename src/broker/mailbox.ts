@@ -63,30 +63,41 @@ export function purgeAllExpired(
   return dropped;
 }
 
-export function mailboxSize(state: BrokerState, config: MeshConfig, alias: string): number {
-  return partitionExpired(state, alias, config.mailboxTtlMs, Date.now()).fresh.length;
-}
-
 /**
- * Drain the mailbox at hello: returns stored frames (as `mailbox` frames with
- * queuedAt) in enqueue order, clears the queue, and surfaces any entries
- * that expired while the owner was away (for drop notices).
+ * Return the fresh queue at hello without consuming it. Entries stay queued
+ * until a write is attempted; only the broker's successful write callback
+ * records delivery.
  */
 export function flushMailbox(
   state: BrokerState,
   config: MeshConfig,
   alias: string,
   now: number = Date.now(),
-): { frames: MeshFrame[]; dropped: StoredMsg[] } {
+): { entries: StoredMsg[]; dropped: StoredMsg[] } {
   const { fresh, dropped } = partitionExpired(state, alias, config.mailboxTtlMs, now);
-  state.mailbox.delete(alias);
-  state.stats.mailboxDelivered += fresh.length;
-  return {
-    frames: fresh.map((stored) => ({
-      ...stored.frame,
-      type: "mailbox",
-      queuedAt: new Date(stored.enqueuedAt).toISOString(),
-    })),
-    dropped,
-  };
+  return { entries: fresh, dropped };
+}
+
+/** Restore a failed write at its original age and position, honoring TTL/cap. */
+export function requeueMailbox(
+  state: BrokerState,
+  config: MeshConfig,
+  alias: string,
+  stored: StoredMsg,
+  now: number = Date.now(),
+): StoredMsg[] {
+  const queue = state.mailbox.get(alias) ?? [];
+  const next = queue.findIndex((entry) => entry.enqueuedAt >= stored.enqueuedAt);
+  queue.splice(next < 0 ? queue.length : next, 0, stored);
+  state.mailbox.set(alias, queue);
+  const { fresh, dropped } = partitionExpired(state, alias, config.mailboxTtlMs, now);
+  while (fresh.length > config.mailboxCap) {
+    const evicted = fresh.shift();
+    if (evicted === undefined) break;
+    dropped.push(evicted);
+    state.stats.mailboxDropped += 1;
+  }
+  if (fresh.length === 0) state.mailbox.delete(alias);
+  else state.mailbox.set(alias, fresh);
+  return dropped;
 }

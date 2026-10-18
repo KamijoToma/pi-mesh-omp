@@ -24,25 +24,28 @@ export async function cmdWait(timeoutRaw) {
     }
     catch {
         say("blocked: broker_unavailable");
+        await client.close();
         return EXIT_MESH_FAILURE;
     }
     const summary = await client.waitAll(timeout);
-    if (summary.total === 0) {
+    if (summary.total === 0 && summary.status === "complete") {
         say("no awaited missions in this process — missions are memory of the sending process");
         say("(scripted path: mesh send --await; persistent missions: attach, Phase 5)");
         await client.close();
         return EXIT_OK;
     }
-    say(`verdict ${summary.status} answered=${summary.answered}/${summary.total} in ${summary.elapsedMs}ms`);
+    say(`verdict ${summary.status}${summary.reason !== undefined ? ` (${summary.reason})` : ""} answered=${summary.answered}/${summary.total} in ${summary.elapsedMs}ms`);
     for (const a of summary.answers)
         say(`  + ${a.to}: ${a.response}`);
     for (const m of summary.missing)
-        say(`  x ${m.to} (${m.msgId})`);
+        say(`  x ${m.to} (${m.msgId})${m.reason !== undefined ? ` — ${m.reason}` : ""}`);
     await client.close();
-    // plan D5 mapping: complete → 0 ; cancelled (agreed outcome) → 0 ;
-    // timeout with NO answer → 3 (expired) ; timeout with some answers → 4
-    // (honest partial — the missing ones are listed above).
+    // Cancellation is explicit; interruption preserves an incomplete batch.
     if (summary.status === "complete" || summary.status === "cancelled")
         return EXIT_OK;
+    if (summary.status === "error")
+        return EXIT_MESH_FAILURE;
+    if (summary.status === "interrupted")
+        return EXIT_PARTIAL;
     return summary.answered === 0 ? EXIT_EXPIRED : EXIT_PARTIAL;
 }
