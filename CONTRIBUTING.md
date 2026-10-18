@@ -62,6 +62,9 @@ npm run smoke       # E2E without Pi (broker + 2 headless clients)
   (`npx -y node@24 scripts/run-tests.mjs`).
 - Windows is a first-class platform (named pipes instead of AF_UNIX) —
   never break it.
+- Bound lifecycle scenarios with individual test timeouts, not one deadline
+  for the entire serial suite. Windows socket and filesystem work can exceed
+  a cumulative suite budget even when every scenario is healthy.
 - Verify host changes on both modern Pi and omp, including a real compiled
   omp executable. A `bun cli.ts` run does not exercise compiled-host launch
   semantics. Use isolated HOME, agent, runtime and state directories.

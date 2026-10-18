@@ -166,8 +166,11 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
   };
 }
 
-describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_000 }, () => {
-  it("both hosts keep task titles independent of mesh identity changes", async () => {
+// Bound each scenario independently; slow serial cases must not cancel later cases.
+const LIFECYCLE_TEST_TIMEOUT_MS = 15_000;
+
+describe("mesh extension session lifecycle", { concurrency: false }, () => {
+  it("both hosts keep task titles independent of mesh identity changes", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     for (const omp of [true, false]) {
       const fixture = await lifecycleFixture(omp);
       try {
@@ -201,7 +204,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("both hosts resume an identity that deliberately left every room", async () => {
+  it("both hosts resume an identity that deliberately left every room", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     for (const omp of [true, false]) {
       const fixture = await lifecycleFixture(omp);
       try {
@@ -222,7 +225,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("both hosts preserve each room role through resume and /mesh new handoff", async () => {
+  it("both hosts preserve each room role through resume and /mesh new handoff", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     for (const omp of [true, false]) {
       const fixture = await lifecycleFixture(omp);
       try {
@@ -252,7 +255,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("both hosts cancel outgoing auto-release timers before resetting the runtime client", async () => {
+  it("both hosts cancel outgoing auto-release timers before resetting the runtime client", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     for (const omp of [true, false]) {
       const fixture = await lifecycleFixture(omp);
       try {
@@ -273,7 +276,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("both hosts switch out of every old room while join stays additive, and resume restores only the destination", async () => {
+  it("both hosts switch out of every old room while join stays additive, and resume restores only the destination", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     for (const omp of [true, false]) {
       const fixture = await lifecycleFixture(omp);
       try {
@@ -311,7 +314,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("switching to an already-joined room retains it, applies observer/alias options and allows a repeated switch", async () => {
+  it("switching to an already-joined room retains it, applies observer/alias options and allows a repeated switch", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     const fixture = await lifecycleFixture(true);
     try {
       await fixture.command("join ops");
@@ -336,7 +339,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("missing or rejected switch destinations preserve the original rooms and a missing room never renames", async () => {
+  it("missing or rejected switch destinations preserve the original rooms and a missing room never renames", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     const fixture = await lifecycleFixture(true);
     try {
       const alias = fixture.alias();
@@ -358,7 +361,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("both hosts route messages and broadcast mentions by the custom name and restore it on resume", async () => {
+  it("both hosts route messages and broadcast mentions by the custom name and restore it on resume", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     for (const omp of [true, false]) {
       const fixture = await lifecycleFixture(omp, { deferred: true });
       try {
@@ -409,7 +412,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("refuses invalid and occupied names without losing the current identity or routing", async () => {
+  it("refuses invalid and occupied names without losing the current identity or routing", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     const fixture = await lifecycleFixture(true);
     try {
       await fixture.tool("mesh_alias", { alias: "reviewer" });
@@ -432,7 +435,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("omp /mesh new transfers history/rooms/reservations and persists subsequent rename only under the new ID", async () => {
+  it("omp /mesh new transfers history/rooms/reservations and persists subsequent rename only under the new ID", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     const fixture = await lifecycleFixture(true);
     try {
       const initialAlias = fixture.alias();
@@ -458,7 +461,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("omp new/resume/fork/branch/reload preserve identity and inject each incoming message once", async () => {
+  it("omp new/resume/fork/branch/reload preserve identity and inject each incoming message once", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     const fixture = await lifecycleFixture(true);
     try {
       const initialAlias = fixture.alias();
@@ -479,7 +482,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("cancelled omp new leaves the live connection intact and no staged handoff", async () => {
+  it("cancelled omp new leaves the live connection intact and no staged handoff", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     const fixture = await lifecycleFixture(true);
     try {
       const alias = fixture.alias();
@@ -495,7 +498,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("both hosts report the reserved target for scalar paths and later multi-target entries", async () => {
+  it("both hosts report the reserved target for scalar paths and later multi-target entries", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     for (const omp of [true, false]) {
       const fixture = await lifecycleFixture(omp);
       try {
@@ -514,7 +517,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("omp succeeds to idle, preserves busy during continuation, and idle model recovery delivers held inbound exactly once", async () => {
+  it("omp succeeds to idle, preserves busy during continuation, and idle model recovery delivers held inbound exactly once", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     const fixture = await lifecycleFixture(true);
     try {
       const alias = fixture.alias();
@@ -544,7 +547,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("a successful same-model turn releases held messages without waiting for the hold deadline", async () => {
+  it("a successful same-model turn releases held messages without waiting for the hold deadline", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     const fixture = await lifecycleFixture(true);
     try {
       await fixture.emit("turn_end", { message: { stopReason: "error", errorMessage: "429 rate limit" }, toolResults: [] });
@@ -561,7 +564,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("omp switches discard old held queues and cancel model timers before activating the target", async () => {
+  it("omp switches discard old held queues and cancel model timers before activating the target", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     const fixture = await lifecycleFixture(true);
     try {
       await fixture.emit("turn_end", { message: { stopReason: "error", errorMessage: "insufficient_quota" }, toolResults: [] });
@@ -580,7 +583,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("shutdown closes the peer even when identity persistence fails", async () => {
+  it("shutdown closes the peer even when identity persistence fails", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     const fixture = await lifecycleFixture(true);
     try {
       const alias = fixture.alias();
@@ -594,7 +597,7 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
     }
   });
 
-  it("Pi keeps withSession handoff and native fork/model/settle hooks", async () => {
+  it("Pi keeps withSession handoff and native fork/model/settle hooks", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     const fixture = await lifecycleFixture(false);
     try {
       const alias = fixture.alias();
