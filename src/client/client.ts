@@ -790,6 +790,11 @@ export class MeshClient extends EventEmitter {
     return this.ownReservations;
   }
 
+  /** Expire local claims without reconnecting after leaving the mesh. */
+  forgetReservations(patterns: readonly string[]): void {
+    this.setOwnReservations(this.ownReservations.filter((reservation) => !patterns.includes(reservation.pattern)));
+  }
+
   /** Known reservations of a peer alias (from welcome/status/reserve broadcasts). */
   reservationsOf(alias: string): readonly FileReservation[] {
     return this.peerReservations.get(alias) ?? [];

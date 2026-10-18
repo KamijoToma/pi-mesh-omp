@@ -81,6 +81,7 @@ function makeRt(stateDir: string, over: Record<string, unknown>): MeshRuntime {
     client: {
       alias: "alice",
       rooms: ["default"],
+      roomRoles: new Map([["default", "member"]]),
       isOnline: () => true,
       send: () => Promise.resolve({ status: "delivered", msgId: "m_t_00000001" }),
       connect: () => Promise.reject(new Error("no connect in tests")),

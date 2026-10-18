@@ -17,7 +17,7 @@ import { makeTempDirs, sleep, startTestBroker, waitFor } from "./helpers.js";
 type Hook = (event: unknown, ctx: SessionContext) => unknown;
 type ManagedTimer = Parameters<NonNullable<SessionContext["clearTimer"]>>[0];
 
-async function lifecycleFixture(omp: boolean, options: { reload?: boolean; deferred?: boolean } = {}) {
+async function lifecycleFixture(omp: boolean, options: { reload?: boolean; deferred?: boolean; join?: boolean } = {}) {
   const dirs = makeTempDirs("mesh-lifecycle-");
   const savedEnvironment: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -41,6 +41,8 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
   const broker = await startTestBroker(dirs.runtimeDir);
   const observer = new MeshClient({ alias: "observer", runtimeDir: dirs.runtimeDir });
   await observer.connect();
+  const identity = new MeshIdentity(dirs.stateDir);
+  let readySequence = 0;
   let sessionId = "original";
   let sequence = 0;
   let cancelNew = false;
@@ -69,7 +71,10 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
     appendEntry: (type: string, data: unknown) => entries.push({ type, data }),
     events: {
       emit: (name: string, data: unknown) => {
-        if (name === "mesh:alias" && data !== null && typeof data === "object" && "alias" in data && typeof data.alias === "string") alias = data.alias;
+        if (name === "mesh:alias" && data !== null && typeof data === "object" && "alias" in data && typeof data.alias === "string") {
+          alias = data.alias;
+          readySequence++;
+        }
         events.emit(name, data);
       },
     },
@@ -118,9 +123,11 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
     installReloadableMesh(api, createMeshExtension,
       pathToFileURL(path.join(packageRoot, "dist", "src", "extension", "index.js")).href, Tui);
   } else meshExtension(api);
-  const ready = once(events, "mesh:alias");
   await emit("session_start");
-  await ready;
+  alias = identity.load(sessionId)!.alias;
+  if (options.join !== false) {
+    await commands.get("mesh")!.handler("join default", context());
+  }
   return {
     dirs, observer, sent, notifications, timers, entries, names,
     packageRoot,
@@ -128,7 +135,7 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
       fs.writeFileSync(path.join(packageRoot, "dist", "src", "shared", "version.js"),
         `export const MESH_VERSION = ${JSON.stringify(version)};\n`);
     },
-    identity: new MeshIdentity(dirs.stateDir),
+    identity,
     ready: () => once(events, "mesh:alias"),
     alias: () => alias, sessionId: () => sessionId, emit, context,
     command: async (args: string) => { await commands.get("mesh")!.handler(args, context()); },
@@ -144,11 +151,13 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
       next[1].callback();
     },
     switchTo: async (id: string, reason: "new" | "resume" | "fork" | "branch") => {
-      const connected = once(events, "mesh:alias");
+      const previousReady = readySequence;
       if (!omp) await emit("session_shutdown");
       sessionId = id;
       await emit(omp ? (reason === "branch" ? "session_branch" : "session_switch") : "session_start", { reason });
-      await connected;
+      const restored = identity.load(id)!;
+      alias = restored.alias;
+      if (restored.rooms.length > 0) await waitFor(() => readySequence > previousReady);
     },
     receive: async (body: string) => {
       const delivered = once(events, "sent");
@@ -170,6 +179,64 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
 const LIFECYCLE_TEST_TIMEOUT_MS = 15_000;
 
 describe("mesh extension session lifecycle", { concurrency: false }, () => {
+  it("both hosts stay isolated until explicit join and then join only the requested room", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
+    for (const omp of [true, false]) {
+      const fixture = await lifecycleFixture(omp, { join: false });
+      try {
+        const alias = fixture.alias();
+        assert.deepEqual(fixture.identity.load("original")?.rooms, []);
+        await fixture.emit("input");
+        await fixture.emit("agent_start");
+        await fixture.emit("tool_call", { toolName: "read", input: {} });
+        await fixture.command("status");
+        const blocked = await fixture.tool("mesh_send", { to: "observer", message: "must-not-activate" });
+        assert.equal(blocked.details?.reason, "not_joined");
+        assert.equal((await fixture.observer.status()).peers.some((peer) => peer.alias === alias), false);
+
+        await fixture.observer.join("isolated");
+        await fixture.command("join isolated");
+        assert.deepEqual(fixture.identity.load("original")?.rooms, ["isolated"]);
+        const joined = (await fixture.observer.status()).peers.find((peer) => peer.alias === alias);
+        assert.deepEqual(joined?.rooms, ["isolated"]);
+        const inbound = once(fixture.observer, "inbound");
+        const sent = await fixture.tool("mesh_send", { to: "observer", message: "explicit-room-message" });
+        assert.equal(sent.details?.status, "delivered");
+        const [frame] = await inbound;
+        assert.equal(frame.room, "isolated");
+        assert.equal(frame.body, "explicit-room-message");
+        await fixture.observer.send({ broadcast: true, room: "default", message: "unrelated-default-broadcast" });
+        await fixture.tool("mesh_status", {});
+        assert.equal(fixture.sent.some((message) => message.content.includes("unrelated-default-broadcast")), false);
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
+  it("both hosts preserve unjoined state through new, resume and fork handoffs", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
+    for (const omp of [true, false]) {
+      const fixture = await lifecycleFixture(omp, { join: false });
+      try {
+        const alias = fixture.alias();
+        await fixture.command("new");
+        assert.equal(fixture.alias(), alias);
+        assert.deepEqual(fixture.identity.load(fixture.sessionId())?.rooms, []);
+        await fixture.emit("session_before_fork");
+        await fixture.switchTo("unjoined-fork", "fork");
+        assert.equal(fixture.alias(), alias);
+        assert.deepEqual(fixture.identity.load("unjoined-fork")?.rooms, []);
+        await fixture.switchTo("other-new", "new");
+        assert.notEqual(fixture.alias(), alias);
+        await fixture.switchTo("original", "resume");
+        assert.equal(fixture.alias(), alias);
+        assert.deepEqual(fixture.identity.load("original")?.rooms, []);
+        assert.deepEqual((await fixture.observer.status()).peers.map((peer) => peer.alias), ["observer"]);
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
   it("both hosts keep task titles independent of mesh identity changes", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
     for (const omp of [true, false]) {
       const fixture = await lifecycleFixture(omp);
@@ -216,9 +283,10 @@ describe("mesh extension session lifecycle", { concurrency: false }, () => {
         assert.equal(fixture.alias(), alias);
         assert.deepEqual(fixture.identity.load("original")?.rooms, []);
         const peer = (await fixture.observer.status()).peers.find((candidate) => candidate.alias === alias);
-        assert.deepEqual(peer?.rooms, []);
+        assert.equal(peer, undefined);
         const sent = await fixture.tool("mesh_send", { to: "observer", message: "must-not-rejoin-default" });
         assert.equal(sent.details?.status, "blocked");
+        assert.equal(sent.details?.reason, "not_joined");
       } finally {
         await fixture.close();
       }
@@ -576,6 +644,7 @@ describe("mesh extension session lifecycle", { concurrency: false }, () => {
       assert.equal(fixture.timers.size, 0);
       for (const callback of staleCallbacks) callback();
       assert.equal(fixture.sent.some((message) => message.content.includes("outgoing-held-message")), false);
+      await fixture.command("join default");
       await fixture.receive("incoming-session-message");
       assert.equal(fixture.sent.filter((message) => message.content.includes("incoming-session-message")).length, 1);
     } finally {
@@ -633,6 +702,28 @@ describe("mesh extension session lifecycle", { concurrency: false }, () => {
 });
 
 describe("mesh built-version hot reload", { concurrency: false, timeout: 15_000 }, () => {
+  it("does not connect an unjoined identity during built-version replacement", async () => {
+    for (const omp of [true, false]) {
+      const fixture = await lifecycleFixture(omp, { reload: true, join: false });
+      try {
+        const alias = fixture.alias();
+        const version = `${MESH_VERSION}-inactive-test`;
+        fixture.updateVersion(version);
+        await fixture.command("reload");
+        await waitFor(() => fixture.notifications.some((notification) => notification.message.includes(version)));
+        assert.equal(fixture.alias(), alias);
+        assert.deepEqual(fixture.identity.load("original")?.rooms, []);
+        assert.deepEqual((await fixture.observer.status()).peers.map((peer) => peer.alias), ["observer"]);
+        await fixture.command("join after-reload");
+        const peer = (await fixture.observer.status()).peers.find((candidate) => candidate.alias === alias);
+        assert.equal(peer?.clientVersion, version);
+        assert.deepEqual(peer?.rooms, ["after-reload"]);
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
   it("replaces the client module graph while preserving identity, reply targets and reserve deadlines", async () => {
     const fixture = await lifecycleFixture(true, { reload: true });
     try {
@@ -804,6 +895,7 @@ describe("mesh built-version hot reload", { concurrency: false, timeout: 15_000 
       await fixture.emit("agent_end", { willContinue: false });
       assert.notEqual(fixture.alias(), originalAlias);
       assert.equal(fixture.identity.load("another")?.alias, fixture.alias());
+      await fixture.command("join default");
       const peer = (await fixture.observer.status()).peers.find((candidate) => candidate.alias === fixture.alias());
       assert.equal(peer?.clientVersion, MESH_VERSION);
       await fixture.receive("new-session-uninterrupted");

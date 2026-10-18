@@ -46,7 +46,7 @@ export declare class MeshHud {
     /** session_shutdown: remove the row and cancel pending snapshot refreshes. */
     detach(): void;
     setConnecting(on: boolean): void;
-    /** 'closed': mark offline + clear peers (client auto-reconnects → ◐). */
+    /** 'closed': clear peers; only existing memberships authorize reconnect. */
     onClosed(): void;
     /** Presence-driven status refresh: at most 1/s, trailing. */
     scheduleStatusRefresh(): void;

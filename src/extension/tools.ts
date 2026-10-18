@@ -16,6 +16,7 @@ import {
   MAX_REPLY_TARGETS,
   MIN_AWAIT_REPLY_TIMEOUT_MS,
   TRANSCRIPT_RING_SIZE,
+  type MeshConfig,
 } from "../shared/config.js";
 import { MESH_VERSION } from "../shared/version.js";
 import type { DeferredInbox } from "./deferred-inbox.js";
@@ -44,6 +45,8 @@ export interface MeshRuntime {
   identity: MeshIdentity;
   /** transferred history from a /mesh new handoff (injected at ready). */
   pendingHistory?: string[];
+  /** Saved tailnet selection awaiting an explicit room join. */
+  pendingTailnetConfig?: MeshConfig;
   /** inbound batching (flush remaining frames on shutdown). */
   batcher?: { flushNow(): void };
   /** Unaddressed broadcasts held separately from immediate traffic. */
@@ -98,6 +101,13 @@ function sendDetails(
   partial: Record<string, unknown>,
 ): Record<string, unknown> {
   return { schema: SEND_RESULT_SCHEMA, bodyStored: false, ...partial };
+}
+
+function notJoinedResult(): ToolResult {
+  const hint = "Use /mesh join <room> to connect.";
+  return textResult(`blocked: not_joined — ${hint}`, sendDetails({
+    status: "blocked", reason: "not_joined", hint,
+  }));
 }
 
 function brokerUnavailableResult(error: unknown, details: Record<string, unknown>): ToolResult {
@@ -384,6 +394,7 @@ async function execMeshSend(
   if (signal?.aborted === true) {
     return textResult("error: aborted (not sent)", sendDetails({ status: "error", reason: "aborted" }));
   }
+  if (rt.client.roomRoles.size === 0) return notJoinedResult();
   const broadcast = params.broadcast === true;
   const toRaw = str(params.to);
   const message = str(params.message);
@@ -406,7 +417,7 @@ async function execMeshSend(
   // default its sends to "default" — the broker would refuse not_member.
   const room =
     str(params.room) ??
-    (rt.client.rooms.includes(DEFAULT_ROOM) ? DEFAULT_ROOM : rt.client.rooms[0] ?? DEFAULT_ROOM);
+    (rt.client.rooms.includes(DEFAULT_ROOM) ? DEFAULT_ROOM : rt.client.rooms[0]!);
   const priority = (str(params.priority) ?? "normal") as MeshPriority;
   const reason = str(params.reason);
   const interrupt = params.interrupt === true;
@@ -569,6 +580,7 @@ async function execMeshReply(
 ): Promise<ToolResult> {
   const rt = getRuntime();
   if (rt === null) return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
+  if (rt.client.roomRoles.size === 0) return notJoinedResult();
   const msgId = str(params.msgId);
   const message = str(params.message);
   if (msgId === undefined || message === undefined) {
@@ -686,6 +698,7 @@ async function execMeshAlias(
   if (params.alias === undefined) {
     return textResult(`mesh alias: @${previousAlias}`, { alias: previousAlias, rooms: rt.client.rooms });
   }
+  if (rt.client.roomRoles.size === 0) return notJoinedResult();
   if (typeof params.alias !== "string") {
     return textResult(`blocked: invalid_alias — current alias @${previousAlias}`, { status: "blocked", reason: "invalid_alias", alias: previousAlias });
   }
@@ -722,6 +735,7 @@ async function execMeshStatus(
 ): Promise<ToolResult> {
   const rt = getRuntime();
   if (rt === null) return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
+  if (rt.client.roomRoles.size === 0) return notJoinedResult();
   const room = str(params.room);
   if (!rt.client.isOnline()) {
     try {
@@ -1109,7 +1123,9 @@ export function armReserveTimers(rt: MeshRuntime, patterns: string[], ms: number
     if (prev !== undefined) clearTimeout(prev.timer);
     const t = setTimeout(() => {
       rt.reserveTimers?.delete(pattern);
-      void rt.client.release([pattern]).catch(() => {}); // best effort
+      if (rt.isCurrent?.() === false) return;
+      if (rt.client.roomRoles.size === 0) rt.client.forgetReservations([pattern]);
+      else void rt.client.release([pattern]).catch(() => {}); // best effort
       try {
         rt.identity.save(identityFromClient(rt.sessionId, rt.client));
       } catch {
@@ -1138,6 +1154,7 @@ async function execMeshReserve(
 ): Promise<ToolResult> {
   const rt = getRuntime();
   if (rt === null) return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
+  if (rt.client.roomRoles.size === 0) return notJoinedResult();
   const rawPaths = Array.isArray(params.paths)
     ? params.paths.filter((p): p is string => typeof p === "string")
     : [];
@@ -1186,6 +1203,7 @@ async function execMeshRelease(
 ): Promise<ToolResult> {
   const rt = getRuntime();
   if (rt === null) return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
+  if (rt.client.roomRoles.size === 0) return notJoinedResult();
   const rawPaths = Array.isArray(params.paths)
     ? params.paths.filter((p): p is string => typeof p === "string")
     : undefined;

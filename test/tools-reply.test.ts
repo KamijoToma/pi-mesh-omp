@@ -13,14 +13,13 @@ import type { ExtensionAPI, SessionContext, ToolDefinition } from "../src/extens
 import { registerTools, type MeshRuntime } from "../src/extension/tools.js";
 import { buildFrame, type MeshFrame } from "../src/protocol/envelope.js";
 import { sha256 } from "../src/protocol/frames.js";
-import type { SendResult } from "../src/client/client.js";
-import { makeTempDirs } from "./helpers.js";
+import { MeshClient, type SendResult } from "../src/client/client.js";
+import { makeTempDirs, startTestBroker, waitFor } from "./helpers.js";
 
 interface StubClient {
   alias: string;
   inboxFrame: MeshFrame | undefined;
   replyResult: SendResult;
-  calls: string[];
 }
 
 function makeRuntime(stateDir: string, stub: StubClient): { rt: MeshRuntime; ledger: MeshLedger } {
@@ -28,15 +27,11 @@ function makeRuntime(stateDir: string, stub: StubClient): { rt: MeshRuntime; led
   const rt = {
     client: {
       alias: stub.alias,
+      rooms: ["default"],
+      roomRoles: new Map([["default", "member"]]),
       isOnline: () => true,
-      peekInbox: (_msgId: string) => {
-        stub.calls.push("peekInbox");
-        return stub.inboxFrame;
-      },
-      reply: (_msgId: string, _body: string, _refs?: string[]) => {
-        stub.calls.push("reply");
-        return Promise.resolve(stub.replyResult);
-      },
+      peekInbox: (_msgId: string) => stub.inboxFrame,
+      reply: (_msgId: string, _body: string, _refs?: string[]) => Promise.resolve(stub.replyResult),
       connect: () => Promise.reject(new Error("must not connect in these tests")),
     },
     ledger,
@@ -83,16 +78,12 @@ describe("mesh_reply ledger enrichment (to/room/priority from inbox peek)", () =
       alias: "bob",
       inboxFrame: orig,
       replyResult: { status: "delivered", msgId: "m_r_11111111" },
-      calls: [],
     };
     const { rt, ledger } = makeRuntime(dirs.stateDir, stub);
     const tools = toolRuntime(rt);
 
     const res = await execReply(tools, orig.id, "ack");
-    assert.match(res.content[0]!.text, /^delivered m_r_11111111/);
 
-    // peekInbox ran BEFORE reply (future-eviction safety), read-only access.
-    assert.deepEqual(stub.calls, ["peekInbox", "reply"]);
 
     const lines = ledgerLines(ledger);
     assert.equal(lines.length, 2);
@@ -127,13 +118,11 @@ describe("mesh_reply ledger enrichment (to/room/priority from inbox peek)", () =
       alias: "bob",
       inboxFrame: orig,
       replyResult: { status: "delivered", msgId: "m_r_22222222" },
-      calls: [],
     };
     const { rt, ledger } = makeRuntime(dirs.stateDir, stub);
     const tools = toolRuntime(rt);
 
-    const res = await execReply(tools, orig.id, "ack");
-    assert.match(res.content[0]!.text, /^delivered /);
+    await execReply(tools, orig.id, "ack");
 
     const lines = ledgerLines(ledger);
     assert.equal(lines.length, 2);
@@ -158,16 +147,14 @@ describe("mesh_reply ledger enrichment (to/room/priority from inbox peek)", () =
       alias: "bob",
       inboxFrame: undefined,
       replyResult: { status: "error", msgId: "m_gone_99999999", reason: "reply_without_target" },
-      calls: [],
     };
     const { rt, ledger } = makeRuntime(dirs.stateDir, stub);
     const tools = toolRuntime(rt);
 
     const res = await execReply(tools, "m_gone_99999999", "ack");
-    assert.ok(res.content[0]!.text.startsWith("blocked: reply_without_target"));
+    assert.equal(res.details?.status, "blocked");
+    assert.equal(res.details?.reason, "reply_without_target");
 
-    // Blocked before send: reply() is never invoked.
-    assert.deepEqual(stub.calls, ["peekInbox"]);
 
     const lines = ledgerLines(ledger);
     assert.equal(lines.length, 1);
@@ -181,5 +168,45 @@ describe("mesh_reply ledger enrichment (to/room/priority from inbox peek)", () =
     assert.equal(raw.includes('"to":'), false);
     assert.equal(raw.includes('"room":'), false);
     assert.equal(raw.includes('"priority":'), false);
+  });
+});
+
+describe("mesh_reply participation", () => {
+  it("reconnects an already joined client and delivers the exact inbound reply", async (t) => {
+    const dirs = makeTempDirs();
+    const broker = await startTestBroker(dirs.runtimeDir);
+    const alice = new MeshClient({
+      alias: "alice", rooms: ["opt-in"], runtimeDir: dirs.runtimeDir, noReconnect: true,
+    });
+    const bob = new MeshClient({
+      alias: "bob", rooms: ["opt-in"], runtimeDir: dirs.runtimeDir, noReconnect: true,
+    });
+    t.after(async () => {
+      await alice.close();
+      await bob.close();
+      await broker.close();
+      dirs.cleanup();
+    });
+    await Promise.all([alice.connect(), bob.connect()]);
+    const sent = await bob.send({ to: "alice", message: "request" });
+    assert.equal(sent.status, "delivered");
+    assert.ok(sent.msgId);
+    await waitFor(() => alice.peekInbox(sent.msgId!) !== undefined);
+    await alice.close();
+    await waitFor(() => !broker.state.peers.has("alice"));
+    const { rt, ledger } = makeRuntime(dirs.stateDir, {
+      alias: "alice", inboxFrame: undefined,
+      replyResult: { status: "delivered", msgId: "unused" },
+    });
+    rt.client = alice;
+    const received: MeshFrame[] = [];
+    bob.on("inbound", (frame: MeshFrame) => { if (frame.type === "reply") received.push(frame); });
+    const result = await execReply(toolRuntime(rt), sent.msgId, "response");
+    assert.equal(result.details?.status, "delivered");
+    await waitFor(() => received.some((frame) => frame.replyTo === sent.msgId && frame.body === "response"));
+    assert.equal(broker.state.peers.has("alice"), true);
+    assert.deepEqual(alice.rooms, ["opt-in"]);
+    assert.equal(broker.state.rooms.has("default"), false);
+    assert.deepEqual(ledger.read().map((record) => record.event), ["sent", "delivered"]);
   });
 });

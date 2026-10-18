@@ -1,5 +1,5 @@
 import { MeshClient } from "../client/client.js";
-import { MAX_BODY_BYTES } from "../shared/config.js";
+import { MAX_BODY_BYTES, type MeshConfig } from "../shared/config.js";
 import type { DeferredInbox } from "./deferred-inbox.js";
 import type { MeshGuards } from "./guards.js";
 import { type MeshIdentity } from "../shared/identity-store.js";
@@ -22,6 +22,8 @@ export interface MeshRuntime {
     identity: MeshIdentity;
     /** transferred history from a /mesh new handoff (injected at ready). */
     pendingHistory?: string[];
+    /** Saved tailnet selection awaiting an explicit room join. */
+    pendingTailnetConfig?: MeshConfig;
     /** inbound batching (flush remaining frames on shutdown). */
     batcher?: {
         flushNow(): void;

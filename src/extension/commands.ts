@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { stripVTControlCharacters } from "node:util";
 import { parseTailnetArgs, TAILSCALE_USAGE } from "../cli/cmd/tailscale.js";
 import { MeshClient, type StatusSnapshot } from "../client/client.js";
-import type { MeshRole } from "../protocol/envelope.js";
+import { isValidRoom, type MeshRole } from "../protocol/envelope.js";
 import { loadConfig, TAILSCALE_DIAGNOSTIC_MAX_CHARS } from "../shared/config.js";
 import { brokerLockPath, brokerSocketPath } from "../shared/paths.js";
 import { MESH_VERSION } from "../shared/version.js";
@@ -24,7 +24,7 @@ const HELP_TEXT = [
   "/mesh new [--history]  — fresh pi session like /new, mesh identity (alias, rooms,",
   "                         reservations) handed over; --history carries the last frames",
   "/mesh reset            — factory-reset the mesh identity (like /new: fresh alias,",
-  "                         default rooms, no reservations) WITHOUT leaving this session",
+  "                         default rooms if joined, otherwise none; no reservations)",
   "/mesh log [on|off]    — opt-in transcript (redacted bodies)",
   "/mesh ping <alias>    — send a one-shot ping message",
   "/mesh stale           — reservations held by peers, with age (TTL insight)",
@@ -38,6 +38,12 @@ const HELP_TEXT = [
 
 function notify(ctx: SessionContext, message: string): void {
   ctx.ui.notify(message, "info");
+}
+
+function requireRoom(rt: MeshRuntime, ctx: SessionContext): boolean {
+  if (rt.client.roomRoles.size > 0) return true;
+  notify(ctx, "mesh: not joined — use /mesh join <room> to connect");
+  return false;
 }
 
 /** persist alias/rooms after a mutation (join/switch/leave/rename). */
@@ -77,6 +83,7 @@ function pidAlive(pid: number): boolean {
 }
 
 async function cmdStatus(rt: MeshRuntime, ctx: SessionContext, pi: ExtensionAPI, room?: string): Promise<void> {
+  if (!requireRoom(rt, ctx)) return;
   if (!rt.client.isOnline()) {
     try {
       await rt.client.connect();
@@ -110,29 +117,31 @@ async function cmdJoin(
   asAlias: string | undefined,
   mode: "join" | "switch" = "join",
 ): Promise<void> {
-  if (mode === "switch" && room === undefined) {
-    notify(ctx, "usage: /mesh switch <room> [as <alias>] [observer]");
+  if (room === undefined || !isValidRoom(room)) {
+    notify(ctx, `usage: /mesh ${mode} <room> [as <alias>] [observer]`);
     return;
   }
-  // Rename first (re-hello), then enter the room. A rename failure keeps
-  // the current alias without aborting join/switch; same_alias is a no-op.
-  if (asAlias !== undefined) {
-    const renamed = await rt.client.rename(asAlias);
-    if (renamed.ok) {
-      if (renamed.unchanged !== true) {
-        notify(ctx, `mesh: alias changed @${renamed.alias}`);
-        persistIdentity(rt);
-      }
-    } else {
-      notify(ctx, `mesh: rename to "${asAlias}" failed: ${renamed.reason} — ${mode === "switch" ? "switching" : "joining"} as @${rt.client.alias}`);
-    }
-  }
-  if (room === undefined) {
-    notify(ctx, "usage: /mesh join <room> [as <alias>] [observer]");
-    return;
-  }
+  const activating = rt.client.roomRoles.size === 0;
   const role: MeshRole = observer ? "observer" : "member";
   try {
+    if (rt.pendingTailnetConfig !== undefined) {
+      await rt.client.selectTailnet(rt.pendingTailnetConfig);
+      delete rt.pendingTailnetConfig;
+    }
+    if (!rt.client.isOnline()) await rt.client.connect();
+    // Rename first (re-hello), then enter the room. A rename failure keeps
+    // the current alias without aborting join/switch; same_alias is a no-op.
+    if (asAlias !== undefined) {
+      const renamed = await rt.client.rename(asAlias);
+      if (renamed.ok) {
+        if (renamed.unchanged !== true) {
+          notify(ctx, `mesh: alias changed @${renamed.alias}`);
+          persistIdentity(rt);
+        }
+      } else {
+        notify(ctx, `mesh: rename to "${asAlias}" failed: ${renamed.reason} — ${mode === "switch" ? "switching" : "joining"} as @${rt.client.alias}`);
+      }
+    }
     await rt.client.join(room, role);
     if (mode === "switch") {
       // Join first: a refused destination must not discard the original rooms.
@@ -148,6 +157,9 @@ async function cmdJoin(
     }
     notify(ctx, `mesh: ${mode === "switch" ? "switched to" : "joined"} ${room} as ${role}`);
   } catch (err) {
+    if (activating && rt.client.roomRoles.size === 0) {
+      await rt.client.close().catch(() => {});
+    }
     notify(ctx, `mesh: ${mode} failed: ${err instanceof Error ? err.message : String(err)}` +
       (mode === "switch" ? ` — remaining rooms: ${rt.client.rooms.join(",") || "(none)"}` : ""));
   } finally {
@@ -157,6 +169,7 @@ async function cmdJoin(
 }
 
 async function cmdLeave(rt: MeshRuntime, ctx: SessionContext, room: string | undefined): Promise<void> {
+  if (!requireRoom(rt, ctx)) return;
   if (room === undefined) {
     notify(ctx, "usage: /mesh leave <room>");
     return;
@@ -164,7 +177,6 @@ async function cmdLeave(rt: MeshRuntime, ctx: SessionContext, room: string | und
   try {
     await rt.client.leave(room);
     notify(ctx, `mesh: left ${room}`);
-    persistIdentity(rt);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg === "not_member") {
@@ -175,6 +187,9 @@ async function cmdLeave(rt: MeshRuntime, ctx: SessionContext, room: string | und
     } else {
       notify(ctx, `mesh: leave failed: ${msg}`);
     }
+  } finally {
+    if (rt.client.roomRoles.size === 0) await rt.client.close().catch(() => {});
+    persistIdentity(rt);
   }
 }
 
@@ -183,6 +198,7 @@ async function cmdAlias(rt: MeshRuntime, ctx: SessionContext, alias: string | un
     notify(ctx, `mesh alias: @${rt.client.alias}`);
     return;
   }
+  if (!requireRoom(rt, ctx)) return;
   const renamed = await rt.client.rename(alias);
   if (renamed.ok) {
     if (renamed.unchanged !== true) {
@@ -257,8 +273,8 @@ async function cmdReset(
   getRuntime: GetRuntime,
   resetActivity?: (rt: MeshRuntime) => void,
 ): Promise<void> {
-  // like /new (fresh alias, default rooms, no reservations) but stays in
-  // this pi session, like /reload does for identity preservation.
+  // Reset joined sessions to configured rooms; an inactive session stays inactive.
+  const joined = rt.client.roomRoles.size > 0;
   const oldAlias = rt.client.alias;
   rt.markDetached?.();
   rt.stopHold?.();
@@ -272,7 +288,7 @@ async function cmdReset(
   const config = loadConfig(rt.stateDir);
   const fresh = new MeshClient({
     alias: config.alias, // explicit config.alias wins; otherwise random
-    rooms: config.rooms,
+    rooms: joined ? config.rooms : [],
     runtimeDir: rt.runtimeDir,
     config,
   });
@@ -285,6 +301,11 @@ async function cmdReset(
     }
   });
   resetActivity?.(rt);
+  persistIdentity(rt);
+  if (!joined) {
+    notify(ctx, `mesh: identity reset — was @${oldAlias}, now @${fresh.alias} (rooms: none); use /mesh join <room> to connect`);
+    return;
+  }
   try {
     await fresh.connect();
     if (getRuntime() !== rt || rt.client !== fresh) {
@@ -313,6 +334,7 @@ function cmdLog(rt: MeshRuntime, ctx: SessionContext, arg: string | undefined): 
 }
 
 async function cmdPing(rt: MeshRuntime, ctx: SessionContext, alias: string | undefined): Promise<void> {
+  if (!requireRoom(rt, ctx)) return;
   if (alias === undefined) {
     notify(ctx, "usage: /mesh ping <alias>");
     return;
@@ -484,10 +506,18 @@ async function cmdTailnet(
     const result = await executeTailnetCommand(parsed.command, loadConfig(rt.stateDir), rt.stateDir, rt.runtimeDir, client, process.env, isCurrent);
     if (!isCurrent()) return;
     if (result.ok && result.config !== undefined) {
+      if (client.roomRoles.size === 0) {
+        rt.pendingTailnetConfig = result.config;
+        result.details.connected = false;
+        result.text += "; use /mesh join <room> to connect";
+        notifyTailnet(ctx, parsed.json ? JSON.stringify({ ...result.details, ok: result.ok }) : result.text);
+        return;
+      }
       rt.clearInbound?.();
       getHud()?.setConnecting(true);
       try {
         await client.selectTailnet(result.config);
+        delete rt.pendingTailnetConfig;
       } catch (error) {
         if (!isCurrent()) return;
         getHud()?.setConnecting(false);

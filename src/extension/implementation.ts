@@ -1,5 +1,5 @@
 // Replaceable mesh implementation; the stable entry owns host registrations.
-// Initial connection is non-blocking. Reload restoration waits for readiness.
+// Restored memberships reconnect non-blockingly; fresh sessions wait for /mesh join.
 import { MeshClient, type MeshClientReloadState } from "../client/client.js";
 import { loadConfig } from "../shared/config.js";
 import { runtimeDir, stateDir } from "../shared/paths.js";
@@ -177,9 +177,7 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
     }
     const client = new MeshClient({
       alias: restored === undefined ? config.alias ?? persisted?.alias : restored.identity.alias,
-      rooms: restored === undefined
-        ? persisted !== null ? persisted.rooms : config.rooms
-        : restored.identity.rooms,
+      rooms: persisted?.rooms ?? [],
       roomRoles: persisted?.roomRoles,
       initialReservations: persisted?.reservations,
       runtimeDir: rDir,
@@ -249,9 +247,9 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
       }
     };
     hud = new MeshHud({ getRuntime });
-    hud.setConnecting(true);
+    hud.setConnecting(client.roomRoles.size > 0);
     hud.attach(ctx);
-    if (restored !== undefined) {
+    if (restored !== undefined && client.roomRoles.size > 0) {
       await client.connect();
       if (!isCurrent()) throw new Error("mesh reload cancelled by session change");
       for (const [pattern, expiresAt] of restored.reserveDeadlines) {
@@ -259,8 +257,8 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
           armReserveTimers(rt, [pattern], Math.max(0, expiresAt - Date.now()));
         }
       }
-    } else {
-      // Non-blocking startup; /mesh status can retry a failed connection.
+    } else if (client.roomRoles.size > 0) {
+      // Only an existing membership authorizes automatic connection/retry.
       void client.connect().catch((error: unknown) => {
         if (isCurrent()) {
           hud?.setConnecting(false);

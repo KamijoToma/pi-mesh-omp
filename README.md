@@ -88,7 +88,7 @@ upstream npm package.
   `fork` hand the identity over; `/mesh reset` factory-resets in place.
 - **Multi-machine** — TCP/TLS broker with a shared token; everything works
   unchanged across machines (VPS, LAN, Tailscale…).
-- **Tailnet discovery (unreleased)** — opt-in Tailscale Services or exact
+- **Tailnet discovery** — opt-in Tailscale Services or exact
   device/tag discovery, authenticated mesh selection, and restart-aware reconnects.
 - **Hash-only ledger** — durable history with bodies never stored, plus an
   opt-in redacted transcript. Zero loops: rate caps, anti-duplicate window,
@@ -122,12 +122,13 @@ npm install
 npm run build
 ```
 
-Pi auto-loads the project extension. Open **two Pi sessions** in this
-directory (each session gets its own alias):
+Pi auto-loads the project extension, but fresh sessions stay disconnected.
+Open **two Pi sessions** here and explicitly join the same room:
 
 ```bash
 # session 1            # session 2
 pi                      pi
+> /mesh join work        > /mesh join work
 > /mesh alias           > /mesh alias
 # → @agent-a1b2c3       # → @agent-d4e5f6
 ```
@@ -145,7 +146,7 @@ as a follow-up turn and answers with
 (The short format is the v0.5 default — `contextVerbosity: "full"` restores
 the legacy `[mesh] @from (room X, priority, HH:MM:SS) body` prefix.)
 
-The broker **auto-spawns** on first use (lockfile in `$TMPDIR/mesh-<uid>/`).
+The broker **auto-spawns** when a joined session connects (lockfile in `$TMPDIR/mesh-<uid>/`).
 No daemon management needed. Try `npm run smoke` for a full headless demo
 (2 clients, mailbox, broker-kill recovery).
 
@@ -168,8 +169,9 @@ This explicit-only command avoids loading an already-installed upstream copy
 at the same time. For normal use with other extensions, replace or disable the
 old mesh entry before configuring the fork.
 
-Open a second omp or Pi session with the same `MESH_RUNTIME_DIR` and
-`MESH_ROOMS` to share a broker. `MESH_STATE_DIR` controls per-session identity
+Open a second omp or Pi session with the same `MESH_RUNTIME_DIR`, then run
+`/mesh join <room>` in each session. `MESH_ROOMS` alone does not opt a fresh
+extension session into the mesh. `MESH_STATE_DIR` controls per-session identity
 and ledger storage; defaults are unchanged. Pi's normal package manifest and
 entry remain supported.
 
@@ -188,14 +190,27 @@ the broker script. Both automatic startup and `pimesh broker start` use the
 same readiness check. Missing runtimes, script failures and startup timeouts
 return actionable diagnostics, not success based only on a child PID.
 
-**Session behavior:** `/mesh new --history` transfers alias, rooms,
-reservations and recent history to the new session ID. Ordinary new sessions
-start with their own identity; resume restores the target session's identity,
-and fork/branch handoffs preserve the outgoing identity. Outgoing callbacks,
-deferred messages and provider
-holds cannot leak into the replacement session. Model observation is active
-only during an omp provider-error hold; switching to a working model releases
-the queued messages without requiring another human prompt.
+**Session behavior:** fresh sessions start with their own identity, no room
+memberships and no broker connection. `/mesh join <room>` explicitly activates
+the session and joins only that room; `/mesh switch <room>` is also an explicit
+activation. Neither command silently adds `default`.
+
+Resume reconnects only when the target identity has saved room memberships.
+Existing saved memberships, including `default`, remain evidence of prior
+participation; empty memberships stay disconnected. `/mesh new --history`
+transfers alias, rooms, reservations and recent history to the new session ID,
+and fork/branch handoffs preserve the outgoing identity, including its inactive
+state. Leaving the final room disconnects and persists the empty membership.
+Resetting an inactive identity also stays disconnected; an active reset still
+uses configured rooms. Status, send, reply, alias mutation and reservation tools
+do not opt an inactive session in: they direct the user to `/mesh join <room>`.
+Local alias display, history and ledger remain available without joining.
+Tailnet selection can be saved while inactive; it connects only on room join.
+
+Outgoing callbacks, deferred messages and provider holds cannot leak into the
+replacement session. Model observation is active only during an omp
+provider-error hold; switching to a working model releases the queued messages
+without requiring another human prompt.
 
 Verified with standalone omp 18.10.3, an omp source checkout reporting 18.4.2,
 and Pi 1.2.0. Modern Pi's `agent_settled`, `model_select` and replacement
@@ -223,8 +238,9 @@ queued until a safe point. Current work and reply waits continue; reload does
 not call the host's abort, session reload or new-session APIs. Changing
 sessions or shutting down cancels a queued reload.
 
-Cutover briefly reconnects the mesh client to the existing broker. The host
-process, conversation and other extensions remain running. Alias, rooms,
+Cutover briefly reconnects a joined client to the existing broker; an inactive
+session stays disconnected. The host process, conversation and other extensions
+remain running. Alias, rooms,
 per-room member/observer roles, reservations and their auto-release deadlines, reply targets,
 memory history/deduplication, deferred inbox (including already-queued messages),
 provider holds, transcript toggle and diagnostic counts are transferred in
@@ -304,9 +320,10 @@ delivery uncertain (`broker_state_lost_delivery_unknown`); this does **not**
 prove that the task never executed. Confirmed-delivered tasks survive the
 broker restart and can still reply after reconnect.
 
-**Custom agent names:** call `mesh_alias({ alias: "reviewer" })` to give this
-agent a recognizable name; `mesh_alias({})` shows its current name. The existing
-`/mesh alias reviewer` command remains available for manual naming.
+**Custom agent names:** after joining, call `mesh_alias({ alias: "reviewer" })`
+to give this agent a recognizable name; `mesh_alias({})` shows its current
+name even while inactive. `/mesh alias reviewer` changes a joined session's
+name; `/mesh join work as reviewer` can name it during explicit activation.
 Other agents can then use `mesh_send({ to: "reviewer", message: "Please review…" })`
 or mention `@reviewer` in a room broadcast. With deferred broadcasts enabled,
 a whole-name mention of the new alias is delivered immediately.
@@ -534,8 +551,12 @@ re-sent by flush. Deferred state is session-local and cleared on reset,
 host/session replacement or shutdown; `/mesh reload` transfers it to the new
 implementation. Use the existing mesh history for older frames.
 
-### Unreleased reliability fixes
+### v0.7.2-omp.4
 
+- Keep fresh extension sessions disconnected until explicit room join/switch;
+  restore only saved memberships and never implicitly add `default`.
+- Keep inactive commands, model tools, reset and reload disconnected; closing
+  the last room opts out, and expired auto-release claims cannot reconnect.
 - Increased task and group wait defaults and maximum waits to 60 minutes,
   including CLI attach's scripted timeout validation.
 - Preserved UTF-8 characters split across socket chunks; reject oversized
@@ -789,12 +810,11 @@ MESH_BROKER_URL=tcp://<machine-A>:8712 MESH_BROKER_TOKEN=change-me pi
   machine; reservations protect the same repo paths when both machines
   share the same git checkout (always reserve repo-relative paths).
 
-### Tailnet discovery (unreleased)
+### Tailnet discovery
 
-These commands are available from the default `omp-compat` branch using the
-unpinned GitHub installation in [Install](#install). The published
-`v0.7.2-omp.2` tag remains unchanged and does not include them. Use one mesh
-extension copy; do not load a checkout alongside an installed copy.
+These commands are included in `v0.7.2-omp.4` and the default `omp-compat`
+branch. Use one mesh extension copy; do not load a checkout alongside an
+installed copy.
 
 Discovery is **off by default**. It reuses the installed Tailscale client;
 no management API token, Go sidecar, IRC transport, or tailnet-wide port scan

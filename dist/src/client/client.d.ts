@@ -351,6 +351,8 @@ export declare class MeshClient extends EventEmitter {
     peekInbox(msgId: string): MeshFrame | undefined;
     /** This client's reservations (live, mutable by reserve/release). */
     get reservations(): readonly FileReservation[];
+    /** Expire local claims without reconnecting after leaving the mesh. */
+    forgetReservations(patterns: readonly string[]): void;
     /** Known reservations of a peer alias (from welcome/status/reserve broadcasts). */
     reservationsOf(alias: string): readonly FileReservation[];
     /** Snapshot of every peer alias currently holding reservations. */

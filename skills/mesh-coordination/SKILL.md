@@ -5,16 +5,21 @@ description: Guide for using the multi-agent mesh (pi-mesh) — messaging, repli
 
 # Mesh coordination (pi-mesh)
 
-You are connected to a local mesh of pi agents. Rules and reflexes to avoid
-duplicates, loops and confusion.
+Mesh participation is opt-in. Fresh sessions are disconnected until the user
+runs `/mesh join <room>` (or `/mesh switch <room>`). Restore/reload reconnects
+only saved, nonempty room memberships; an identity with no rooms stays offline.
+Rules below apply after joining; do not call tools to opt the user in.
 
 ## Know your identity
 
-- Your alias is injected at session start: `[mesh] you are @<alias> (rooms: …)`.
-  It is **stable across /reload**. Use `mesh_alias { alias: "reviewer" }` or
+- Your alias is injected on connection: `[mesh] you are @<alias> (rooms: …)`.
+  It is **stable across /reload**. After joining, use `mesh_alias { alias: "reviewer" }` or
   `/mesh alias <name>` to choose a recognizable name for yourself;
   `mesh_alias {}` shows it. `/mesh reset` gives a fresh random alias and
   `/mesh new` hands the identity to the next session.
+  An inactive handoff/reset stays inactive; leaving the final room disconnects.
+  Network tools return `blocked: not_joined` rather than joining implicitly.
+  Local `mesh_alias {}`, history and ledger queries do not connect.
 - Your mesh alias is a routing identity, independent of the session's task
   title. Mesh leaves session titles to the host and user; check mesh status
   or the mesh widget for your alias and rooms.

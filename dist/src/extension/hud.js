@@ -98,11 +98,11 @@ export class MeshHud {
         this.connecting = on;
         this.refresh();
     }
-    /** 'closed': mark offline + clear peers (client auto-reconnects → ◐). */
+    /** 'closed': clear peers; only existing memberships authorize reconnect. */
     onClosed() {
         this.snapshot = null;
         this.statusError = undefined;
-        this.connecting = true;
+        this.connecting = (this.deps.getRuntime()?.client.roomRoles.size ?? 0) > 0;
         this.refresh();
     }
     /** Presence-driven status refresh: at most 1/s, trailing. */

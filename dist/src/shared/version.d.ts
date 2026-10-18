@@ -1,1 +1,1 @@
-export declare const MESH_VERSION = "0.7.2-omp.3";
+export declare const MESH_VERSION = "0.7.2-omp.4";
