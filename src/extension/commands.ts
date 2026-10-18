@@ -11,7 +11,7 @@ import { attachClientListeners } from "./attach.js";
 import type { MeshHud } from "./hud.js";
 import { identityFromClient } from "../shared/identity-store.js";
 import type { ExtensionAPI, SessionContext } from "./pi-types.js";
-import { formatPeerActivity, type GetRuntime, type MeshRuntime } from "./tools.js";
+import { clearReserveTimers, formatPeerActivity, type GetRuntime, type MeshRuntime } from "./tools.js";
 import { isOmpHost, reportConnectionError } from "./host.js";
 import { executeTailnetCommand } from "../tailscale/commands.js";
 
@@ -256,6 +256,7 @@ async function cmdReset(
   const oldAlias = rt.client.alias;
   rt.markDetached?.();
   rt.stopHold?.();
+  clearReserveTimers(rt);
   // 1. leave the mesh cleanly (alias/rooms/reservations purged at the broker)
   await rt.client.close().catch(() => {});
   if (getRuntime() !== rt) return;

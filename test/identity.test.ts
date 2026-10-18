@@ -3,12 +3,14 @@
 // persisted in <stateDir>/identity.json and re-loaded by the next session.
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MeshClient } from "../src/client/client.js";
 import {
   PENDING_TTL_MS,
+  IDENTITY_VERSION,
+  IDENTITY_PENDING_NAME,
   identityFileExists,
   identityFromClient,
   identityPath,
@@ -31,16 +33,18 @@ describe("MeshIdentity persistence", () => {
       const id = new MeshIdentity(dir);
       const now = new Date().toISOString();
       id.save({
-        version: 1,
+        version: IDENTITY_VERSION,
         sessionId: SID,
         alias: "agent-7",
         rooms: ["default", "ops"],
+        roomRoles: { default: "member", ops: "observer" },
         reservations: [{ pattern: "web/x.js", reason: "integrating", since: now }],
         updatedAt: now,
       });
       const loaded = id.load(SID);
       assert.equal(loaded?.alias, "agent-7");
       assert.deepEqual(loaded?.rooms, ["default", "ops"]);
+      assert.deepEqual(loaded?.roomRoles, { default: "member", ops: "observer" });
       assert.equal(loaded?.reservations[0]?.pattern, "web/x.js");
       assert.ok(identityFileExists(dir, SID));
     } finally {
@@ -55,6 +59,7 @@ describe("MeshIdentity persistence", () => {
       id.save(identityFromClient(SID, {
         alias: "agent-1",
         rooms: ["default"],
+        roomRoles: new Map([["default", "member"]]),
         reservations: [],
       }));
       assert.equal(id.load("019fdead-0000-7000-8000-000000000002"), null);
@@ -71,10 +76,11 @@ describe("MeshIdentity persistence", () => {
       const old = new Date(Date.now() - RESERVATION_TTL_MS - 60_000).toISOString();
       const fresh = new Date(Date.now() - 60_000).toISOString();
       id.save({
-        version: 1,
+        version: IDENTITY_VERSION,
         sessionId: SID,
         alias: "agent-1",
         rooms: ["default"],
+        roomRoles: { default: "member" },
         reservations: [
           { pattern: "web/stale.js", since: old },
           { pattern: "web/fresh.js", since: fresh },
@@ -107,8 +113,8 @@ describe("MeshIdentity persistence", () => {
       const id = new MeshIdentity(dir);
       const sidA = "019faaaa-0000-7000-8000-000000000001";
       const sidB = "019faaaa-0000-7000-8000-000000000002";
-      id.save(identityFromClient(sidA, { alias: "agent-1", rooms: ["cs-room"], reservations: [] }));
-      id.save(identityFromClient(sidB, { alias: "agent-2", rooms: ["cs-room"], reservations: [] }));
+      id.save(identityFromClient(sidA, { alias: "agent-1", rooms: ["cs-room"], roomRoles: new Map([["cs-room", "member"]]), reservations: [] }));
+      id.save(identityFromClient(sidB, { alias: "agent-2", rooms: ["cs-room"], roomRoles: new Map([["cs-room", "member"]]), reservations: [] }));
       // agent-2's save must NOT clobber agent-1's file
       assert.equal(id.load(sidA)?.alias, "agent-1");
       assert.equal(id.load(sidB)?.alias, "agent-2");
@@ -125,14 +131,56 @@ describe("MeshIdentity persistence", () => {
       // write the legacy format (v0.1.3-v0.1.7: one file, sessionId inside)
       writeFileSync(
         identityPath(dir, "").replace("identity-.json", "identity.json"),
-        JSON.stringify(identityFromClient(SID, { alias: "agent-1", rooms: ["cs-room"], reservations: [] })),
+        JSON.stringify({ version: 1, sessionId: SID, alias: "agent-1", rooms: ["cs-room"], reservations: [], updatedAt: new Date().toISOString() }),
         "utf8",
       );
       const id = new MeshIdentity(dir);
       const loaded = id.load(SID);
       assert.equal(loaded?.alias, "agent-1");
       assert.deepEqual(loaded?.rooms, ["cs-room"]);
+      assert.deepEqual(loaded?.roomRoles, { "cs-room": "member" });
+      assert.deepEqual(JSON.parse(readFileSync(identityPath(dir, SID), "utf8")), loaded);
       assert.ok(identityFileExists(dir, SID), "migrated to per-session file");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("migrates v1 per-session identities without losing alias, rooms or fresh claims", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      const old = {
+        version: 1, sessionId: SID, alias: "legacy-agent", rooms: ["default", "ops"],
+        reservations: [{ pattern: "src/legacy.ts", reason: "keep", since: new Date().toISOString() }],
+        updatedAt: new Date().toISOString(),
+      };
+      writeFileSync(identityPath(dir, SID), JSON.stringify(old));
+      const store = new MeshIdentity(dir);
+      const migrated = store.load(SID);
+      assert.deepEqual(migrated, { ...old, version: IDENTITY_VERSION, roomRoles: { default: "member", ops: "member" } });
+      assert.deepEqual(JSON.parse(readFileSync(identityPath(dir, SID), "utf8")), migrated);
+      assert.deepEqual(store.load(SID), migrated);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("rejects malformed v2 roles instead of promoting them to members", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      const base = {
+        version: IDENTITY_VERSION, sessionId: SID, alias: "reviewer", rooms: ["ops"],
+        reservations: [], updatedAt: new Date().toISOString(),
+      };
+      const store = new MeshIdentity(dir);
+      for (const roomRoles of [undefined, null, [], {}, { ops: "admin" }, { ops: "observer", extra: "member" }]) {
+        writeFileSync(identityPath(dir, SID), JSON.stringify({ ...base, roomRoles }));
+        assert.equal(store.load(SID), null, `invalid role map ${JSON.stringify(roomRoles)}`);
+        assert.deepEqual(store.list().identities, []);
+      }
+      writeFileSync(identityPath(dir, SID), JSON.stringify({ ...base, rooms: [], roomRoles: {} }));
+      assert.deepEqual(store.load(SID)?.rooms, []);
+      assert.deepEqual(store.load(SID)?.roomRoles, {});
     } finally {
       cleanup();
     }
@@ -177,6 +225,7 @@ describe("identity reload E2E (simulated /reload)", () => {
     const alice2 = new MeshClient({
       alias: persisted?.alias,
       rooms: persisted?.rooms,
+      roomRoles: persisted?.roomRoles,
       initialReservations: persisted?.reservations,
       runtimeDir: dirs.runtimeDir,
     });
@@ -225,7 +274,7 @@ describe("MeshIdentity.reset (D28: /mesh reset)", () => {
     const { dir, cleanup } = tmpStateDir();
     try {
       const id = new MeshIdentity(dir);
-      id.save(identityFromClient(SID, { alias: "agent-1", rooms: ["cs-room"], reservations: [] }));
+      id.save(identityFromClient(SID, { alias: "agent-1", rooms: ["cs-room"], roomRoles: new Map([["cs-room", "member"]]), reservations: [] }));
       assert.equal(id.load(SID)?.alias, "agent-1");
       id.reset(SID);
       assert.equal(id.load(SID), null);
@@ -241,8 +290,8 @@ describe("MeshIdentity.reset (D28: /mesh reset)", () => {
       const id = new MeshIdentity(dir);
       const sidA = "019faaaa-0000-7000-8000-0000000000a1";
       const sidB = "019faaaa-0000-7000-8000-0000000000a2";
-      id.save(identityFromClient(sidA, { alias: "agent-1", rooms: ["cs-room"], reservations: [] }));
-      id.save(identityFromClient(sidB, { alias: "agent-2", rooms: ["cs-room"], reservations: [] }));
+      id.save(identityFromClient(sidA, { alias: "agent-1", rooms: ["cs-room"], roomRoles: new Map([["cs-room", "member"]]), reservations: [] }));
+      id.save(identityFromClient(sidB, { alias: "agent-2", rooms: ["cs-room"], roomRoles: new Map([["cs-room", "member"]]), reservations: [] }));
       id.reset(sidA);
       assert.equal(id.load(sidA), null);
       assert.equal(id.load(sidB)?.alias, "agent-2", "other sessions keep their identity");
@@ -302,16 +351,41 @@ describe("identity pending handoff (D30: /mesh new)", () => {
       const id = new MeshIdentity(dir);
       const sidA = "019faaaa-0000-7000-8000-0000000000b1";
       id.savePending(
-        identityFromClient(sidA, { alias: "agent-1", rooms: ["cs-room"], reservations: [{ pattern: "web/x.js", since: new Date().toISOString() }] }),
+        identityFromClient(sidA, { alias: "agent-1", rooms: ["cs-room"], roomRoles: new Map([["cs-room", "observer"]]), reservations: [{ pattern: "web/x.js", since: new Date().toISOString() }] }),
         ["10:00 msg agent-1→agent-2 MISSION", "10:05 reply agent-2→agent-1 done"],
       );
       // consumed by a DIFFERENT session (new sessionId)
       const taken = id.consumePending();
       assert.equal(taken?.identity.alias, "agent-1");
       assert.deepEqual(taken?.identity.rooms, ["cs-room"]);
+      assert.deepEqual(taken?.identity.roomRoles, { "cs-room": "observer" });
       assert.equal(taken?.identity.reservations[0]?.pattern, "web/x.js");
       assert.deepEqual(taken?.history, ["10:00 msg agent-1→agent-2 MISSION", "10:05 reply agent-2→agent-1 done"]);
       assert.equal(id.consumePending(), null, "file cleared after consume");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("migrates legacy pending handoff roles and rejects invalid current roles", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      const id = new MeshIdentity(dir);
+      const payload = {
+        version: 1, sessionId: "outgoing-session", alias: "legacy-reviewer", rooms: ["ops"],
+        reservations: [{ pattern: "src/handoff.ts", since: new Date().toISOString() }],
+        updatedAt: new Date().toISOString(), history: ["handoff context"],
+      };
+      writeFileSync(path.join(dir, IDENTITY_PENDING_NAME), JSON.stringify(payload));
+      const pending = id.consumePending();
+      assert.equal(pending?.identity.alias, "legacy-reviewer");
+      assert.deepEqual(pending?.identity.roomRoles, { ops: "member" });
+      assert.equal(pending?.identity.reservations[0]?.pattern, "src/handoff.ts");
+      assert.deepEqual(pending?.history, ["handoff context"]);
+      writeFileSync(path.join(dir, IDENTITY_PENDING_NAME), JSON.stringify({
+        ...payload, version: IDENTITY_VERSION, roomRoles: { ops: "admin" },
+      }));
+      assert.equal(id.consumePending(), null);
     } finally {
       cleanup();
     }
@@ -324,6 +398,7 @@ describe("identity pending handoff (D30: /mesh new)", () => {
       const stale = identityFromClient("019faaaa-0000-7000-8000-0000000000b2", {
         alias: "agent-1",
         rooms: ["cs-room"],
+        roomRoles: new Map([["cs-room", "member"]]),
         reservations: [],
       });
       stale.updatedAt = new Date(Date.now() - PENDING_TTL_MS - 60_000).toISOString();

@@ -74,7 +74,7 @@ export function loadPolicy(stateDir?: string, env: NodeJS.ProcessEnv = process.e
   const allow = parseRules(p.allow);
   const rl = (p.rateLimits ?? {}) as Record<string, unknown>;
   const posInt = (v: unknown, d: number): number =>
-    typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : d;
+    typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : d;
   return {
     allow: allow.length > 0 ? allow : [{ from: "*", to: "*", room: "*" }],
     deny: parseRules(p.deny),

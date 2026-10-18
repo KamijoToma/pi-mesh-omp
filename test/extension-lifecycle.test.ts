@@ -12,7 +12,7 @@ import { MESH_VERSION } from "../src/shared/version.js";
 import { MeshClient } from "../src/client/client.js";
 import type { ExtensionAPI, CommandDefinition, InboundMessage, SessionContext, ToolDefinition } from "../src/extension/pi-types.js";
 import { IDENTITY_PENDING_NAME, MeshIdentity } from "../src/shared/identity-store.js";
-import { makeTempDirs, startTestBroker, waitFor } from "./helpers.js";
+import { makeTempDirs, sleep, startTestBroker, waitFor } from "./helpers.js";
 
 type Hook = (event: unknown, ctx: SessionContext) => unknown;
 type ManagedTimer = Parameters<NonNullable<SessionContext["clearTimer"]>>[0];
@@ -195,6 +195,78 @@ describe("mesh extension session lifecycle", { concurrency: false, timeout: 15_0
         fixture.names.set("fork-session", "Inherited task title");
         await fixture.switchTo("fork-session", "fork");
         assert.equal(fixture.names.get("fork-session"), "Inherited task title");
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
+  it("both hosts resume an identity that deliberately left every room", async () => {
+    for (const omp of [true, false]) {
+      const fixture = await lifecycleFixture(omp);
+      try {
+        const alias = fixture.alias();
+        await fixture.command("leave default");
+        assert.deepEqual(fixture.identity.load("original")?.rooms, []);
+        await fixture.switchTo("other-session", "new");
+        await fixture.switchTo("original", "resume");
+        assert.equal(fixture.alias(), alias);
+        assert.deepEqual(fixture.identity.load("original")?.rooms, []);
+        const peer = (await fixture.observer.status()).peers.find((candidate) => candidate.alias === alias);
+        assert.deepEqual(peer?.rooms, []);
+        const sent = await fixture.tool("mesh_send", { to: "observer", message: "must-not-rejoin-default" });
+        assert.equal(sent.details?.status, "blocked");
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
+  it("both hosts preserve each room role through resume and /mesh new handoff", async () => {
+    for (const omp of [true, false]) {
+      const fixture = await lifecycleFixture(omp);
+      try {
+        const alias = fixture.alias();
+        await fixture.observer.join("ops");
+        await fixture.observer.join("writers");
+        await fixture.command("switch ops observer");
+        await fixture.command("join writers");
+        const assertRoles = async () => {
+          assert.equal(fixture.alias(), alias);
+          assert.deepEqual(fixture.identity.load(fixture.sessionId())?.roomRoles, { ops: "observer", writers: "member" });
+          const readonly = await fixture.tool("mesh_send", { to: "observer", room: "ops", message: "must-remain-readonly" });
+          assert.equal(readonly.details?.reason, "observer_readonly");
+          const writable = await fixture.tool("mesh_send", { to: "observer", room: "writers", message: "still-a-member" });
+          assert.equal(writable.details?.status, "delivered");
+        };
+        await fixture.switchTo("other-session", "new");
+        await fixture.switchTo("original", "resume");
+        await assertRoles();
+        const ready = fixture.ready();
+        await fixture.command("new");
+        await ready;
+        await assertRoles();
+      } finally {
+        await fixture.close();
+      }
+    }
+  });
+
+  it("both hosts cancel outgoing auto-release timers before resetting the runtime client", async () => {
+    for (const omp of [true, false]) {
+      const fixture = await lifecycleFixture(omp);
+      try {
+        const reserved = await fixture.tool("mesh_reserve", { paths: ["same-path.ts"], autoReleaseMs: 1000 });
+        assert.equal(reserved.details?.status, "delivered");
+        const oldDeadline = Date.now() + 1000;
+        await fixture.command("reset");
+        const alias = fixture.alias();
+        const replacement = await fixture.tool("mesh_reserve", { paths: ["same-path.ts"], reason: "no auto release" });
+        assert.equal(replacement.details?.status, "delivered");
+        await sleep(Math.max(0, oldDeadline - Date.now()) + 100);
+        const peer = (await fixture.observer.status()).peers.find((candidate) => candidate.alias === alias);
+        assert.equal(peer?.reservations?.[0]?.pattern, "same-path.ts");
+        assert.equal(fixture.identity.load("original")?.reservations[0]?.pattern, "same-path.ts");
       } finally {
         await fixture.close();
       }

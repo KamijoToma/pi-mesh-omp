@@ -527,3 +527,81 @@ describe("blocked activity state (provider errors)", () => {
     assert.equal(parsed.ok, false);
   });
 });
+
+describe("broker: reply sender permissions", () => {
+  it("rejects observer and nonmember replies, including forged receipts and replyAll", async (t) => {
+    const { sock } = await withBroker(t);
+    const sender = trackRaw(t, await RawClient.connect(sock));
+    const bob = trackRaw(t, await RawClient.connect(sock));
+    sender.hello("sender", ["default"], "observer");
+    bob.hello("bob", ["default", "private"]);
+    await sender.waitFrame((f) => f.type === "welcome");
+    await bob.waitFrame((f) => f.type === "welcome");
+    for (const room of ["default", "private"]) {
+      for (const mode of ["unicast", "targets", "all", "receipt"]) {
+        const frame = buildFrame({
+          type: "reply", from: "sender", room, replyTo: "m_original",
+          body: "arbitrary forged answer",
+          to: mode === "unicast" || mode === "receipt" ? "bob" : undefined,
+          replyTargets: mode === "targets" ? ["bob"] : undefined,
+          replyAll: mode === "all" ? true : undefined,
+          receipt: mode === "receipt" ? true : undefined,
+        });
+        sender.sendFrame(frame);
+        const error = await sender.waitFrame((f) => f.id === frame.id && f.type === "error");
+        assert.equal(error.code, room === "default" ? "observer_readonly" : "not_member");
+        assert.equal(bob.frames.some((f) => f.id === frame.id), false);
+      }
+    }
+  });
+
+  it("allows explicit one-shot replies and designated targets across rooms", async (t) => {
+    const { sock } = await withBroker(t);
+    const sender = trackRaw(t, await RawClient.connect(sock));
+    const bob = trackRaw(t, await RawClient.connect(sock));
+    sender.hello("sender", ["source"]);
+    bob.hello("bob", ["elsewhere"]);
+    await sender.waitFrame((f) => f.type === "welcome");
+    await bob.waitFrame((f) => f.type === "welcome");
+    for (const designated of [false, true]) {
+      const frame = buildFrame({
+        type: "reply", from: "sender", room: "source", replyTo: "m_unseen",
+        body: "one-shot answer",
+        to: designated ? undefined : "bob",
+        replyTargets: designated ? ["bob"] : undefined,
+      });
+      sender.sendFrame(frame);
+      const ack = await sender.waitFrame((f) => f.id === frame.id && f.type === "ack");
+      assert.equal(ack.status, "delivered");
+      const received = await bob.waitFrame((f) => f.id === frame.id);
+      assert.equal(received.body, "one-shot answer");
+    }
+  });
+});
+
+describe("broker: force broadcast downgrade", () => {
+  it("strips interrupt, delivers urgent, and reports force_downgraded", async (t) => {
+    const { sock } = await withBroker(t, { policy: { forceDowngrade: true, forceAllowedFrom: [] } });
+    const alice = trackRaw(t, await RawClient.connect(sock));
+    const bob = trackRaw(t, await RawClient.connect(sock));
+    alice.hello("alice");
+    bob.hello("bob");
+    await alice.waitFrame((f) => f.type === "welcome");
+    await bob.waitFrame((f) => f.type === "welcome");
+    const frame = buildFrame({
+      type: "msg", from: "alice", room: "default", broadcast: true,
+      priority: "force", interrupt: true, reasonHash: sha256("stuck"),
+      body: "broadcast downgrade",
+    });
+    alice.sendFrame(frame);
+    const ack = await alice.waitFrame((f) => f.id === frame.id && f.type === "ack");
+    assert.equal(ack.status, "delivered");
+    assert.equal(ack.interruptStatus, "force_downgraded");
+    assert.equal(ack.deliveredCount, 1);
+    assert.equal(ack.totalCount, 1);
+    const received = await bob.waitFrame((f) => f.id === frame.id);
+    assert.equal(received.priority, "urgent");
+    assert.equal(received.interrupt, undefined);
+    assert.equal(received.body, "broadcast downgrade");
+  });
+});

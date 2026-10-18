@@ -10,7 +10,7 @@ import { describe, it } from "node:test";
 import { MeshClient } from "../src/client/client.js";
 import { buildFrame, parseFrameLine, type MeshFrame } from "../src/protocol/envelope.js";
 import { encodeFrame, FrameDecoder } from "../src/protocol/frames.js";
-import { DEFAULT_MAX_FRAME_BYTES } from "../src/shared/config.js";
+import { DEFAULT_MAX_FRAME_BYTES, MAX_BODY_BYTES } from "../src/shared/config.js";
 import {
   brokerSocketPathOf,
   makeTempDirs,
@@ -140,6 +140,43 @@ describe("client: awaitReply lifecycle", () => {
     const res = await sendPromise;
     assert.equal(res.status, "error");
     if (res.status === "error") assert.equal(res.reason, "shutting_down");
+  });
+});
+
+describe("client: encoded frame limits", () => {
+  it("rejects an escaped launch frame without leaving a pending mission or ACK waiter", async (t) => {
+    const { alice, bob } = await fixture(t);
+    const rejected = await alice.send({
+      to: "bob",
+      message: "\\".repeat(MAX_BODY_BYTES),
+      awaitReply: true,
+      block: false,
+    });
+    assert.deepEqual(rejected, { status: "error", reason: "oversized" });
+    assert.equal(alice.pendingCount, 0);
+    assert.deepEqual(alice.missionStatus(), []);
+    assert.equal(alice.isReloadSafe(), true);
+
+    const received = new Promise<MeshFrame>((resolve) => bob.once("inbound", resolve));
+    const body = "x".repeat(MAX_BODY_BYTES);
+    const accepted = await alice.send({ to: "bob", message: body });
+    assert.equal(accepted.status, "delivered");
+    assert.equal((await received).body, body);
+  });
+
+  it("rejects an escaped reply before registering an ACK and allows a valid reply afterward", async (t) => {
+    const { alice, bob } = await fixture(t);
+    const incoming = new Promise<MeshFrame>((resolve) => bob.once("inbound", resolve));
+    await alice.send({ to: "bob", message: "reply with a report" });
+    const original = await incoming;
+    const rejected = await bob.reply(original.id, "\\".repeat(MAX_BODY_BYTES));
+    assert.equal(rejected.status, "error");
+    if (rejected.status === "error") assert.equal(rejected.reason, "oversized");
+    assert.equal(bob.isReloadSafe(), true);
+
+    const received = new Promise<MeshFrame>((resolve) => alice.once("inbound", resolve));
+    assert.equal((await bob.reply(original.id, "valid report")).status, "delivered");
+    assert.equal((await received).body, "valid report");
   });
 });
 

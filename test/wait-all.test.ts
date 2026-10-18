@@ -150,6 +150,52 @@ describe("waitAll (D42)", () => {
     assert.equal(m!.status, "expired");
   });
 
+  it("reports a launch mission that expired before the first verdict", async () => {
+    lead.cancelAllAwaited();
+    bob.removeAllListeners("inbound");
+    const sent = await lead.send({
+      to: "bob", message: "expire before wait", awaitReply: true, block: false, timeoutMs: 100,
+    });
+    assert.equal(sent.status, "delivered");
+    await waitFor(() => lead.missionStatus().some((m) => m.msgId === sent.msgId && m.status === "expired"));
+    const verdict = await lead.waitAll(50);
+    assert.equal(verdict.status, "timeout");
+    assert.equal(verdict.total, 1);
+    assert.equal(verdict.answered, 0);
+    assert.deepEqual(verdict.missing, [{ msgId: sent.msgId, to: "bob" }]);
+    assert.deepEqual((await lead.waitAll(50)).missing, verdict.missing);
+  });
+
+  it("keeps mailbox drops and ACK failures in the missing verdict until the batch is cleared", async () => {
+    lead.cancelAllAwaited();
+    await bob.close();
+    await waitFor(() => !broker.state.peers.has("bob"));
+    try {
+      const queued = await lead.send({
+        to: "bob", message: "drop before wait", awaitReply: true, block: false, timeoutMs: 30_000,
+      });
+      assert.equal(queued.status, "queued_offline");
+      broker.purgeMailboxExpired(Date.now() + 3_600_001);
+      await waitFor(() => lead.missionStatus().some((m) => m.msgId === queued.msgId && m.status === "failed"));
+      const blocked = await lead.send({
+        to: "unknown-recipient", message: "no such peer", awaitReply: true, block: false,
+      });
+      assert.equal(blocked.status, "blocked");
+      const verdict = await lead.waitAll(50);
+      assert.equal(verdict.status, "timeout");
+      assert.equal(verdict.total, 2);
+      assert.deepEqual(verdict.missing, [
+        { msgId: queued.msgId, to: "bob" },
+        { msgId: blocked.msgId, to: "unknown-recipient" },
+      ]);
+      lead.cancelAllAwaited();
+      assert.deepEqual(lead.missionStatus(), []);
+      assert.equal((await lead.waitAll(50)).total, 0);
+    } finally {
+      await bob.connect();
+    }
+  });
+
   it("ESC (AbortSignal) cancels a pending wait_all early, reporting nothing", async () => {
     lead.cancelAllAwaited();
     // bob never answers — wait_all would block until the timeout.

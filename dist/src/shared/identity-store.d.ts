@@ -1,8 +1,8 @@
-import { type FileReservation } from "../protocol/envelope.js";
+import { type FileReservation, type MeshRole } from "../protocol/envelope.js";
 export declare const IDENTITY_FILE_NAME = "identity.json";
 export declare const IDENTITY_PREFIX = "identity-";
 export declare const IDENTITY_PENDING_NAME = "identity-pending.json";
-export declare const IDENTITY_VERSION = 1;
+export declare const IDENTITY_VERSION = 2;
 /** Persisted reservations older than this are NOT re-declared at hello. */
 export declare const RESERVATION_TTL_MS = 86400000;
 /** a /mesh new handoff is only valid for this long. */
@@ -12,6 +12,7 @@ export interface PersistedIdentity {
     sessionId: string;
     alias: string;
     rooms: string[];
+    roomRoles: Record<string, MeshRole>;
     reservations: FileReservation[];
     updatedAt: string;
 }
@@ -19,6 +20,7 @@ export interface PersistedIdentity {
 export declare function identityFromClient(sessionId: string, client: {
     alias: string;
     rooms: readonly string[];
+    roomRoles: ReadonlyMap<string, MeshRole>;
     reservations: readonly FileReservation[];
 }): PersistedIdentity;
 export declare class MeshIdentity {
@@ -30,8 +32,8 @@ export declare class MeshIdentity {
     private parse;
     /**
     * Load the identity belonging to `sessionId`. Returns null when absent,
-    * from another session, malformed, or on an older version — callers then
-    * start fresh (random alias, default rooms, no reservations).
+    * from another session, malformed, or on an unsupported version — callers
+    * then start fresh. Version 1 memberships migrate explicitly to member roles.
     */
     load(sessionId: string): PersistedIdentity | null;
     /**

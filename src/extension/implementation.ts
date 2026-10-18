@@ -178,8 +178,9 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
     const client = new MeshClient({
       alias: restored === undefined ? config.alias ?? persisted?.alias : restored.identity.alias,
       rooms: restored === undefined
-        ? persisted !== null && persisted.rooms.length > 0 ? persisted.rooms : config.rooms
+        ? persisted !== null ? persisted.rooms : config.rooms
         : restored.identity.rooms,
+      roomRoles: persisted?.roomRoles,
       initialReservations: persisted?.reservations,
       runtimeDir: rDir,
       config,

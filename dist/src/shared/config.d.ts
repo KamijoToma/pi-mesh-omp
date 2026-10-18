@@ -27,9 +27,10 @@ export declare const RATE_BUCKET_WINDOW_MS = 60000;
 export declare const RECONNECT_BASE_MS = 250;
 export declare const RECONNECT_MAX_MS = 5000;
 export declare const OUTBOX_FLUSH_CAP = 50;
-export declare const DEFAULT_AWAIT_REPLY_TIMEOUT_MS = 1800000;
+export declare const DEFAULT_AWAIT_REPLY_TIMEOUT_MS = 3600000;
+export declare const DEFAULT_WAIT_ALL_TIMEOUT_MS = 3600000;
 export declare const MIN_AWAIT_REPLY_TIMEOUT_MS = 25;
-export declare const MAX_AWAIT_REPLY_TIMEOUT_MS = 1800000;
+export declare const MAX_AWAIT_REPLY_TIMEOUT_MS = 3600000;
 export declare const MAX_REMINDS = 2;
 export declare const ENSURE_BROKER_POLL_MS = 50;
 export declare const ENSURE_BROKER_MAX_POLLS = 60;
@@ -51,7 +52,7 @@ export declare const PROVIDER_MODEL_WATCH_MS = 500;
 /** last N ledger lines printed by `mesh tail` (no -f yet — Phase 3). */
 export declare const CLI_TAIL_LINES = 20;
 /** default `mesh send --await` timeout: a one-shot CLI script must not hang
- * for the 30-min mission default — long awaits belong to a live session. */
+ * for the 60-min mission default — long awaits belong to a live session. */
 export declare const CLI_SEND_TIMEOUT_MS = 30000;
 /** how long `mesh reserve` keeps its claim alive before closing: long enough
  * for peers to receive the reservation broadcast, short enough that the
@@ -60,8 +61,8 @@ export declare const CLI_RESERVE_GRACE_MS = 1500;
 /** `mesh ping` await budget: short by design — liveness probing must not hang
  * for the send default; peer turns often take longer, expired ≠ down. */
 export declare const CLI_PING_TIMEOUT_MS = 5000;
-/** `mesh wait` default budget (same 5 min as the extension's mesh_wait_all). */
-export declare const CLI_WAIT_TIMEOUT_MS = 300000;
+/** `mesh wait` default budget matches the extension's mesh_wait_all. */
+export declare const CLI_WAIT_TIMEOUT_MS = 3600000;
 /** max records `mesh ledger`/`mesh tail --limit` may print (bound, V5). */
 export declare const CLI_LEDGER_MAX_LIMIT = 200;
 /** default record count for `mesh ledger`. */

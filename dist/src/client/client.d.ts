@@ -104,6 +104,7 @@ export declare function computePeerStatus(lastSeenAt: string | undefined, hasRes
 export interface MeshClientOpts {
     alias?: string;
     rooms?: string[];
+    roomRoles?: Readonly<Record<string, MeshRole>>;
     /** Reservations to declare at hello (persisted identity reload). */
     initialReservations?: FileReservation[];
     runtimeDir?: string;
@@ -238,6 +239,7 @@ export declare class MeshClient extends EventEmitter {
     get connectionError(): string | undefined;
     /** All rooms this client is a member of (re-declared at every hello). */
     get rooms(): readonly string[];
+    get roomRoles(): ReadonlyMap<string, MeshRole>;
     /** activity status thresholds from config. */
     get activityIdleMs(): number;
     /**
@@ -258,9 +260,7 @@ export declare class MeshClient extends EventEmitter {
         alias: string;
         at: string;
     }[];
-    /** cancel every pending awaited mission (e.g. before a reset).
-    *  awaitedMissions is wiped here, so recently-answered missions of past
-    *  batches cannot leak into the next wait_all verdict. */
+    /** Cancel pending replies and clear every mission from the previous batch. */
     cancelAllAwaited(): void;
     /** bound the awaitedMissions history (oldest dropped first). */
     private pruneAwaitedMissions;
@@ -282,9 +282,8 @@ export declare class MeshClient extends EventEmitter {
     * return the honest group summary. The turn is suspended inside this tool
     * call — no sleep, no wasted tokens; inbound replies keep flowing and the
     * batch is delivered right after the result.
-    * snapshot: still-pending missions (awaitTargets) PLUS missions
-    * answered recently (≤ 5 min) that no previous verdict reported yet — a
-    * fast answer that resolved before this call must still be in the summary.
+    * Snapshot every unreported mission, including answers and terminal failures
+    * that arrived before this call. Missing missions remain reportable on retry.
     */
     waitAll(timeoutMs: number, signal?: AbortSignal): Promise<WaitAllSummary>;
     private summarize;

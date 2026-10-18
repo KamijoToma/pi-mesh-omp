@@ -20,7 +20,7 @@ import {
   type MeshPriority,
   type MeshRole,
 } from "../protocol/envelope.js";
-import { encodeFrame, FrameDecoder, sha256 } from "../protocol/frames.js";
+import { encodeFrame, FrameDecoder, FrameSizeError, sha256 } from "../protocol/frames.js";
 import {
   ACK_TIMEOUT_MS,
   ALIAS_RAND_CHARS,
@@ -159,6 +159,7 @@ export function computePeerStatus(
 export interface MeshClientOpts {
   alias?: string;
   rooms?: string[];
+  roomRoles?: Readonly<Record<string, MeshRole>>;
   /** Reservations to declare at hello (persisted identity reload). */
   initialReservations?: FileReservation[];
   runtimeDir?: string;
@@ -220,11 +221,6 @@ const ALIAS_RETRY_DELAY_MS = 250;
 
 /** a reply target stays "handled" for 30 min (duplicates dropped). */
 const HANDLED_REPLY_WINDOW_MS = 1_800_000;
-
-/** a mission answered within this window and not yet reported by a
- *  wait_all verdict still belongs to the current batch — a fast answer
- *  that resolved BEFORE wait_all was called must still appear in it. */
-const RECENT_ANSWER_WINDOW_MS = 300_000; // 5 min
 
 export interface WaitAllSummary {
   status: "complete" | "timeout" | "cancelled";
@@ -337,7 +333,9 @@ export class MeshClient extends EventEmitter {
     this.aliasInternal = normalizeAlias(opts.alias ?? defaultAlias());
     this.initialRooms = opts.rooms ?? [...DEFAULT_CONFIG.rooms];
     this.joinedRooms = new Map();
-    for (const room of this.initialRooms) this.joinedRooms.set(room, "member");
+    for (const room of this.initialRooms) {
+      this.joinedRooms.set(room, opts.roomRoles?.[room] ?? "member");
+    }
     this.runtimeDir = opts.runtimeDir ?? runtimeDir();
     this.config = { ...DEFAULT_CONFIG, ...opts.config, rooms: this.initialRooms };
     this.noReconnect = opts.noReconnect === true;
@@ -373,6 +371,10 @@ export class MeshClient extends EventEmitter {
     return [...this.joinedRooms.keys()];
   }
 
+  get roomRoles(): ReadonlyMap<string, MeshRole> {
+    return this.joinedRooms;
+  }
+
   /** activity status thresholds from config. */
   get activityIdleMs(): number {
     return this.config.activityIdleMs;
@@ -406,15 +408,14 @@ export class MeshClient extends EventEmitter {
 
   // ---- awaited missions (mesh_wait_all) ----
 
-  /** cancel every pending awaited mission (e.g. before a reset).
-  *  awaitedMissions is wiped here, so recently-answered missions of past
-  *  batches cannot leak into the next wait_all verdict. */
+  /** Cancel pending replies and clear every mission from the previous batch. */
   cancelAllAwaited(): void {
     for (const id of [...this.awaitTargets.keys()]) {
-      this.awaitedMissions.delete(id);
       this.pending.cancel(id, "cancelled");
     }
     this.awaitTargets.clear();
+    this.awaitedMissions.clear();
+    this.reportedMissions.clear();
   }
 
   /** bound the awaitedMissions history (oldest dropped first). */
@@ -462,19 +463,15 @@ export class MeshClient extends EventEmitter {
   * return the honest group summary. The turn is suspended inside this tool
   * call — no sleep, no wasted tokens; inbound replies keep flowing and the
   * batch is delivered right after the result.
-  * snapshot: still-pending missions (awaitTargets) PLUS missions
-  * answered recently (≤ 5 min) that no previous verdict reported yet — a
-  * fast answer that resolved before this call must still be in the summary.
+  * Snapshot every unreported mission, including answers and terminal failures
+  * that arrived before this call. Missing missions remain reportable on retry.
   */
   async waitAll(timeoutMs: number, signal?: AbortSignal): Promise<WaitAllSummary> {
     const start = Date.now();
     const deadline = start + Math.max(25, timeoutMs);
-    const now = Date.now();
     const targets = new Set<string>(this.awaitTargets.keys());
-    for (const [id, m] of this.awaitedMissions) {
-      if (m.status !== "answered" || m.at === undefined) continue;
-      if (this.reportedMissions.has(id)) continue;
-      if (now - Date.parse(m.at) <= RECENT_ANSWER_WINDOW_MS) targets.add(id);
+    for (const id of this.awaitedMissions.keys()) {
+      if (!this.reportedMissions.has(id)) targets.add(id);
     }
     const targetList = [...targets];
     if (this.#selection !== null || this.intentionallyClosed) {
@@ -526,6 +523,13 @@ export class MeshClient extends EventEmitter {
         const missing = targetList.filter((id) => this.awaitedMissions.get(id)?.answered !== true);
         if (missing.length === 0) {
           done("complete");
+          return;
+        }
+        if (missing.every((id) => {
+          const status = this.awaitedMissions.get(id)?.status;
+          return status === "expired" || status === "failed";
+        })) {
+          done("timeout");
           return;
         }
         if (Date.now() >= deadline) {
@@ -1408,9 +1412,9 @@ export class MeshClient extends EventEmitter {
     }
   }
 
-  private writeOrQueue(frame: MeshFrame): void {
+  private writeOrQueue(frame: MeshFrame, encoded?: Buffer): void {
     if (this.online && this.socket && !this.socket.destroyed) {
-      this.socket.write(encodeFrame(frame, this.config.maxFrameBytes));
+      this.socket.write(encoded ?? encodeFrame(frame, this.config.maxFrameBytes));
     } else if (this.outbox.length < OUTBOX_FLUSH_CAP) {
       this.outbox.push(frame);
     }
@@ -1507,6 +1511,13 @@ export class MeshClient extends EventEmitter {
       interrupt: opts.interrupt === true ? true : undefined,
       expiresAt,
     });
+    let encoded: Buffer;
+    try {
+      encoded = encodeFrame(frame, this.config.maxFrameBytes);
+    } catch (error) {
+      if (error instanceof FrameSizeError) return { status: "error", reason: "oversized" };
+      throw error;
+    }
 
   // register pending BEFORE write to avoid a reply/registration race
     let pendingPromise: Promise<import("./pending.js").PendingResolution> | null = null;
@@ -1518,7 +1529,7 @@ export class MeshClient extends EventEmitter {
     }
 
     const ackPromise = this.waitAck(frame.id);
-    this.writeOrQueue(frame);
+    this.writeOrQueue(frame, encoded);
     this.ring(frame);
     const ack = await ackPromise;
 
@@ -1678,56 +1689,16 @@ export class MeshClient extends EventEmitter {
   //  - the original msg may carry replyTargets (sender-designated): the
   //    default reply then fans out to ALL of them instead of the sender.
     const designated = original?.replyTargets;
-    const target =
-      replyAll === true
-        ? undefined
-        : to !== undefined
-          ? normalizeAlias(to)
-          : designated !== undefined && designated.length > 0
-            ? undefined
-            : original?.from;
-    if (replyAll !== true && to === undefined && designated !== undefined && designated.length > 0) {
-  // fan-out to the sender-designated targets (bounded, validated at send)
-      if (designated.length > MAX_REPLY_TARGETS) {
-        return { status: "error", msgId, reason: "invalid_frame: bad replyTargets" };
-      }
-      const frame = buildFrame({
-        type: "reply",
-        from: this.alias,
-        room: originalRoom,
-        replyTo: msgId,
-        replyTargets: [...designated],
-        body,
-        refs,
-        receipt: opts.receipt === true ? true : undefined,
-      });
-      const ackPromise = this.waitAck(frame.id);
-      this.writeOrQueue(frame);
-      this.ring(frame);
-      const ack = await ackPromise;
-      if (ack.type === "error") {
-        return { status: "error", msgId: frame.id, reason: ack.code ?? "internal" };
-      }
-      if (ack.status === "dropped_offline") {
-        return { status: "error", msgId: frame.id, reason: "dropped_offline" };
-      }
-      this.sentReplies.add(frame.id);
-      if (this.sentReplies.size > 512) {
-        let dropped = 0;
-        for (const id of this.sentReplies) {
-          if (dropped >= 256) break;
-          this.sentReplies.delete(id);
-          dropped += 1;
-        }
-      }
-      return {
-        status: "delivered",
-        msgId: frame.id,
-        deliveredCount: ack.deliveredCount,
-        totalCount: ack.totalCount,
-      };
+    const replyTargets = replyAll !== true && to === undefined && designated !== undefined && designated.length > 0
+      ? designated
+      : undefined;
+    if (replyTargets !== undefined && replyTargets.length > MAX_REPLY_TARGETS) {
+      return { status: "error", msgId, reason: "invalid_frame: bad replyTargets" };
     }
-    if (replyAll !== true && (target === undefined || !isValidAlias(target))) {
+    const target = replyAll === true || replyTargets !== undefined
+      ? undefined
+      : to !== undefined ? normalizeAlias(to) : original?.from;
+    if (replyAll !== true && replyTargets === undefined && (target === undefined || !isValidAlias(target))) {
       return { status: "error", msgId, reason: "invalid_alias" };
     }
     const frame = buildFrame({
@@ -1736,13 +1707,21 @@ export class MeshClient extends EventEmitter {
       to: target,
       room: originalRoom,
       replyTo: msgId,
+      replyTargets: replyTargets !== undefined ? [...replyTargets] : undefined,
       body,
       refs,
       replyAll: replyAll === true ? true : undefined,
       receipt: opts.receipt === true ? true : undefined,
     });
+    let encoded: Buffer;
+    try {
+      encoded = encodeFrame(frame, this.config.maxFrameBytes);
+    } catch (error) {
+      if (error instanceof FrameSizeError) return { status: "error", msgId, reason: "oversized" };
+      throw error;
+    }
     const ackPromise = this.waitAck(frame.id);
-    this.writeOrQueue(frame);
+    this.writeOrQueue(frame, encoded);
     this.ring(frame);
     const ack = await ackPromise;
     if (ack.type === "error") {

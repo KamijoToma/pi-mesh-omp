@@ -8,6 +8,7 @@ import { sha256 } from "../protocol/frames.js";
 import {
   DEFAULT_AWAIT_REPLY_TIMEOUT_MS,
   DEFAULT_ROOM,
+  DEFAULT_WAIT_ALL_TIMEOUT_MS,
   MAX_AWAIT_REPLY_TIMEOUT_MS,
   MAX_BODY_BYTES,
   MAX_REFS,
@@ -757,7 +758,7 @@ const MESH_WAIT_ALL_PARAMETERS: Record<string, unknown> = {
       type: "number",
       minimum: MIN_AWAIT_REPLY_TIMEOUT_MS,
       maximum: MAX_AWAIT_REPLY_TIMEOUT_MS,
-      description: "How long to wait for all answers (default 300000 = 5 min).",
+      description: `How long to wait for all answers (default ${DEFAULT_WAIT_ALL_TIMEOUT_MS} = 60 min).`,
     },
   },
 };
@@ -867,14 +868,13 @@ async function execMeshWaitAll(
   if (rt === null) return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
   const timeoutMs = Math.min(
     MAX_AWAIT_REPLY_TIMEOUT_MS,
-    Math.max(MIN_AWAIT_REPLY_TIMEOUT_MS, typeof params.timeoutMs === "number" ? params.timeoutMs : 300_000),
+    Math.max(MIN_AWAIT_REPLY_TIMEOUT_MS, typeof params.timeoutMs === "number" ? params.timeoutMs : DEFAULT_WAIT_ALL_TIMEOUT_MS),
   );
   const res = await rt.client.waitAll(timeoutMs, signal);
   const head = `wait_all: ${res.answered}/${res.total} answered${res.status === "timeout" ? " (TIMEOUT)" : res.status === "cancelled" ? " (CANCELLED — ESC)" : ""} after ${formatElapsed(res.elapsedMs)}`;
   const lines = [head];
   for (const a of res.answers) {
-    const body = a.response.replace(/\s+/g, " ").trim();
-    lines.push(`  ✓ @${a.to}: ${body.slice(0, 140)}`);
+    lines.push(`  ✓ @${a.to} (${a.msgId}):\n${a.response}`);
   }
   for (const m of res.missing) {
     const act = rt.client.activityOf(m.to)?.state;
@@ -909,6 +909,7 @@ async function execMeshWaitAll(
     answered: res.answered,
     elapsedMs: res.elapsedMs,
     missing: res.missing,
+    answers: res.answers,
   });
 }
 
@@ -1003,7 +1004,7 @@ export function armReserveTimers(rt: MeshRuntime, patterns: string[], ms: number
 }
 
 /** Clear auto-release timers (release/shutdown). */
-function clearReserveTimers(rt: MeshRuntime, patterns?: string[]): void {
+export function clearReserveTimers(rt: MeshRuntime, patterns?: string[]): void {
   if (rt.reserveTimers === undefined) return;
   for (const [pattern, t] of [...rt.reserveTimers]) {
     if (patterns === undefined || patterns.includes(pattern)) {

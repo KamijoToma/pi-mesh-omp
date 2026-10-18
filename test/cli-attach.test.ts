@@ -7,7 +7,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { MeshClient } from "../src/client/client.js";
 import { MeshIdentity, identityFromClient } from "../src/shared/identity-store.js";
-import { makeTempDirs, startTestBroker, sleep, spawnCli, type CliProcess } from "./helpers.js";
+import { makeTempDirs, startTestBroker, sleep, spawnCli, waitFor, type CliProcess } from "./helpers.js";
 
 const SCRUB_ENV_KEYS = [
   "MESH_BROKER_URL", "MESH_BROKER_TOKEN", "MESH_LISTEN", "MESH_TLS_CERT",
@@ -66,6 +66,17 @@ test("attach --json: receives WITH body, executes stdin commands, NEVER reads", 
     await sleep(600);
     assert.equal(readsSeen.length, 0, "--json must never emit read receipts");
 
+    // Script mode accepts requests longer than the old 30-minute ceiling.
+    peer.once("inbound", (frame) => { void peer.reply(frame.id, "long-timeout-answer"); });
+    proc.child.stdin!.write(JSON.stringify({ ref: "long-timeout", cmd: "send", to: "peer", message: "long-request", awaitReply: true, timeoutMs: 1_800_001 }) + "\n");
+    await waitFor(() => proc?.out.includes('"ref":"long-timeout"') ? true : undefined);
+    const longResultLine = proc.out.split("\n").find((line) => line.includes('"ref":"long-timeout"'));
+    assert.ok(longResultLine);
+    const longResult = JSON.parse(longResultLine);
+    assert.equal(longResult.type, "result");
+    assert.equal(longResult.result.status, "reply");
+    assert.equal(longResult.result.response, "long-timeout-answer");
+
     proc.child.stdin!.write(JSON.stringify({ cmd: "exit" }) + "\n");
     const code = await proc.done;
     assert.equal(code, 0);
@@ -84,7 +95,8 @@ test("attach adoption: dead session identity re-declared with refreshed since + 
   // a "killed" session: persisted identity, never connected
   store.save(identityFromClient("sess-killed-01", {
     alias: "fallen",
-    rooms: ["ops"],
+    rooms: ["ops", "writers"],
+    roomRoles: new Map([["ops", "observer"], ["writers", "member"]]),
     reservations: [{ pattern: "src/fallen.ts", reason: "wip", since: new Date(Date.now() - 20 * 3600_000).toISOString() }],
   }));
   // queue mail for the dead alias: connect it once, then leave
@@ -98,6 +110,7 @@ test("attach adoption: dead session identity re-declared with refreshed since + 
   // an observer verifies the adopted reservations + since
   const observer = new MeshClient({ alias: "observer", runtimeDir: dirs.runtimeDir, rooms: ["ops"] });
   await observer.connect();
+  await observer.join("writers");
   let proc: CliProcess | undefined;
   try {
     const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };
@@ -123,6 +136,14 @@ test("attach adoption: dead session identity re-declared with refreshed since + 
 
     // the queued mail was flushed at hello and rendered (with its body)
     assert.match(proc.out, /mail-for-the-dead/);
+
+    // Adoption keeps per-room permissions, not just membership names.
+    proc.child.stdin!.write(JSON.stringify({ ref: "readonly", cmd: "send", to: "observer", room: "ops", message: "blocked-after-adoption" }) + "\n");
+    proc.child.stdin!.write(JSON.stringify({ ref: "writable", cmd: "send", to: "observer", room: "writers", message: "allowed-after-adoption" }) + "\n");
+    await waitFor(() => proc?.out.includes('"ref":"writable"') ? true : undefined);
+    const results = proc.out.split("\n").filter((line) => line.includes('"ref":')).map((line) => JSON.parse(line));
+    assert.equal(results.find((result) => result.ref === "readonly")?.result?.reason, "observer_readonly");
+    assert.equal(results.find((result) => result.ref === "writable")?.result?.status, "delivered");
 
     proc.interrupt();
     const code = await proc.done;
@@ -156,6 +177,38 @@ test("attach --session unknown exits 2; attach live alias exits 1 (strict)", asy
     await noSession?.cleanup();
     await live?.cleanup();
     await holder.close();
+    await broker.close();
+    dirs.cleanup();
+  }
+});
+
+test("attach --session adopts an explicitly empty room set without rejoining default", async () => {
+  const dirs = makeTempDirs("cli-attach-empty-");
+  const broker = await startTestBroker(dirs.runtimeDir);
+  const observer = new MeshClient({ alias: "observer", runtimeDir: dirs.runtimeDir });
+  await observer.connect();
+  const store = new MeshIdentity(dirs.stateDir);
+  store.save(identityFromClient("empty-session", {
+    alias: "roomless", rooms: [], roomRoles: new Map(), reservations: [],
+  }));
+  let proc: CliProcess | undefined;
+  try {
+    proc = spawnCli(["attach", "--session", "empty-session", "--json"], hermeticEnv({
+      MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir,
+    }));
+    await waitFor(() => proc?.out.includes('"attach-start"') ? true : undefined);
+    const peer = (await observer.status()).peers.find((candidate) => candidate.alias === "roomless");
+    assert.deepEqual(peer?.rooms, []);
+    proc.child.stdin!.write(JSON.stringify({ ref: "roomless-send", cmd: "send", to: "observer", message: "must-not-send" }) + "\n");
+    await waitFor(() => proc?.out.includes('"ref":"roomless-send"') ? true : undefined);
+    const line = proc.out.split("\n").find((entry) => entry.includes('"ref":"roomless-send"'));
+    assert.ok(line);
+    assert.equal(JSON.parse(line).result.reason, "not_in_any_room");
+    proc.child.stdin!.write(JSON.stringify({ cmd: "exit" }) + "\n");
+    assert.equal(await proc.done, 0);
+  } finally {
+    await proc?.cleanup();
+    await observer.close();
     await broker.close();
     dirs.cleanup();
   }

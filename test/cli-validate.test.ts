@@ -32,10 +32,11 @@ test("validateRoom", () => {
 test("validateTimeoutMs: integer within bounds only", () => {
   assert.ok(validateTimeoutMs("30000").ok);
   assert.ok(validateTimeoutMs("25").ok);
+  assert.ok(validateTimeoutMs("3600000").ok);
   assert.ok(!validateTimeoutMs("abc").ok);
   assert.ok(!validateTimeoutMs("1.5").ok);
   assert.ok(!validateTimeoutMs("24").ok); // below MIN (25)
-  assert.ok(!validateTimeoutMs("1800001").ok); // above MAX (30 min)
+  assert.ok(!validateTimeoutMs("3600001").ok); // above MAX (60 min)
 });
 
 test("validateBody: 1..MAX_BODY_BYTES, never silently truncated", () => {

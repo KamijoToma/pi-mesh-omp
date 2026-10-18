@@ -20,12 +20,13 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { nowIso } from "../protocol/frames.js";
-import { isValidReservations, type FileReservation } from "../protocol/envelope.js";
+import { isValidReservations, type FileReservation, type MeshRole } from "../protocol/envelope.js";
+import { ROOM_REGEX } from "./config.js";
 
 export const IDENTITY_FILE_NAME = "identity.json"; // legacy single-file name
 export const IDENTITY_PREFIX = "identity-";
 export const IDENTITY_PENDING_NAME = "identity-pending.json";
-export const IDENTITY_VERSION = 1;
+export const IDENTITY_VERSION = 2;
 /** Persisted reservations older than this are NOT re-declared at hello. */
 export const RESERVATION_TTL_MS = 86_400_000; // 24 h
 /** a /mesh new handoff is only valid for this long. */
@@ -36,6 +37,7 @@ export interface PersistedIdentity {
   sessionId: string;
   alias: string;
   rooms: string[];
+  roomRoles: Record<string, MeshRole>;
   reservations: FileReservation[];
   updatedAt: string;
 }
@@ -46,6 +48,7 @@ export function identityFromClient(
   client: {
     alias: string;
     rooms: readonly string[];
+    roomRoles: ReadonlyMap<string, MeshRole>;
     reservations: readonly FileReservation[];
   },
 ): PersistedIdentity {
@@ -54,6 +57,7 @@ export function identityFromClient(
     sessionId,
     alias: client.alias,
     rooms: [...client.rooms],
+    roomRoles: Object.fromEntries(client.roomRoles),
     reservations: client.reservations.map((r) => ({ ...r })),
     updatedAt: nowIso(),
   };
@@ -81,17 +85,32 @@ export class MeshIdentity {
     return path.join(this.stateDir, IDENTITY_FILE_NAME);
   }
 
-  private parse(raw: string, sessionId: string, ignoreSessionId = false): PersistedIdentity | null {
+  private parse(value: unknown, sessionId: string, ignoreSessionId = false): PersistedIdentity | null {
     try {
-      const value: unknown = JSON.parse(raw);
       if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
       const id = value as Record<string, unknown>;
-      if (id.version !== IDENTITY_VERSION) return null;
+      if (id.version !== 1 && id.version !== IDENTITY_VERSION) return null;
       if (!ignoreSessionId && id.sessionId !== sessionId) return null;
       if (typeof id.alias !== "string" || id.alias === "") return null;
-      const rooms = Array.isArray(id.rooms)
-        ? id.rooms.filter((r): r is string => typeof r === "string")
-        : [];
+      if (!Array.isArray(id.rooms)) return null;
+      const rooms: string[] = [];
+      for (const room of id.rooms) {
+        if (typeof room !== "string" || !ROOM_REGEX.test(room) || rooms.includes(room)) return null;
+        rooms.push(room);
+      }
+      let roomRoles: Record<string, MeshRole>;
+      if (id.version === 1) {
+        // v1 recorded membership only: every historical membership was a member.
+        roomRoles = Object.fromEntries(rooms.map((room) => [room, "member"]));
+      } else {
+        if (id.roomRoles === null || typeof id.roomRoles !== "object" || Array.isArray(id.roomRoles)) return null;
+        const roles = id.roomRoles as Record<string, unknown>;
+        if (Object.keys(roles).length !== rooms.length) return null;
+        for (const room of rooms) {
+          if (!Object.hasOwn(roles, room) || (roles[room] !== "member" && roles[room] !== "observer")) return null;
+        }
+        roomRoles = Object.fromEntries(rooms.map((room) => [room, roles[room] as MeshRole]));
+      }
       const reservations = isValidReservations(id.reservations)
         ? freshReservations(id.reservations)
         : [];
@@ -100,6 +119,7 @@ export class MeshIdentity {
         sessionId,
         alias: id.alias,
         rooms,
+        roomRoles,
         reservations,
         updatedAt: typeof id.updatedAt === "string" ? id.updatedAt : nowIso(),
       };
@@ -110,25 +130,29 @@ export class MeshIdentity {
 
   /**
   * Load the identity belonging to `sessionId`. Returns null when absent,
-  * from another session, malformed, or on an older version — callers then
-  * start fresh (random alias, default rooms, no reservations).
+  * from another session, malformed, or on an unsupported version — callers
+  * then start fresh. Version 1 memberships migrate explicitly to member roles.
   */
   load(sessionId: string): PersistedIdentity | null {
     if (sessionId === "") return null;
     try {
-      const raw = readFileSync(this.pathFor(sessionId), "utf8");
-      return this.parse(raw, sessionId);
+      const stored: unknown = JSON.parse(readFileSync(this.pathFor(sessionId), "utf8"));
+      const id = this.parse(stored, sessionId);
+      if (id !== null && stored !== null && typeof stored === "object" &&
+          "version" in stored && stored.version === 1) this.save(id);
+      return id;
     } catch {
   // fall through to the legacy single-file identity (v0.1.3-v0.1.7)
     }
     try {
-      const raw = readFileSync(this.legacyPath, "utf8");
-      const id = this.parse(raw, sessionId);
+      const stored: unknown = JSON.parse(readFileSync(this.legacyPath, "utf8"));
+      const id = this.parse(stored, sessionId);
       if (id === null) return null;
   // migrate: move the legacy file to the per-session file, then remove it
       try {
         mkdirSync(this.stateDir, { recursive: true });
         renameSync(this.legacyPath, this.pathFor(sessionId));
+        this.save(id);
       } catch {
   // best effort — the legacy file may be re-read next time
       }
@@ -204,7 +228,7 @@ export class MeshIdentity {
         }
         return null;
       }
-      const parsed = this.parse(raw, "", true); // pending carries the OLD sessionId
+      const parsed = this.parse(value, "", true); // pending carries the OLD sessionId
       if (parsed === null) return null;
       const history = Array.isArray(p.history)
         ? p.history.filter((h): h is string => typeof h === "string")
@@ -247,7 +271,8 @@ export class MeshIdentity {
       const sessionId = name.slice(IDENTITY_PREFIX.length, -".json".length);
       if (sessionId === "" || sessionId === "pending") continue; // legacy single file / handoff staging
       try {
-        const id = this.parse(readFileSync(path.join(this.stateDir, name), "utf8"), sessionId);
+        const stored: unknown = JSON.parse(readFileSync(path.join(this.stateDir, name), "utf8"));
+        const id = this.parse(stored, sessionId);
         if (id !== null) {
           identities.push({ ...id, sessionId });
         } else {

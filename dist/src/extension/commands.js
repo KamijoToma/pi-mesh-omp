@@ -8,7 +8,7 @@ import { brokerLockPath, brokerSocketPath } from "../shared/paths.js";
 import { MESH_VERSION } from "../shared/version.js";
 import { attachClientListeners } from "./attach.js";
 import { identityFromClient } from "../shared/identity-store.js";
-import { formatPeerActivity } from "./tools.js";
+import { clearReserveTimers, formatPeerActivity } from "./tools.js";
 import { isOmpHost, reportConnectionError } from "./host.js";
 import { executeTailnetCommand } from "../tailscale/commands.js";
 const HELP_TEXT = [
@@ -233,6 +233,7 @@ async function cmdReset(rt, ctx, pi, getHud, getRuntime, resetActivity) {
     const oldAlias = rt.client.alias;
     rt.markDetached?.();
     rt.stopHold?.();
+    clearReserveTimers(rt);
     // 1. leave the mesh cleanly (alias/rooms/reservations purged at the broker)
     await rt.client.close().catch(() => { });
     if (getRuntime() !== rt)

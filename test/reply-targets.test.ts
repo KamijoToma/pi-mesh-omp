@@ -141,4 +141,34 @@ describe("sender-designated reply targets (replyTo)", () => {
     assert.ok(msg !== undefined);
     assert.deepEqual(msg.replyTargets, ["carol"]);
   });
+
+  it("counts distinct offline targets and never mailboxes replies", async () => {
+    await dave.close();
+    await waitFor(() => broker.state.peers.has("dave") ? undefined : true);
+    const sent = await lead.send({
+      to: "bob", message: "one target offline", replyTo: ["carol", "dave", "carol", "bob"],
+    });
+    assert.equal(sent.status, "delivered");
+    await waitFor(() => framesOf("bob", "msg").some((f) => f.id === sent.msgId) ? true : undefined);
+    const partial = await bob.reply(sent.msgId!, "only carol online");
+    assert.equal(partial.status, "delivered");
+    assert.equal(partial.deliveredCount, 1);
+    assert.equal(partial.totalCount, 2, "duplicates and the replier are excluded, offline dave is included");
+    await waitFor(() => framesOf("carol", "reply").some((f) => f.body === "only carol online") ? true : undefined);
+
+    await carol.close();
+    await waitFor(() => broker.state.peers.has("carol") ? undefined : true);
+    const allOffline = await bob.reply(sent.msgId!, "no targets online");
+    assert.equal(allOffline.status, "error");
+    assert.equal(allOffline.reason, "dropped_offline");
+    await Promise.all([carol.connect(), dave.connect()]);
+    const carolStatus = await carol.status();
+    const daveStatus = await dave.status();
+    assert.ok(carolStatus.peers.some((p) => p.alias === "dave"));
+    assert.ok(daveStatus.peers.some((p) => p.alias === "carol"));
+    assert.equal(framesOf("dave", "reply").some((f) => f.body === "only carol online"), false);
+    for (const alias of ["carol", "dave"]) {
+      assert.equal(framesOf(alias, "reply").some((f) => f.body === "no targets online"), false);
+    }
+  });
 });

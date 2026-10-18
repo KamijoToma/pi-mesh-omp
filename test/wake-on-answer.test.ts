@@ -7,6 +7,8 @@ import { after, before, describe, it } from "node:test";
 import { rmSync } from "node:fs";
 import { MeshClient } from "../src/client/client.js";
 import type { MeshFrame } from "../src/protocol/envelope.js";
+import { registerTools, type MeshRuntime } from "../src/extension/tools.js";
+import type { ExtensionAPI, SessionContext, ToolDefinition } from "../src/extension/pi-types.js";
 import { makeTempDirs, sleep, startTestBroker, waitFor, type TempDirs } from "./helpers.js";
 
 describe("wake-on-answer (LAUNCH missions)", () => {
@@ -114,6 +116,42 @@ describe("wake-on-answer (LAUNCH missions)", () => {
     await waitFor(() => (inboundCount > 0 ? true : undefined));
     assert.equal(inboundCount, 1, "post-verdict answers are injected again");
     lead.removeAllListeners("inbound");
+  });
+
+  it("wait_all returns the complete multiline answer to the model without a duplicate inbound", async () => {
+    lead.cancelAllAwaited();
+    resetPeers();
+    let original: MeshFrame | undefined;
+    carol.on("inbound", (frame: MeshFrame) => {
+      if (frame.type === "msg") original = frame;
+    });
+    let inboundCount = 0;
+    const onInbound = (): void => { inboundCount += 1; };
+    lead.on("inbound", onInbound);
+    try {
+      const tools = new Map<string, ToolDefinition>();
+      registerTools({
+        registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
+      } as unknown as ExtensionAPI, () => ({ client: lead }) as MeshRuntime);
+      await lead.send({
+        to: "carol", message: "complete multiline report", awaitReply: true, block: false, timeoutMs: 30_000,
+      });
+      await waitFor(() => original !== undefined);
+      const waiting = tools.get("mesh_wait_all")!.execute(
+        "complete-report", { timeoutMs: 2000 }, undefined, undefined, {} as SessionContext,
+      );
+      const body = `${"findings ".repeat(40)}\n\`\`\`ts\nconst answer = 42;\n\`\`\`\nFINAL_CRITICAL_RESULT`;
+      assert.equal((await carol.reply(original!.id, body)).status, "delivered");
+      const result = await waiting;
+      assert.ok(result.content.some((part) => part.text.includes(body)));
+      assert.deepEqual(result.details?.answers, [{
+        msgId: original!.id, to: "carol", response: body,
+      }]);
+      assert.equal(inboundCount, 0);
+      assert.equal((await lead.waitAll(50)).total, 0);
+    } finally {
+      lead.removeListener("inbound", onInbound);
+    }
   });
 
   it("an identical re-sent answer after wake injection is deduped; a different body still passes", async () => {

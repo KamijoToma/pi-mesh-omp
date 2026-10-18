@@ -9,7 +9,8 @@ import {
   evaluatePolicy,
   loadPolicy,
 } from "../src/broker/policy.js";
-import { DEFAULT_RATE_LIMITS } from "../src/broker/ratelimit.js";
+import { checkRate, DEFAULT_RATE_LIMITS } from "../src/broker/ratelimit.js";
+import { BrokerState } from "../src/broker/state.js";
 import { makeTempDirs } from "./helpers.js";
 
 describe("policy: evaluatePolicy", () => {
@@ -108,6 +109,34 @@ describe("policy: loadPolicy", () => {
     assert.equal(p.rateLimits.msgPerMin, 3);
     assert.equal(p.rateLimits.urgentPerMin, DEFAULT_RATE_LIMITS.urgentPerMin);
     assert.equal(p.rateLimits.forcePerMin, DEFAULT_RATE_LIMITS.forcePerMin);
+  });
+
+  it("invalid fractional limits fall back and never reject the first message", (t) => {
+    const dirs = makeTempDirs();
+    t.after(() => dirs.cleanup());
+    for (const invalid of [0.5, 1.5, 0, -1, "3", null, Number.MAX_SAFE_INTEGER + 1]) {
+      writeFileSync(path.join(dirs.stateDir, "policy.json"), JSON.stringify({
+        rateLimits: { msgPerMin: invalid, urgentPerMin: invalid, forcePerMin: invalid },
+      }));
+      const policy = loadPolicy(dirs.stateDir, {});
+      assert.deepEqual(policy.rateLimits, DEFAULT_RATE_LIMITS);
+      for (const kind of ["msg", "urgent", "force"] as const) {
+        assert.equal(checkRate(new BrokerState(), "alice", kind, policy.rateLimits), true, `${kind}: ${invalid}`);
+      }
+    }
+  });
+
+  it("valid integer policy limits bound actual sends", (t) => {
+    const dirs = makeTempDirs();
+    t.after(() => dirs.cleanup());
+    writeFileSync(path.join(dirs.stateDir, "policy.json"), JSON.stringify({
+      rateLimits: { msgPerMin: 1 },
+    }));
+    const policy = loadPolicy(dirs.stateDir, {});
+    const state = new BrokerState();
+    const now = Date.now();
+    assert.equal(checkRate(state, "alice", "msg", policy.rateLimits, now), true);
+    assert.equal(checkRate(state, "alice", "msg", policy.rateLimits, now), false);
   });
 
   it("parses allow/deny/forceAllowedFrom/forceDowngrade from file", (t) => {

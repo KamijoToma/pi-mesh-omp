@@ -48,11 +48,11 @@ export const RECONNECT_MAX_MS = 5_000;
 export const OUTBOX_FLUSH_CAP = 50;
 
 // ---- awaitReply ----
-export const DEFAULT_AWAIT_REPLY_TIMEOUT_MS = 1_800_000; // 30 min — missions run long;
-// a short default (was 10 min) made orchestration "expire" while agents were
-// still working, which triggered re-sends and duplicate replies.
+export const DEFAULT_AWAIT_REPLY_TIMEOUT_MS = 3_600_000; // 60 min — missions run long.
+// Generous mission waits avoid re-sends while agents are still working.
+export const DEFAULT_WAIT_ALL_TIMEOUT_MS = 3_600_000; // 60 min
 export const MIN_AWAIT_REPLY_TIMEOUT_MS = 25;
-export const MAX_AWAIT_REPLY_TIMEOUT_MS = 1_800_000; // 30 min
+export const MAX_AWAIT_REPLY_TIMEOUT_MS = 3_600_000; // 60 min
 export const MAX_REMINDS = 2;
 
 // ---- ensureBroker ----
@@ -82,7 +82,7 @@ export const PROVIDER_MODEL_WATCH_MS = 500;
 /** last N ledger lines printed by `mesh tail` (no -f yet — Phase 3). */
 export const CLI_TAIL_LINES = 20;
 /** default `mesh send --await` timeout: a one-shot CLI script must not hang
- * for the 30-min mission default — long awaits belong to a live session. */
+ * for the 60-min mission default — long awaits belong to a live session. */
 export const CLI_SEND_TIMEOUT_MS = 30_000;
 /** how long `mesh reserve` keeps its claim alive before closing: long enough
  * for peers to receive the reservation broadcast, short enough that the
@@ -91,8 +91,8 @@ export const CLI_RESERVE_GRACE_MS = 1_500;
 /** `mesh ping` await budget: short by design — liveness probing must not hang
  * for the send default; peer turns often take longer, expired ≠ down. */
 export const CLI_PING_TIMEOUT_MS = 5_000;
-/** `mesh wait` default budget (same 5 min as the extension's mesh_wait_all). */
-export const CLI_WAIT_TIMEOUT_MS = 300_000;
+/** `mesh wait` default budget matches the extension's mesh_wait_all. */
+export const CLI_WAIT_TIMEOUT_MS = DEFAULT_WAIT_ALL_TIMEOUT_MS;
 /** max records `mesh ledger`/`mesh tail --limit` may print (bound, V5). */
 export const CLI_LEDGER_MAX_LIMIT = 200;
 /** default record count for `mesh ledger`. */
@@ -286,8 +286,8 @@ function clampFrameBytes(n: number): number {
 }
 
 function positiveInt(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0
-    ? Math.floor(value)
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? value
     : fallback;
 }
 
@@ -295,7 +295,7 @@ function envInt(env: NodeJS.ProcessEnv, key: string): number | undefined {
   const raw = env[key];
   if (raw === undefined || raw.trim() === "") return undefined;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+  return Number.isSafeInteger(n) && n > 0 ? n : undefined;
 }
 export function isMeshId(value: unknown): value is string {
   return typeof value === "string" && ROOM_REGEX.test(value);
@@ -384,6 +384,7 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
     ? 0
     : positiveInt(fileCfg.reservationTtlMs, DEFAULT_CONFIG.reservationTtlMs),
   watchdog: fileCfg.watchdog === false ? false : true,
+  interruptReceipts: fileCfg.interruptReceipts !== false,
   watchdogSpikeBytes: positiveInt(
     fileCfg.watchdogSpikeBytes ?? DEFAULT_CONFIG.watchdogSpikeBytes,
     DEFAULT_CONFIG.watchdogSpikeBytes ?? DEFAULT_WATCHDOG_SPIKE_BYTES,
@@ -495,14 +496,17 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
   if (env.MESH_RESERVATION_TTL_MS === "0") cfg.reservationTtlMs = 0;
   if (env.MESH_WATCHDOG === "0" || env.MESH_WATCHDOG === "false") cfg.watchdog = false;
   if (env.MESH_INTERRUPT_RECEIPTS === "0" || env.MESH_INTERRUPT_RECEIPTS === "false") cfg.interruptReceipts = false;
+  if (env.MESH_INTERRUPT_RECEIPTS === "1" || env.MESH_INTERRUPT_RECEIPTS === "true") cfg.interruptReceipts = true;
   if (env.MESH_CONTEXT_VERBOSE === "1" || env.MESH_CONTEXT_VERBOSE === "true") cfg.contextVerbosity = "full";
   if (env.MESH_INBOUND_BROADCASTS === "immediate" || env.MESH_INBOUND_BROADCASTS === "deferred") {
     cfg.inboundBroadcasts = env.MESH_INBOUND_BROADCASTS;
   }
   if (env.MESH_INBOUND_BATCH_MS !== undefined) {
     const n = Number(env.MESH_INBOUND_BATCH_MS);
-    cfg.inboundBatchMs = Number.isFinite(n) && n >= 0 ? Math.floor(n) : cfg.inboundBatchMs;
+    if (env.MESH_INBOUND_BATCH_MS.trim() !== "" && Number.isSafeInteger(n) && n >= 0) cfg.inboundBatchMs = n;
   }
+  const envMaxHold = envInt(env, "MESH_INBOUND_BATCH_MAX_HOLD_MS");
+  if (envMaxHold !== undefined) cfg.inboundBatchMaxHoldMs = envMaxHold;
   if (env.MESH_DEBUG === "1" || env.MESH_DEBUG === "true") cfg.debug = true;
   const envTranscript = env.MESH_TRANSCRIPT;
   if (envTranscript !== undefined) cfg.transcript = envTranscript === "1" || envTranscript === "true";

@@ -57,7 +57,7 @@ duplicates, loops and confusion.
   your rooms.
 - `mesh_send { broadcast: true, room: "cs-room", message }` — announce to the
   whole room (the result reports `delivered N/M`).
-- `awaitReply: true` waits for an answer (30 min default timeout).
+- `awaitReply: true` waits for an answer (60 min default and maximum timeout).
 - **`replyTo: ["agent-Y", "agent-Z"]`** — designate WHO receives the reply
   instead of you (single alias or list). The recipient's plain `mesh_reply`
   then goes to ALL of them. Include yourself in the list if you also want the
@@ -94,12 +94,14 @@ duplicates, loops and confusion.
    lands as a `[mesh]` reply event** (an idle session wakes; keep working
    in the meantime) and lands in the inbox, so it can be replied to.
 2. **`mesh_wait_all { timeoutMs }`** — the turn is suspended INSIDE the
-   tool call (no sleep, no polling). It returns the honest group verdict:
-   who answered (with the answer), who is missing. Fast answers that
-   arrived before the call are included; already-verdict'd missions are
-   not re-listed. While it runs, answers are carried by the verdict (not
-   injected again). Reach for it only when you must collect the whole
-   batch before continuing.
+   tool call (no sleep, no polling; default and maximum wait: 60 min).
+   It returns the honest group verdict: who answered (with complete,
+   multiline answers), who is missing. Answers arriving before the call
+   are included; already-reported answers are not re-listed. Expired/failed
+   missions remain missing, including those that settled before the call;
+   a batch containing only terminal missing missions returns immediately.
+   While it runs, answers are carried by the verdict, not injected again.
+   Reach for it only when you must collect the whole batch before continuing.
 3. **ESC cancels a pending `mesh_wait_all`** — the verdict says
    `(CANCELLED — ESC)` and reports NOTHING: the missions stay reportable,
    so a later `mesh_wait_all` re-lists them. Use it to abort a long wait

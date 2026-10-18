@@ -128,5 +128,7 @@ export declare function formatPeerActivity(peer: {
 }, idleMs: number, stuckMs: number, now?: number): string;
 /** Arm one auto-release timer per freshly reserved pattern. */
 export declare function armReserveTimers(rt: MeshRuntime, patterns: string[], ms: number): void;
+/** Clear auto-release timers (release/shutdown). */
+export declare function clearReserveTimers(rt: MeshRuntime, patterns?: string[]): void;
 export declare function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void;
 export { MAX_BODY_BYTES };

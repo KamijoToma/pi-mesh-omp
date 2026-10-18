@@ -16,7 +16,7 @@ import readline from "node:readline/promises";
 import { say, sayErr, jsonLine, colorizeSender, useColor, dim } from "../out.js";
 import { EXIT_OK, EXIT_MESH_FAILURE, EXIT_USAGE } from "../codes.js";
 import { MeshClient } from "../../client/client.js";
-import { ALIAS_RAND_CHARS, ATTACH_BULK_READ_THRESHOLD, DEFAULT_ROOM, STANDALONE_ALIAS_PREFIX } from "../../shared/config.js";
+import { ALIAS_RAND_CHARS, ATTACH_BULK_READ_THRESHOLD, DEFAULT_ROOM, DEFAULT_WAIT_ALL_TIMEOUT_MS, MIN_AWAIT_REPLY_TIMEOUT_MS, MAX_AWAIT_REPLY_TIMEOUT_MS, STANDALONE_ALIAS_PREFIX } from "../../shared/config.js";
 import { resolveCliConfig } from "../ctx.js";
 import { MeshIdentity } from "../../shared/identity-store.js";
 import { stateDir } from "../../shared/paths.js";
@@ -47,7 +47,7 @@ function resolveIdentity(opts) {
         }
         // no persisted identity: a fresh strict standalone under that name
         // (still joins the default room — see the no-arg case)
-        return { kind: "fresh", alias, rooms: [DEFAULT_ROOM], reservations: [], sessionId: undefined };
+        return { kind: "fresh", alias, rooms: [DEFAULT_ROOM], roomRoles: { [DEFAULT_ROOM]: "member" }, reservations: [], sessionId: undefined };
     }
     return {
         kind: "fresh",
@@ -55,6 +55,7 @@ function resolveIdentity(opts) {
         // a peer in NO room can neither receive nor send (not_in_any_room) —
         // a fresh standalone joins the default room like any session would
         rooms: [DEFAULT_ROOM],
+        roomRoles: { [DEFAULT_ROOM]: "member" },
         reservations: [],
     };
 }
@@ -65,6 +66,7 @@ function refresh(id) {
     return {
         alias: id.alias,
         rooms: [...id.rooms],
+        roomRoles: { ...id.roomRoles },
         reservations: id.reservations.map((r) => ({ ...r, since: nowIso() })),
     };
 }
@@ -108,6 +110,7 @@ export async function cmdAttach(opts) {
     const client = new MeshClient({
         alias: identity.alias,
         rooms,
+        roomRoles: identity.roomRoles,
         initialReservations: identity.reservations.length > 0 ? identity.reservations : undefined,
         strictAlias: opts.alias !== undefined || opts.sessionId !== undefined,
         onFrame: (f) => {
@@ -312,8 +315,8 @@ async function runCommand(client, cmd) {
                 throw new Error("send: force requires a reason (hashed, never persisted)");
             }
             const timeoutMs = typeof cmd.timeoutMs === "number" ? cmd.timeoutMs : undefined;
-            if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 25 || timeoutMs > 1_800_000)) {
-                throw new Error("send: timeoutMs out of bounds (25..1800000)");
+            if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < MIN_AWAIT_REPLY_TIMEOUT_MS || timeoutMs > MAX_AWAIT_REPLY_TIMEOUT_MS)) {
+                throw new Error(`send: timeoutMs out of bounds (${MIN_AWAIT_REPLY_TIMEOUT_MS}..${MAX_AWAIT_REPLY_TIMEOUT_MS})`);
             }
             // refs: array (normalized through the same table) or csv string
             let refs;
@@ -386,7 +389,7 @@ async function runCommand(client, cmd) {
             return { released: "released" in r ? r.released : [] };
         }
         case "wait": {
-            const summary = await client.waitAll(typeof cmd.timeoutMs === "number" ? cmd.timeoutMs : 300_000);
+            const summary = await client.waitAll(typeof cmd.timeoutMs === "number" ? cmd.timeoutMs : DEFAULT_WAIT_ALL_TIMEOUT_MS);
             return { verdict: summary };
         }
         case "exit":

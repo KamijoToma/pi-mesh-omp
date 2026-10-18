@@ -16,6 +16,7 @@ export declare class FrameDecoder {
     private readonly maxBytes;
     private buf;
     private bufBytes;
+    private readonly decoder;
     constructor(maxBytes: number);
     /** Feed a chunk; returns complete lines (without trailing \n). */
     push(chunk: Buffer | string): string[];

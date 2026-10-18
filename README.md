@@ -57,8 +57,12 @@ upstream npm package.
   Each answer is ALSO delivered to the session as a `[mesh]` reply event
   (wake-on-answer): an idle sender wakes the moment a mission is answered,
   and the answer frame lands in the inbox so it can itself be replied to.
-  While a `mesh_wait_all` is in flight the verdict carries the batch instead
-  (no double delivery). A blocking `mesh_send` (default) can be aborted with
+  While a `mesh_wait_all` is in flight the verdict carries the complete,
+  multiline answers instead (no double delivery or model-visible truncation).
+  Expired or failed missions remain listed as missing even if they settle
+  before the wait starts; a batch with only terminal missing missions returns
+  immediately rather than reporting a false success.
+  A blocking `mesh_send` (default) can be aborted with
   ESC — the pending settles immediately as `cancelled` and a late reply is
   still injected.
 - **Inbound batching** — bursts are held while the agent is busy (long tool
@@ -73,9 +77,9 @@ upstream npm package.
 - **File reservations** — claim repo paths before editing; other agents'
   `edit`/`write` calls on those paths are blocked with the holder's name.
   Reservations live with the connection and expire via TTL.
-- **Identity persistence** — alias, rooms and reservations survive `/reload`
-  (one file per pi session, never overwritten); `/mesh new` and pi `fork`
-  hand the identity over; `/mesh reset` factory-resets in place.
+- **Identity persistence** — alias, room membership/roles and reservations
+  survive resume and `/reload` (one file per pi session); `/mesh new` and pi
+  `fork` hand the identity over; `/mesh reset` factory-resets in place.
 - **Multi-machine** — TCP/TLS broker with a shared token; everything works
   unchanged across machines (VPS, LAN, Tailscale…).
 - **Tailnet discovery (unreleased)** — opt-in Tailscale Services or exact
@@ -430,6 +434,20 @@ Precedence: defaults < config file < environment.
   "inboundBatchMs": 250, "inboundBatchMaxHoldMs": 30000 }
 ```
 
+Task `awaitReply` and group `mesh_wait_all` waits default to **60 minutes**,
+with the same 60-minute maximum. CLI `wait` and the persistent `attach` wait
+command use that group default. One-shot CLI `send --await` still defaults to
+30 seconds and `ping` to 5 seconds; protocol ACK/handshake deadlines and
+force authorization/rate limits are unchanged.
+
+Integer settings require safe integers: positive values unless a setting
+explicitly supports zero (`reservationTtlMs` disables expiry, `inboundBatchMs`
+disables batching). Invalid file values fall back to defaults; invalid
+environment values preserve the file setting.
+`MESH_INBOUND_BATCH_MAX_HOLD_MS` overrides the batch hold cap.
+`interruptReceipts` works in the file, while `MESH_INTERRUPT_RECEIPTS=0/false`
+or `1/true` overrides it.
+
 ### Deferring unrelated broadcasts
 
 Set `"inboundBroadcasts": "deferred"` or `MESH_INBOUND_BROADCASTS=deferred`
@@ -458,6 +476,22 @@ already handed to Pi remain queued for the next successful prompt, not
 re-sent by flush. Deferred state is session-local and cleared on reset,
 host/session replacement or shutdown; `/mesh reload` transfers it to the new
 implementation. Use the existing mesh history for older frames.
+
+### Unreleased reliability fixes
+
+- Increased task and group wait defaults and maximum waits to 60 minutes,
+  including CLI attach's scripted timeout validation.
+- Preserved UTF-8 characters split across socket chunks; reject oversized
+  JSON-encoded sends/replies before creating pending missions or ACK waiters.
+- Return complete multiline answers to the model from `mesh_wait_all`;
+  retain early expired/failed missions in missing verdicts.
+- Enforce observer/read-only room permissions for all replies, apply force
+  downgrade to broadcasts, and include offline designated reply targets in
+  delivery totals.
+- Preserve empty memberships and per-room roles through resume, handoff and
+  CLI adoption; cancel outgoing auto-release deadlines on identity reset.
+- Honor receipt file configuration and the batch max-hold environment
+  override; reject fractional integer settings instead of rounding to zero.
 
 ### v0.7.2-omp.3
 
@@ -586,18 +620,21 @@ new [--history] · reset · log [on|off] · ping <alias> · broker · help`.
   Alias, reservations and the selected room survive reconnect/resume/reload;
   messages without an explicit room then use `ops`.
 - `/mesh new [--history]` opens a fresh pi session like `/new` but hands
-  over the mesh identity (alias, rooms, reservations; `--history` also
+  over the mesh identity (alias, rooms and roles, reservations; `--history` also
   transfers the last 30 mesh frames as context). Stale handoffs expire
   after 15 min.
 - `/mesh reset` factory-resets the identity of the CURRENT session (fresh
-  alias, default rooms, no reservations) without leaving it; `/reload`
-  preserves the identity.
-- **Identity survives `/reload`**: alias, rooms and reservations are
+  alias, default rooms, no reservations or old auto-release timers) without
+  leaving it; `/reload` preserves the identity.
+- **Identity survives `/reload`**: alias, rooms/roles and reservations are
   persisted in `<stateDir>/identity-<sessionId>.json` — one file per pi
   session, stable across reloads, sessions sharing a stateDir never
   overwrite each other. Stale persisted reservations older than 24 h are
   dropped at load; if a crashed session still holds the alias, the client
   falls back to a random one (notified + persisted) instead of looping.
+  Version 2 identity files also preserve an explicitly empty room set. Older
+  v1 files migrate on load with `member` roles, since they did not record
+  roles; reapply any historical observer selection once after migration.
 - **HUD**: one live, non-wrapping row above the editor, for example
   `mesh ● peers:7 · agent-22c8b9`. `●`/`◐`/`○` mean connected/connecting/offline;
   connecting and offline states hide stale peer counts. The count includes only
@@ -799,6 +836,8 @@ must be removed before a saved selection can take effect.
   deleted after consumption.
 - **Bounds**: frame 64 KiB, body 32 KiB, mailbox 100/1 h, reminds ≤ 2,
   16 rooms/peer, 64 peers/room — every bound is a named constant.
+  The frame limit includes JSON escaping and metadata, so an otherwise valid
+  body can return `oversized` without being transmitted.
 - **Broker down** → tools answer `blocked{broker_unavailable}`, never crash.
 - **Turn state** is announced by each session (busy on the first tool call,
   idle when the run settles) and shared with the room; peers without

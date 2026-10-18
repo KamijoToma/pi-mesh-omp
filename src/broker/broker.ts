@@ -217,14 +217,13 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
   /** replyTargets — fan the answer out to the designated aliases (online
   *  only, like every reply). Ack carries deliveredCount/totalCount. */
   const routeReplyTargets = (from: PeerRecord, frame: MeshFrame): void => {
-    const targets = frame.replyTargets ?? [];
+    const targets = new Set(frame.replyTargets ?? []);
     const writes: Promise<boolean>[] = [];
-    let total = 0;
+    const total = targets.size - (targets.has(from.alias) ? 1 : 0);
     for (const alias of targets) {
       if (alias === from.alias) continue;
       const t = state.peers.get(alias);
       if (t !== undefined && t.helloDone && !t.socket.destroyed) {
-        total += 1;
         const target = t;
         writes.push(
           new Promise<boolean>((resolve) => {
@@ -378,6 +377,12 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
         sendError(from.socket, decision.code, frame.id);
         return;
       }
+      const routedFrame = decision.action === "downgrade"
+        ? { ...frame, priority: "urgent" as const, interrupt: undefined }
+        : frame;
+      const interruptStatus = decision.action === "downgrade"
+        ? "force_downgraded"
+        : priority === "force" ? "force_accepted" : undefined;
   // deliver to every member: online → socket, offline-known → mailbox
       const writes: Promise<boolean>[] = [];
       let total = 0;
@@ -390,13 +395,13 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
           const target = t;
           writes.push(
             new Promise<boolean>((resolve) => {
-              writeFrame(target.socket, frame, config.maxFrameBytes, (ok) => {
+              writeFrame(target.socket, routedFrame, config.maxFrameBytes, (ok) => {
                 if (ok) {
                   resolve(true);
                 } else {
   // identity guard — a re-hello may have replaced the record.
                   if (state.peers.get(target.alias) === target) closePeer(state, target.alias, "write_failure");
-                  notifyDropped(enqueueMailbox(state, config, target.alias, frame));
+                  notifyDropped(enqueueMailbox(state, config, target.alias, routedFrame));
                   queued += 1;
                   resolve(false);
                 }
@@ -404,7 +409,7 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
             }),
           );
         } else if (state.knownAliases.has(alias)) {
-          notifyDropped(enqueueMailbox(state, config, alias, frame));
+          notifyDropped(enqueueMailbox(state, config, alias, routedFrame));
           queued += 1;
         }
       }
@@ -413,7 +418,7 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
         state.stats.relayed += delivered;
         const status: "delivered" | "queued_offline" =
           delivered > 0 ? "delivered" : "queued_offline";
-        sendAck(from, frame.id, status, undefined, delivered, total);
+        sendAck(from, frame.id, status, interruptStatus, delivered, total);
       });
       return;
     }
@@ -553,7 +558,20 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
         broadcastReservations(state, peer, sendTo);
         sendAck(peer, frame.id, "ok");
         break;
-      case "reply":
+      case "reply": {
+        // Replies may target peers in other rooms (including one-shot CLI
+        // replies), but the sender must be allowed to speak in this room.
+        const room = frame.room ?? DEFAULT_ROOM;
+        if (!peer.rooms.has(room)) {
+          state.stats.refused += 1;
+          sendError(peer.socket, "not_member", frame.id);
+          break;
+        }
+        if (peer.rooms.get(room) === "observer") {
+          state.stats.refused += 1;
+          sendError(peer.socket, "observer_readonly", frame.id);
+          break;
+        }
   // replies are messages too — rate-limit them so a
   // confirmation ping-pong cannot spam without bound.
         if (!checkRate(state, peer.alias, "msg", policy.rateLimits)) {
@@ -564,6 +582,7 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
         else if (frame.replyTargets !== undefined) routeReplyTargets(peer, frame);
         else routeOnlineOnly(peer, frame, false);
         break;
+      }
       case "remind":
         routeOnlineOnly(peer, frame, true);
         break;

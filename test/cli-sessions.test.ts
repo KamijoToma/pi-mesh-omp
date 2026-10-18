@@ -48,8 +48,8 @@ test("sessions lists identities with live status, skips corrupt files, writes no
   await live.connect();
   // two persisted identities: one alive (same alias), one dead + one corrupt
   const store = new MeshIdentity(dirs.stateDir);
-  store.save(identityFromClient("sess-alive-0001", { alias: "dead-or-alive", rooms: ["default"], reservations: [] }));
-  store.save(identityFromClient("sess-dead-0002", { alias: "ghost-agent", rooms: ["ops"], reservations: [{ pattern: "src/x.ts", reason: "wip", since: new Date().toISOString() }] }));
+  store.save(identityFromClient("sess-alive-0001", { alias: "dead-or-alive", rooms: ["default"], roomRoles: new Map([["default", "member"]]), reservations: [] }));
+  store.save(identityFromClient("sess-dead-0002", { alias: "ghost-agent", rooms: ["ops"], roomRoles: new Map([["ops", "observer"]]), reservations: [{ pattern: "src/x.ts", reason: "wip", since: new Date().toISOString() }] }));
   writeFileSync(path.join(dirs.stateDir, "identity-sess-bad-0003.json"), "{not json");
   try {
     const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };

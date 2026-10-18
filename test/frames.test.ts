@@ -75,22 +75,35 @@ describe("frames: size bounds", () => {
     const dec = new FrameDecoder(64);
     assert.throws(() => dec.push(Buffer.from("x".repeat(65), "utf8")), FrameSizeError);
   });
+
+  it("counts incomplete multibyte bytes toward the partial frame limit", () => {
+    const dec = new FrameDecoder(2);
+    const bytes = Buffer.from("😀");
+    assert.deepEqual(dec.push(bytes.subarray(0, 2)), []);
+    assert.throws(() => dec.push(bytes.subarray(2, 3)), FrameSizeError);
+  });
 });
 
 describe("frames: UTF-8 multibyte at chunk boundary", () => {
-  it("multibyte chars split at a codepoint boundary decode intact", () => {
-    const f = buildFrame({ type: "msg", from: "alice", to: "bob", body: "héllo—✓—münchen" });
+  it("preserves exact body and hash at every byte split inside UTF-8 characters", () => {
+    const body = "héllo—✓—münchen 😀 中文";
+    const f = buildFrame({ type: "msg", from: "alice", to: "bob", body });
     const buf = encodeFrame(f, MAX);
-    // find a split index that is a UTF-8 codepoint boundary (not a continuation byte)
-    let split = Math.floor(buf.length / 2);
-    while (split < buf.length && (buf[split]! & 0xc0) === 0x80) split += 1;
-    const dec = new FrameDecoder(MAX);
-    assert.deepEqual(dec.push(buf.subarray(0, split)), []);
-    const lines = dec.push(buf.subarray(split));
-    assert.equal(lines.length, 1);
-    const parsed = parseFrameLine(lines[0]!);
-    assert.equal(parsed.ok, true);
-    if (parsed.ok) assert.equal(parsed.frame.body, "héllo—✓—münchen");
+    const bodyStart = buf.indexOf(Buffer.from(body));
+    assert.ok(bodyStart >= 0);
+    for (let split = bodyStart + 1; split < bodyStart + Buffer.byteLength(body); split += 1) {
+      if ((buf[split]! & 0xc0) !== 0x80) continue;
+      const dec = new FrameDecoder(MAX);
+      assert.deepEqual(dec.push(buf.subarray(0, split)), []);
+      const lines = dec.push(buf.subarray(split));
+      assert.equal(lines.length, 1);
+      const parsed = parseFrameLine(lines[0]!);
+      assert.equal(parsed.ok, true, `split at byte ${split}`);
+      if (parsed.ok) {
+        assert.equal(parsed.frame.body, body);
+        assert.equal(parsed.frame.bodyHash, sha256(body));
+      }
+    }
   });
 });
 

@@ -57,4 +57,52 @@ describe("loadConfig v0.5 defaults", () => {
       cleanup();
     }
   });
+
+  it("interrupt receipts honor file opt-out and explicit environment overrides", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      assert.equal(loadConfig(dir, {}).interruptReceipts, true);
+      for (const value of [false, true]) {
+        writeFileSync(path.join(dir, "config.json"), JSON.stringify({ interruptReceipts: value }));
+        assert.equal(loadConfig(dir, {}).interruptReceipts, value);
+        assert.equal(loadConfig(dir, { MESH_INTERRUPT_RECEIPTS: "invalid" }).interruptReceipts, value);
+        for (const raw of ["1", "true"]) {
+          assert.equal(loadConfig(dir, { MESH_INTERRUPT_RECEIPTS: raw }).interruptReceipts, true);
+        }
+        for (const raw of ["0", "false"]) {
+          assert.equal(loadConfig(dir, { MESH_INTERRUPT_RECEIPTS: raw }).interruptReceipts, false);
+        }
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("rejects fractional integer settings without erasing valid lower layers", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      const defaults = loadConfig(dir, {});
+      const fields = [
+        ["mailboxCap", "MESH_MAILBOX_CAP"],
+        ["mailboxTtlMs", "MESH_MAILBOX_TTL_MS"],
+        ["reservationTtlMs", "MESH_RESERVATION_TTL_MS"],
+        ["activityIdleMs", "MESH_ACTIVITY_IDLE_MS"],
+      ] as const;
+      for (const [field, key] of fields) {
+        for (const invalid of [0.5, 1.5, -1, Number.MAX_SAFE_INTEGER + 1]) {
+          writeFileSync(path.join(dir, "config.json"), JSON.stringify({ [field]: invalid }));
+          assert.equal(loadConfig(dir, {})[field], defaults[field], `${field}: ${invalid}`);
+          writeFileSync(path.join(dir, "config.json"), JSON.stringify({ [field]: 123 }));
+          assert.equal(loadConfig(dir, { [key]: String(invalid) })[field], 123, `${key}: ${invalid}`);
+        }
+        assert.equal(loadConfig(dir, { [key]: "456" })[field], 456);
+      }
+      writeFileSync(path.join(dir, "config.json"), JSON.stringify({ mailboxCap: 0, mailboxTtlMs: 0 }));
+      const cfg = loadConfig(dir, { MESH_MAILBOX_CAP: "0", MESH_MAILBOX_TTL_MS: "0" });
+      assert.equal(cfg.mailboxCap, defaults.mailboxCap);
+      assert.equal(cfg.mailboxTtlMs, defaults.mailboxTtlMs);
+    } finally {
+      cleanup();
+    }
+  });
 });
