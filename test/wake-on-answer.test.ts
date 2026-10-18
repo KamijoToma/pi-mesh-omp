@@ -11,6 +11,8 @@ import { registerTools, type MeshRuntime } from "../src/extension/tools.js";
 import { attachClientListeners } from "../src/extension/attach.js";
 import { MeshLedger } from "../src/extension/ledger.js";
 import { MeshTranscript } from "../src/extension/transcript.js";
+import { MeshGuards } from "../src/extension/guards.js";
+import { MeshIdentity } from "../src/shared/identity-store.js";
 import type { ExtensionAPI, InboundMessage, SendMessageOptions, SessionContext, ToolDefinition, ToolResult } from "../src/extension/pi-types.js";
 import { makeTempDirs, sleep, startTestBroker, waitFor, type TempDirs } from "./helpers.js";
 
@@ -216,12 +218,14 @@ describe("wake-on-answer (LAUNCH missions)", () => {
 });
 
 describe("actionable inbound messages during passive waits", () => {
-  async function fixture() {
+  async function fixture(options: { rejectAttempts?: number; rejectType?: string; batchMs?: number; allowForce?: boolean } = {}) {
     const dirs = makeTempDirs("mesh-wait-inbound-");
-    const broker = await startTestBroker(dirs.runtimeDir);
+    const broker = await startTestBroker(dirs.runtimeDir, options.allowForce ? { policy: { forceAllowedFrom: ["bob"] } } : {});
     const lead = new MeshClient({
       alias: "lead", runtimeDir: dirs.runtimeDir, noReconnect: true,
-      config: { inboundBroadcasts: "deferred" },
+      config: options.batchMs === undefined
+        ? { inboundBroadcasts: "deferred" }
+        : { inboundBroadcasts: "deferred", inboundBatchMs: options.batchMs },
     });
     const carol = new MeshClient({ alias: "carol", runtimeDir: dirs.runtimeDir, noReconnect: true });
     const bob = new MeshClient({ alias: "bob", runtimeDir: dirs.runtimeDir, noReconnect: true });
@@ -229,6 +233,8 @@ describe("actionable inbound messages during passive waits", () => {
     const tools = new Map<string, ToolDefinition>();
     const injected: { message: InboundMessage; options?: SendMessageOptions }[] = [];
     let aborts = 0;
+    let injectionAttempts = 0;
+    let rejections = options.rejectAttempts ?? 0;
     const ctx = {
       cwd: dirs.root, isIdle: () => false, abort: () => { aborts += 1; },
       ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
@@ -237,18 +243,30 @@ describe("actionable inbound messages during passive waits", () => {
       client: lead, ctx, sessionId: "wait-inbound",
       ledger: new MeshLedger(dirs.stateDir),
       transcript: new MeshTranscript(dirs.stateDir, false),
+      guards: new MeshGuards(), identity: new MeshIdentity(dirs.stateDir),
+      stateDir: dirs.stateDir, runtimeDir: dirs.runtimeDir, startedAt: Date.now(),
       ledgerFailures: 0, transcriptFailures: 0, injectionFailures: 0,
     } as MeshRuntime;
     const pi = {
       registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
-      sendMessage: (message: InboundMessage, options?: SendMessageOptions) => injected.push({ message, options }),
+      sendMessage: (message: InboundMessage, deliveryOptions?: SendMessageOptions) => {
+        if (message.customType === (options.rejectType ?? "mesh-inbound")) {
+          injectionAttempts += 1;
+          if (rejections > 0) {
+            rejections -= 1;
+            throw new Error("transient host transition");
+          }
+        }
+        injected.push({ message, options: deliveryOptions });
+      },
       appendEntry: () => {},
     } as unknown as ExtensionAPI;
     registerTools(pi, () => rt);
     attachClientListeners(pi, rt, () => null, ctx, lead, () => {});
     return {
-      lead, carol, bob, rt, tools, injected, ctx,
+      lead, carol, bob, rt, tools, injected, ctx, broker, dirs,
       abortCount: () => aborts,
+      injectionAttempts: () => injectionAttempts,
       async cleanup() {
         rt.markDetached?.();
         await Promise.all([lead.close(), carol.close(), bob.close()]);
@@ -298,6 +316,352 @@ describe("actionable inbound messages during passive waits", () => {
       }
     });
   }
+
+  for (const priority of ["normal", "urgent"] as const) {
+    it(`${priority} input yields mesh_send and its later reply still wakes the session`, { timeout: 10_000 }, async () => {
+      const f = await fixture();
+      try {
+        const oldSignal = new AbortController();
+        let result: ToolResult | undefined;
+        const sending = f.tools.get("mesh_send")!.execute("single-wait", {
+          to: "bob", message: "single pending task", awaitReply: true, timeoutMs: 5000,
+        }, oldSignal.signal, undefined, f.ctx).then((value) => { result = value; return value; });
+        let original: MeshFrame | undefined;
+        await waitFor(() => {
+          original = f.bob.transcript.find((frame) => frame.type === "msg" && frame.body === "single pending task");
+          return original !== undefined;
+        });
+        const incoming = await f.carol.send({ to: "lead", message: "handle new directive", priority });
+        await waitFor(() => result !== undefined, 2000);
+        const yielded = await sending;
+        assert.equal(yielded.details?.status, "interrupted");
+        assert.equal(yielded.details?.interruptedBy, incoming.msgId);
+        assert.equal(yielded.details?.tracked, true);
+        assert.equal(yielded.details?.msgId, original!.id);
+        assert.equal(f.injected.find((item) => item.message.content.includes("handle new directive"))?.options?.deliverAs, "steer");
+        oldSignal.abort();
+        assert.equal(f.lead.pendingCount, 1);
+        assert.equal(f.abortCount(), 0);
+        f.ctx.isIdle = () => true;
+        await f.bob.reply(original!.id, "answer after yielding");
+        await waitFor(() => f.injected.some((item) => item.message.content.includes("answer after yielding")));
+        assert.equal(f.injected.filter((item) => item.message.content.includes("answer after yielding")).length, 1);
+        const resumed = await f.lead.waitAll(1000);
+        assert.equal(resumed.status, "complete");
+        assert.equal(resumed.answers[0]?.response, "answer after yielding");
+      } finally {
+        await f.cleanup();
+      }
+    });
+  }
+
+  for (const name of ["mesh_status", "mesh_reply", "mesh_reserve", "mesh_release"] as const) {
+    it(`${name} yields a delayed control request and later delivers its actual result`, { timeout: 10_000 }, async () => {
+      const f = await fixture();
+      const socket = f.broker.state.peers.get("lead")!.socket;
+      const received: MeshFrame[] = [];
+      f.bob.on("inbound", (frame: MeshFrame) => received.push(frame));
+      try {
+        let params: Record<string, unknown> = {};
+        if (name === "mesh_reply") {
+          const original = await f.bob.send({ to: "lead", message: "reply to this" });
+          await waitFor(() => f.lead.peekInbox(original.msgId!) !== undefined);
+          params = { msgId: original.msgId, message: "reply completed after yielding" };
+        } else if (name === "mesh_reserve") {
+          params = { paths: ["src/yielded.ts"] };
+        } else if (name === "mesh_release") {
+          await f.lead.reserve(["src/yielded.ts"]);
+          params = { paths: ["src/yielded.ts"] };
+        }
+        socket.pause();
+        let result: ToolResult | undefined;
+        const pending = f.tools.get(name)!.execute(name, params, undefined, undefined, f.ctx)
+          .then((value) => { result = value; return value; });
+        const incoming = await f.carol.send({ to: "lead", message: `input during ${name}` });
+        await waitFor(() => result !== undefined, 2000);
+        const yielded = await pending;
+        assert.equal(yielded.details?.status, "interrupted");
+        assert.equal(yielded.details?.interruptedBy, incoming.msgId);
+        assert.equal(yielded.details?.pendingOperation, true);
+        assert.equal(f.rt.pendingToolOperations?.size, 1);
+        assert.equal(f.injected.find((item) => item.message.content.includes(`input during ${name}`))?.options?.deliverAs, "steer");
+        assert.equal(f.abortCount(), 0);
+        socket.resume();
+        await waitFor(() => f.injected.some((item) =>
+          item.message.customType === "mesh-operation-result" && item.message.details?.operationId === name));
+        const completion = f.injected.find((item) => item.message.customType === "mesh-operation-result")!;
+        const details = completion.message.details?.result as Record<string, unknown>;
+        assert.equal(completion.options?.deliverAs, "steer");
+        assert.equal(f.rt.pendingToolOperations?.size, 0);
+        if (name === "mesh_status") {
+          assert.ok((details.peers as { alias: string }[]).some((peer) => peer.alias === "bob"));
+        } else {
+          assert.equal(details.status, "delivered");
+        }
+        if (name === "mesh_reply") {
+          await waitFor(() => received.some((frame) => frame.body === "reply completed after yielding"));
+          assert.equal(received.filter((frame) => frame.body === "reply completed after yielding").length, 1);
+        } else if (name === "mesh_reserve") {
+          assert.ok(f.lead.reservations.some((reservation) => reservation.pattern === "src/yielded.ts"));
+        } else if (name === "mesh_release") {
+          assert.equal(f.lead.reservations.some((reservation) => reservation.pattern === "src/yielded.ts"), false);
+        }
+      } finally {
+        socket.resume();
+        await f.cleanup();
+      }
+    });
+  }
+
+  it("queued input during rename yields the alias tool without losing its final identity", { timeout: 10_000 }, async () => {
+    const f = await fixture();
+    const future = new MeshClient({ alias: "renamed", runtimeDir: f.dirs.runtimeDir, noReconnect: true });
+    try {
+      await future.connect();
+      await future.close();
+      await waitFor(() => !f.carol.knowsPeer("renamed"));
+      const queued = await f.carol.send({ to: "renamed", message: "input during alias handover" });
+      assert.equal(queued.status, "queued_offline");
+      const result = await f.tools.get("mesh_alias")!.execute("rename-operation", { alias: "renamed" }, undefined, undefined, f.ctx);
+      assert.equal(result.details?.status, "interrupted");
+      await waitFor(() => f.injected.some((item) => item.message.customType === "mesh-operation-result"));
+      const completion = f.injected.find((item) => item.message.customType === "mesh-operation-result")!;
+      assert.equal((completion.message.details?.result as Record<string, unknown>).alias, "renamed");
+      assert.equal(f.lead.alias, "renamed");
+      assert.equal(f.injected.find((item) => item.message.content.includes("input during alias handover"))?.options?.deliverAs, "steer");
+      assert.equal(f.abortCount(), 0);
+    } finally {
+      await future.close();
+      await f.cleanup();
+    }
+  });
+
+  it("a yielded control request never injects its completion into a detached session", { timeout: 10_000 }, async () => {
+    const f = await fixture();
+    const socket = f.broker.state.peers.get("lead")!.socket;
+    try {
+      socket.pause();
+      const pending = f.tools.get("mesh_status")!.execute("detached-status", {}, undefined, undefined, f.ctx);
+      await f.carol.send({ to: "lead", message: "yield then detach" });
+      assert.equal((await pending).details?.status, "interrupted");
+      f.rt.markDetached?.();
+      socket.resume();
+      await waitFor(() => f.rt.pendingToolOperations?.size === 0);
+      assert.equal(f.injected.some((item) => item.message.customType === "mesh-operation-result"), false);
+    } finally {
+      socket.resume();
+      await f.cleanup();
+    }
+  });
+
+  for (const mode of ["single", "group"] as const) {
+    it(`an unrelated launch answer reaches the model while a ${mode} wait is active`, { timeout: 10_000 }, async () => {
+      const f = await fixture();
+      try {
+        let original: MeshFrame | undefined;
+        f.bob.on("inbound", (frame: MeshFrame) => {
+          if (frame.body === "different pending task") original = frame;
+        });
+        let waiting: Promise<ToolResult>;
+        if (mode === "single") {
+          waiting = f.tools.get("mesh_send")!.execute("different-send", {
+            to: "bob", message: "different pending task", awaitReply: true, timeoutMs: 5000,
+          }, undefined, undefined, f.ctx);
+        } else {
+          await f.lead.send({ to: "bob", message: "different pending task", awaitReply: true, block: false, timeoutMs: 5000 });
+          waiting = f.tools.get("mesh_wait_all")!.execute("different-group", { timeoutMs: 5000 }, undefined, undefined, f.ctx);
+        }
+        await waitFor(() => original !== undefined);
+        const other = await f.lead.send({ to: "carol", message: "outside the wait snapshot", awaitReply: true, block: false, timeoutMs: 5000 });
+        await waitFor(() => f.carol.peekInbox(other.msgId!) !== undefined);
+        await f.carol.reply(other.msgId!, "independent report is ready");
+        const yielded = await waiting;
+        assert.equal(yielded.details?.status, "interrupted");
+        const report = f.injected.find((item) => item.message.content.includes("independent report is ready"));
+        assert.equal(report?.options?.deliverAs, "steer", "a core-initiated yield must not leave its answer held by busy batching");
+        assert.equal(f.lead.pendingCount, 1);
+        const resumed = f.lead.waitAll(2000);
+        await f.bob.reply(original!.id, "other task finished");
+        assert.equal((await resumed).status, "complete");
+        assert.equal(f.abortCount(), 0);
+      } finally {
+        await f.cleanup();
+      }
+    });
+  }
+
+  it("a late control result steers the current wait even if its original tool signal was aborted", { timeout: 10_000 }, async () => {
+    const f = await fixture();
+    const socket = f.broker.state.peers.get("lead")!.socket;
+    try {
+      socket.pause();
+      const oldSignal = new AbortController();
+      const request = f.tools.get("mesh_status")!.execute("old-status", {}, oldSignal.signal, undefined, f.ctx);
+      await f.carol.send({ to: "lead", message: "yield the old status request" });
+      assert.equal((await request).details?.status, "interrupted");
+      oldSignal.abort();
+      const current = f.lead.send({ to: "bob", message: "current passive wait", awaitReply: true, timeoutMs: 5000 });
+      socket.resume();
+      assert.equal((await current).status, "interrupted");
+      await waitFor(() => f.injected.some((item) => item.message.customType === "mesh-operation-result"));
+      const completion = f.injected.find((item) => item.message.customType === "mesh-operation-result")!;
+      assert.equal(completion.options?.deliverAs, "steer");
+      const result = completion.message.details?.result as Record<string, unknown>;
+      assert.ok((result.peers as { alias: string }[]).some((peer) => peer.alias === "bob"));
+      assert.equal(f.abortCount(), 0);
+    } finally {
+      socket.resume();
+      await f.cleanup();
+    }
+  });
+
+  it("retries a waking directive once instead of silently dropping it", { timeout: 10_000 }, async () => {
+    const f = await fixture({ rejectAttempts: 1 });
+    try {
+      let original: MeshFrame | undefined;
+      f.bob.on("inbound", (frame: MeshFrame) => { if (frame.body === "retry task") original = frame; });
+      const sending = f.tools.get("mesh_send")!.execute("retry-send", {
+        to: "bob", message: "retry task", awaitReply: true, timeoutMs: 5000,
+      }, undefined, undefined, f.ctx);
+      await waitFor(() => original !== undefined);
+      const incoming = await f.carol.send({ to: "lead", message: "directive surviving host rejection" });
+      assert.equal((await sending).details?.status, "interrupted");
+      assert.equal(f.rt.isInboundReloadSafe?.(), false, "reload must not discard the scheduled retry");
+      assert.equal(f.carol.readsOf(incoming.msgId!).length, 0);
+      await waitFor(() => f.injected.some((item) => item.message.content.includes("directive surviving host rejection")));
+      await waitFor(() => f.carol.readsOf(incoming.msgId!).length === 1);
+      assert.equal(f.injectionAttempts(), 2);
+      assert.equal(f.rt.injectionFailures, 0);
+      assert.equal(f.rt.isInboundReloadSafe?.(), true);
+      assert.equal(f.injected.filter((item) => item.message.content.includes("directive surviving host rejection")).length, 1);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("retries a rejected batch atomically and receipts follow actual acceptance", { timeout: 10_000 }, async () => {
+    const f = await fixture({ rejectAttempts: 1, batchMs: 5000 });
+    try {
+      f.ctx.isIdle = () => true;
+      const first = await f.bob.send({ to: "lead", message: "first queued directive" });
+      const second = await f.bob.send({ to: "lead", message: "second queued directive" });
+      await waitFor(() => f.lead.peekInbox(second.msgId!) !== undefined);
+      f.rt.batcher!.flushNow();
+      assert.equal(f.rt.isInboundReloadSafe?.(), false);
+      assert.equal(f.bob.readsOf(first.msgId!).length, 0);
+      assert.equal(f.bob.readsOf(second.msgId!).length, 0);
+      await waitFor(() => f.injected.some((item) => item.message.content.includes("first queued directive")));
+      await waitFor(() => f.bob.readsOf(first.msgId!).length === 1 && f.bob.readsOf(second.msgId!).length === 1);
+      const batch = f.injected.find((item) => item.message.content.includes("first queued directive"))!;
+      assert.ok(batch.message.content.indexOf("first queued directive") < batch.message.content.indexOf("second queued directive"));
+      assert.equal(f.injectionAttempts(), 2);
+      assert.equal(f.rt.injectionFailures, 0);
+      assert.equal(f.rt.isInboundReloadSafe?.(), true);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("counts a final active-session injection failure and releases retry ownership", { timeout: 10_000 }, async () => {
+    const f = await fixture({ rejectAttempts: 2, batchMs: 0 });
+    try {
+      await f.bob.send({ to: "lead", message: "unavailable host" });
+      await waitFor(() => f.rt.injectionFailures === 1);
+      assert.equal(f.injectionAttempts(), 2);
+      assert.equal(f.rt.isInboundReloadSafe?.(), true);
+      assert.equal(f.injected.some((item) => item.message.content.includes("unavailable host")), false);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("provider hold still yields a passive send and keeps the directive until recovery", { timeout: 10_000 }, async () => {
+    const f = await fixture();
+    try {
+      let original: MeshFrame | undefined;
+      f.bob.on("inbound", (frame: MeshFrame) => { if (frame.body === "held task") original = frame; });
+      const sending = f.tools.get("mesh_send")!.execute("held-send", {
+        to: "bob", message: "held task", awaitReply: true, timeoutMs: 5000,
+      }, undefined, undefined, f.ctx);
+      await waitFor(() => original !== undefined);
+      f.rt.rateLimitedUntil = Date.now() + 1_800_000;
+      const incoming = await f.carol.send({ to: "lead", message: "held directive" });
+      assert.equal((await sending).details?.status, "interrupted");
+      assert.equal(f.injected.some((item) => item.message.content.includes("held directive")), false);
+      assert.equal(f.carol.readsOf(incoming.msgId!).length, 0);
+      f.rt.rateLimitedUntil = undefined;
+      f.rt.flushHeld?.();
+      assert.equal(f.injected.find((item) => item.message.content.includes("held directive"))?.options?.deliverAs, "steer");
+      assert.equal(f.abortCount(), 0);
+      const resumed = f.lead.waitAll(2000);
+      await f.bob.reply(original!.id, "held task completed");
+      assert.equal((await resumed).status, "complete");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("authorized force is not delayed by provider hold", { timeout: 10_000 }, async () => {
+    const f = await fixture({ allowForce: true });
+    let aborts = 0;
+    try {
+      f.rt.rateLimitedUntil = Date.now() + 1_800_000;
+      f.ctx.abort = () => { aborts += 1; f.ctx.isIdle = () => true; };
+      const sent = await f.bob.send({ to: "lead", message: "authorized hold override", priority: "force", reason: "explicit operator override" });
+      assert.equal(sent.status, "delivered");
+      await waitFor(() => f.injected.some((item) => item.message.content.includes("authorized hold override")));
+      assert.equal(aborts, 1);
+      assert.ok(f.rt.rateLimitedUntil > Date.now(), "force must not clear the provider protection for ordinary input");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it("a rejected late operation result is retried without rerunning the transaction", { timeout: 10_000 }, async () => {
+    const f = await fixture({ rejectAttempts: 1, rejectType: "mesh-operation-result" });
+    const socket = f.broker.state.peers.get("lead")!.socket;
+    let responses = 0;
+    f.lead.on("frame", (frame: MeshFrame) => { if (frame.type === "status_res") responses += 1; });
+    try {
+      socket.pause();
+      const pending = f.tools.get("mesh_status")!.execute("retried-result", {}, undefined, undefined, f.ctx);
+      await f.carol.send({ to: "lead", message: "yield control request" });
+      assert.equal((await pending).details?.status, "interrupted");
+      socket.resume();
+      await waitFor(() => f.injectionAttempts() === 1);
+      assert.equal(f.rt.pendingToolOperations?.size, 1);
+      await waitFor(() => f.injected.some((item) => item.message.customType === "mesh-operation-result"));
+      const completion = f.injected.find((item) => item.message.customType === "mesh-operation-result")!;
+      assert.ok(((completion.message.details?.result as Record<string, unknown>).peers as { alias: string }[])
+        .some((peer) => peer.alias === "bob"));
+      assert.equal(responses, 1);
+      assert.equal(f.injectionAttempts(), 2);
+      assert.equal(f.rt.pendingToolOperations?.size, 0);
+      assert.equal(f.rt.injectionFailures, 0);
+    } finally {
+      socket.resume();
+      await f.cleanup();
+    }
+  });
+
+  it("a mailbox drop notice survives a transient host rejection", { timeout: 10_000 }, async () => {
+    const f = await fixture({ rejectAttempts: 1 });
+    try {
+      await f.bob.close();
+      await waitFor(() => !f.lead.knowsPeer("bob"));
+      const queued = await f.lead.send({ to: "bob", message: "expiring queue", awaitReply: true, block: false, timeoutMs: 5000 });
+      assert.equal(queued.status, "queued_offline");
+      f.broker.purgeMailboxExpired(Number.MAX_SAFE_INTEGER);
+      await waitFor(() => f.injected.some((item) => item.message.details?.kind === "mesh-drop-notice"));
+      const notice = f.injected.find((item) => item.message.details?.kind === "mesh-drop-notice")!;
+      assert.equal(notice.message.details?.msgId, queued.msgId);
+      assert.equal(f.injectionAttempts(), 2);
+      assert.equal(f.rt.isInboundReloadSafe?.(), true);
+      assert.equal(f.rt.injectionFailures, 0);
+    } finally {
+      await f.cleanup();
+    }
+  });
 
   it("deferred broadcasts and machine receipts do not wake a wait", { timeout: 10_000 }, async () => {
     const f = await fixture();

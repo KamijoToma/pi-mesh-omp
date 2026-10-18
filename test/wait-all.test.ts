@@ -93,8 +93,9 @@ describe("waitAll (D42)", () => {
     lead.cancelAllAwaited();
     bob.removeAllListeners("inbound");
     carol.removeAllListeners("inbound");
+    let original: MeshFrame | undefined;
     carol.on("inbound", (f: MeshFrame) => {
-      if (f.type === "msg") void carol.reply(f.id, "carol launch done");
+      if (f.type === "msg") original = f;
     });
     const t0 = Date.now();
     const r1 = await lead.send({ to: "carol", message: "fast", awaitReply: true, block: false, timeoutMs: 30_000 });
@@ -102,7 +103,10 @@ describe("waitAll (D42)", () => {
     assert.equal(r1.status, "delivered");
     assert.equal(r2.status, "delivered");
     assert.ok(Date.now() - t0 < 2000, "launch must NOT block for the replies");
-    const res = await lead.waitAll(2500);
+    const verdict = lead.waitAll(2500);
+    await waitFor(() => original !== undefined);
+    await carol.reply(original!.id, "carol launch done");
+    const res = await verdict;
     assert.equal(res.status, "timeout", "bob stays silent");
     assert.ok(res.answers.some((a) => a.to === "carol" && a.response === "carol launch done"), "fast answer in the verdict");
     assert.ok(res.missing.some((m) => m.to === "bob"), "slow mission reported missing");
@@ -303,8 +307,8 @@ describe("waitAll: non-destructive lifecycle exits", () => {
     const waiting = lead.waitAll(2000);
     await bob.reply(first.msgId, "partial answer");
     await waitFor(() => lead.missionStatus().some((mission) => mission.msgId === first.msgId && mission.answered));
-    assert.equal(lead.interruptWaitAll("incoming_message", "m_incoming_12345678"), true);
-    assert.equal(lead.interruptWaitAll("nothing_active"), false);
+    assert.equal(lead.interruptWaits("incoming_message", "m_incoming_12345678"), true);
+    assert.equal(lead.interruptWaits("nothing_active"), false);
     const interrupted = await waiting;
     assert.equal(interrupted.status, "interrupted");
     assert.equal(interrupted.reason, "incoming_message");
@@ -412,4 +416,81 @@ it("waitAll intentional close settles immediately with an honest intact snapshot
   assert.equal(closed.total, 1);
   assert.deepEqual(closed.missing, [{ msgId: sent.msgId, to: "bob" }]);
   assert.equal(lead.pendingCount, 0);
+});
+
+it("a group owns only its snapshot, not a subsequently launched answer", { timeout: 5000 }, async (t) => {
+  const { lead, bob, carol } = await isolatedWaitFixture(t);
+  const first = await lead.send({ to: "bob", message: "group member", awaitReply: true, block: false });
+  const waiting = lead.waitAll(2000);
+  const outside = await lead.send({ to: "carol", message: "outside snapshot", awaitReply: true, block: false });
+  assert.ok(first.msgId && outside.msgId);
+  const inbound: MeshFrame[] = [];
+  lead.on("inbound", (frame: MeshFrame) => inbound.push(frame));
+  await carol.reply(outside.msgId, "outside answer");
+  const interrupted = await waiting;
+  assert.equal(interrupted.status, "interrupted");
+  assert.equal(interrupted.total, 1);
+  assert.deepEqual(interrupted.missing, [{ msgId: first.msgId, to: "bob" }]);
+  await waitFor(() => inbound.length === 1);
+  assert.equal(inbound[0]!.body, "outside answer");
+  const again = lead.waitAll(2000);
+  await bob.reply(first.msgId, "group answer");
+  const complete = await again;
+  assert.equal(complete.status, "complete");
+  assert.equal(complete.answered, 2);
+  assert.equal(inbound.length, 1, "answers carried by the new snapshot are not injected");
+});
+
+it("a matched answer releases unrelated sends while its owning group aggregates normally", { timeout: 5000 }, async (t) => {
+  const { lead, bob, carol } = await isolatedWaitFixture(t);
+  const first = lead.send({ to: "bob", message: "first blocking", awaitReply: true });
+  const second = lead.send({ to: "carol", message: "second blocking", awaitReply: true });
+  await waitFor(() => lead.pendingCount === 2 && bob.transcript.some((frame) => frame.body === "first blocking"));
+  const firstId = lead.missionStatus().find((mission) => mission.to === "bob")!.msgId;
+  const secondId = lead.missionStatus().find((mission) => mission.to === "carol")!.msgId;
+  const inbound: MeshFrame[] = [];
+  lead.on("inbound", (frame: MeshFrame) => inbound.push(frame));
+  const aggregate = lead.waitAll(2000);
+  await bob.reply(firstId, "first result");
+  const own = await first;
+  assert.equal(own.status, "reply");
+  const other = await second;
+  assert.equal(other.status, "interrupted");
+  if (other.status === "interrupted") {
+    assert.equal(other.msgId, secondId);
+    assert.equal(other.tracked, true);
+  }
+  await waitFor(() => carol.peekInbox(secondId) !== undefined);
+  await carol.reply(secondId, "second result");
+  const complete = await aggregate;
+  assert.equal(complete.status, "complete");
+  assert.equal(complete.answered, 2);
+  assert.deepEqual(inbound, [], "the owning send/group results carry both answers");
+});
+
+it("single send connection loss yields promptly and its remote answer survives reconnect", { timeout: 5000 }, async (t) => {
+  const { lead, bob, broker } = await isolatedWaitFixture(t);
+  let acknowledgedId: string | undefined;
+  lead.on("frame", (frame: MeshFrame) => {
+    if (frame.type === "ack" && frame.status === "delivered") acknowledgedId = frame.id;
+  });
+  const sending = lead.send({ to: "bob", message: "survive connection loss", awaitReply: true });
+  await waitFor(() => bob.transcript.some((frame) => frame.body === "survive connection loss"));
+  const id = lead.missionStatus()[0]!.msgId;
+  await waitFor(() => acknowledgedId === id);
+  broker.state.peers.get("lead")!.socket.destroy();
+  const result = await sending;
+  assert.equal(result.status, "error");
+  if (result.status === "error") {
+    assert.equal(result.reason, "connection_lost");
+    assert.equal(result.delivery, "delivered");
+    assert.equal(result.tracked, true);
+  }
+  assert.equal(lead.pendingCount, 1);
+  await lead.connect();
+  const aggregate = lead.waitAll(2000);
+  await bob.reply(id, "remote work completed");
+  const complete = await aggregate;
+  assert.equal(complete.status, "complete");
+  assert.deepEqual(complete.answers, [{ msgId: id, to: "bob", response: "remote work completed" }]);
 });

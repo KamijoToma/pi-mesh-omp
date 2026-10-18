@@ -1,8 +1,9 @@
 import { buildBatchMessage, bypassesBatch, batchDetails, InboundBatcher } from "./batcher.js";
 import { DeferredInbox } from "./deferred-inbox.js";
 import { classifyInbound } from "./inbound-policy.js";
-import { tagInboundReplyChain, recordInboundDelivery, injectInbound } from "./inbound.js";
+import { tagInboundReplyChain, recordInboundDelivery, injectInbound, handleInboundFrame } from "./inbound.js";
 import { ReplyHintTracker } from "./reply-hints.js";
+import { interruptToolOperations } from "./tools.js";
 /** live-entry previews shown while the agent is busy (cooldown). */
 const LIVE_COOLDOWN_MS = 1_500;
 /** Format opts for one inbound frame (compact mode + gated hints). */
@@ -57,6 +58,7 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
     const pendingInjections = new Set();
     rt.isInboundReloadSafe = () => pendingInjections.size === 0;
     const active = () => !detached && isCurrent() && rt.client === client;
+    rt.isCurrent = active;
     const guarded = (fn) => {
         if (!active())
             return;
@@ -101,6 +103,7 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
         counters: rt,
         read: (msgId, from) => client.sendRead(msgId, from),
         isReplyToReply: (replyTo) => client.isReplyToReply(replyTo),
+        onSettled: (frame) => { pendingInjections.delete(frame); },
     };
     // batch inbound messages over a short window → ONE injection (one
     // turn) for a burst; force/remind bypass the batcher (immediate delivery).
@@ -108,14 +111,18 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
     (frames) => {
         if (!active())
             return;
-        const batch = buildBatchMessage(frames, (f) => formatOptsFor(f, client.contextVerbosity === "full", client.homeRoom, hintTracker));
-        guarded(() => {
-            pi.sendMessage({
-                customType: "mesh-inbound",
-                content: batch.content,
-                display: true,
-                details: batchDetails(frames),
-            }, { triggerTurn: true, deliverAs: batch.deliverAs });
+        const first = frames[0];
+        if (first === undefined)
+            return;
+        const batch = buildBatchMessage(frames, (frame) => formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker));
+        const message = {
+            customType: "mesh-inbound", content: batch.content, display: true, details: batchDetails(frames),
+        };
+        pendingInjections.add(first);
+        handleInboundFrame(deliveryHost, deliveryContext, first, deps, () => {
+            if (!active())
+                return;
+            deliveryHost.sendMessage(message, { triggerTurn: true, deliverAs: batch.deliverAs });
             for (const frame of frames)
                 recordInboundDelivery(frame, deps);
         });
@@ -133,18 +140,21 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
     // turn. They are queued and delivered when the hold expires.
     const heldFrames = [...(restored?.held ?? [])];
     const pausedBatches = [...(restored?.batched ?? [])];
-    const deliver = (frame, matchedReply) => {
+    const wakeForInput = (frame, interruptedWaits = false) => {
+        if (frame.receipt === true || ("__replyChain" in frame && frame.__replyChain === true))
+            return false;
+        const operationWoke = interruptToolOperations(rt, "inbound_message", frame.id);
+        const taskWoke = frame.priority !== "force" && client.interruptWaits("inbound_message", frame.id);
+        return interruptedWaits || operationWoke || taskWoke;
+    };
+    const deliver = (frame, matchedReply, interruptedWaits = false) => {
         tagInboundReplyChain(frame, deps);
         getHud()?.refresh();
         if (classifyInbound(frame, client.alias, client.inboundBroadcasts, matchedReply) === "deferred") {
             deferredInbox.push(frame);
             return;
         }
-        const wakeWaiting = !matchedReply &&
-            frame.priority !== "force" &&
-            frame.receipt !== true &&
-            !("__replyChain" in frame && frame.__replyChain === true) &&
-            client.interruptWaitAll("inbound_message", frame.id);
+        const wakeWaiting = wakeForInput(frame, interruptedWaits);
         const opts = {
             ...formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker),
         };
@@ -181,6 +191,14 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
                         });
                     }
                 };
+            }
+            if (frame.priority !== "force") {
+                pendingInjections.add(frame);
+                handleInboundFrame(deliveryHost, deliveryContext, frame, deps, () => {
+                    if (active())
+                        injectInbound(deliveryHost, deliveryContext, frame, injectOpts);
+                });
+                return;
             }
             guarded(() => {
                 let completed = false;
@@ -233,17 +251,25 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
         if (!active() || paused)
             return;
         const frames = heldFrames.splice(0);
-        for (const { frame, matchedReply } of frames)
-            deliver(frame, matchedReply);
+        for (const { frame, matchedReply, interruptedWaits } of frames)
+            deliver(frame, matchedReply, interruptedWaits);
     };
     client.on("inbound", (frame, meta) => {
         if (!active())
             return;
-        if (paused || (rt.rateLimitedUntil !== undefined && rt.rateLimitedUntil > Date.now())) {
-            heldFrames.push({ frame, matchedReply: meta?.matchedReply === true }); // no injection while the provider rejects turns
+        const matchedReply = meta?.matchedReply === true;
+        if (paused) {
+            heldFrames.push({ frame, matchedReply, interruptedWaits: meta?.interruptedWaits });
             return;
         }
-        deliver(frame, meta?.matchedReply === true);
+        if (frame.priority !== "force" && rt.rateLimitedUntil !== undefined && rt.rateLimitedUntil > Date.now()) {
+            tagInboundReplyChain(frame, deps);
+            const wake = classifyInbound(frame, client.alias, client.inboundBroadcasts, matchedReply) === "deferred"
+                ? false : wakeForInput(frame, meta?.interruptedWaits);
+            heldFrames.push({ frame, matchedReply, interruptedWaits: wake });
+            return;
+        }
+        deliver(frame, matchedReply, meta?.interruptedWaits);
     });
     rt.batcher = batcher;
     rt.clearInbound = () => {
@@ -398,22 +424,27 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
         getHud()?.onClosed(); });
     client.on("pending", () => guarded(() => getHud()?.refresh()));
     // async drop receipt: the broker dropped one of OUR messages from the
-    // recipient's offline mailbox (TTL expiry or cap eviction). The client
-    // already settled any live awaitReply mission; the session must LEARN
-    // the message will never arrive so a re-send decision is possible.
+    // recipient's offline mailbox. The client
+    // already settled its mission; wake any other passive wait so the explicit
+    // failure reaches the model without waiting for an unrelated task.
     client.on("dropped_offline", (frame) => {
         if (!active())
             return;
         const target = frame.to ?? "?";
-        guarded(() => {
-            pi.sendMessage({
+        pendingInjections.add(frame);
+        handleInboundFrame(deliveryHost, deliveryContext, frame, deps, () => {
+            if (!active())
+                return;
+            const operationWoke = interruptToolOperations(rt, "dropped_offline", frame.id);
+            const taskWoke = client.interruptWaits("dropped_offline", frame.id);
+            deliveryHost.sendMessage({
                 customType: "mesh-inbound",
                 content: `[mesh] drop notice: message ${frame.id} to @${target} was dropped from the ` +
-                    `offline mailbox (TTL expiry or cap). It will never be delivered — ` +
-                    `re-send with mesh_send if still relevant.`,
+                    `offline mailbox and is no longer queued. Check whether the work ` +
+                    `still needs to be reissued.`,
                 display: true,
                 details: { kind: "mesh-drop-notice", msgId: frame.id, to: target },
-            }, { triggerTurn: true, deliverAs: "followUp" });
+            }, { triggerTurn: true, deliverAs: operationWoke || taskWoke ? "steer" : "followUp" });
         });
         try {
             rt.ledger.append({
@@ -432,6 +463,7 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
     // instead of reaching the stale pi/ctx.
     rt.markDetached = () => {
         detached = true;
+        interruptToolOperations(rt, "session_closed");
         heldFrames.length = 0;
         pausedBatches.length = 0;
         pendingInjections.clear();

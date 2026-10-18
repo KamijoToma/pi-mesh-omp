@@ -5,8 +5,8 @@ import { MAX_REMINDS } from "../shared/config.js";
  * - correlation strict: replyTo === msgId (any other reply ignored + counted)
  * - reminds at T/2 and 3T/4 via onRemind hook (client sends `remind`), max 2
  * - expiry terminal at expiresAt; late reply counted, not delivered
- * - launch flag: block:false missions resolve the SAME way, but the client
- *   additionally delivers the answer frame to the session (wake-on-answer)
+ * - launch flag: background missions resolve the SAME way, but the client
+ *   additionally delivers an answer not owned by an active group
  */
 export class PendingReplies {
     onRemind;
@@ -61,10 +61,15 @@ export class PendingReplies {
             this.onChanged?.();
         });
     }
-    /** True when msgId is a live LAUNCH mission (awaitReply + block:false).
-     *  Consulted by the client BEFORE handleReply consumes the entry. */
+    /** True for a live background mission; checked before handleReply consumes it. */
     isLaunch(msgId) {
         return this.entries.get(msgId)?.launch === true;
+    }
+    /** A yielded tool no longer owns its answer; retain deadlines and correlation. */
+    promoteToLaunch(msgId) {
+        const entry = this.entries.get(msgId);
+        if (entry !== undefined)
+            entry.launch = true;
     }
     /** Route an inbound reply frame. Returns true if it resolved a pending. */
     handleReply(frame) {

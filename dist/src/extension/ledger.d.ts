@@ -1,5 +1,5 @@
 export declare const LEDGER_SCHEMA = "mesh.ledger.v1";
-export type LedgerEventName = "sent" | "delivered" | "queued_offline" | "reply" | "expired" | "blocked" | "error" | "inbound" | "reserved" | "released" | "dropped_offline";
+export type LedgerEventName = "sent" | "delivered" | "queued_offline" | "reply" | "expired" | "interrupted" | "blocked" | "error" | "inbound" | "reserved" | "released" | "dropped_offline";
 export interface LedgerRecord {
     schema: typeof LEDGER_SCHEMA;
     event: LedgerEventName;

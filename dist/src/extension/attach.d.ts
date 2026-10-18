@@ -5,12 +5,13 @@ import type { MeshHud } from "./hud.js";
 import { type FormatOpts } from "./inbound.js";
 import { ReplyHintTracker, type ReplyHintReloadState } from "./reply-hints.js";
 import type { ExtensionAPI, SessionContext } from "./pi-types.js";
-import type { MeshRuntime } from "./tools.js";
+import { type MeshRuntime } from "./tools.js";
 export interface MeshInboundReloadState {
     deferred: DeferredInboxReloadState;
     held: {
         frame: MeshFrame;
         matchedReply: boolean;
+        interruptedWaits?: boolean;
     }[];
     batched: MeshFrame[];
     fullContextSent: boolean;

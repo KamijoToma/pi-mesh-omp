@@ -691,7 +691,12 @@ describe("MeshClient tailnet lifecycle", { concurrency: false }, () => {
       await waitFor(() => fs.existsSync(marker));
       await client.close();
       await cancelled;
-      assert.deepEqual(await sending, { status: "blocked", reason: "connection_cancelled" });
+      const result = await sending;
+      assert.equal(result.status, "error");
+      if (result.status === "error") {
+        assert.equal(result.reason, "closed");
+        assert.equal(result.tracked, false);
+      }
       await sleep(350);
       assert.deepEqual(ready, ["graph-a"]);
       assert.equal(second.broker.state.peers.size, 0);

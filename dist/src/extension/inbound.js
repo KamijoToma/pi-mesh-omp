@@ -231,32 +231,43 @@ export function tagInboundReplyChain(frame, deps) {
     const taggedFrame = frame;
     taggedFrame.__replyChain = replyChain;
 }
-export function handleInboundFrame(pi, ctx, frame, deps) {
-    tagInboundReplyChain(frame, deps);
-    const inject = () => {
+/** Retry a rejected active-session host delivery once, without duplicating acceptance. */
+export function deliverWithRetry(deliver, counters, onSettled, retryMs = INJECTION_RETRY_MS) {
+    try {
+        deliver();
+    }
+    catch {
+        const timer = setTimeout(() => {
+            try {
+                deliver();
+            }
+            catch {
+                counters.injectionFailures += 1;
+            }
+            try {
+                onSettled?.();
+            }
+            catch { /* delivery bookkeeping */ }
+        }, retryMs);
+        timer.unref();
+        return;
+    }
+    try {
+        onSettled?.();
+    }
+    catch { /* delivery bookkeeping */ }
+}
+export function handleInboundFrame(pi, ctx, frame, deps, injection) {
+    if (injection === undefined)
+        tagInboundReplyChain(frame, deps);
+    const inject = injection ?? (() => {
         injectInbound(pi, ctx, frame, {
             ...(deps.format ?? {}),
             replyChain: "__replyChain" in frame && frame.__replyChain === true,
             onInjected: () => recordInboundDelivery(frame, deps),
         });
-    };
-    try {
-        inject();
-    }
-    catch {
-        // One bounded retry for a transient host state. Neither a failed attempt
-        // nor a pending retry is a read: bookkeeping runs only after injection.
-        const delay = deps.retryMs ?? INJECTION_RETRY_MS;
-        const t = setTimeout(() => {
-            try {
-                inject();
-            }
-            catch {
-                deps.counters.injectionFailures += 1;
-            }
-        }, delay);
-        t.unref();
-    }
+    });
+    deliverWithRetry(inject, deps.counters, deps.onSettled === undefined ? undefined : () => deps.onSettled?.(frame), deps.retryMs);
 }
 /** Persist hash-only metadata and acknowledge a successfully injected frame. */
 export function recordInboundDelivery(frame, deps) {

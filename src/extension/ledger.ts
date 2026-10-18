@@ -17,6 +17,7 @@ export type LedgerEventName =
   | "queued_offline"
   | "reply"
   | "expired"
+  | "interrupted"
   | "blocked"
   | "error"
   | "inbound"

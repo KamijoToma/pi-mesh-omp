@@ -352,6 +352,8 @@ export interface InboundDeps {
   format?: FormatOpts;
   /** injection retry delay (defaults to INJECTION_RETRY_MS; tests shrink it). */
   retryMs?: number;
+  /** Release delivery ownership after acceptance or the final failed attempt. */
+  onSettled?: (frame: MeshFrame) => void;
 }
 
 /** Tag reply-to-reply context before formatting, without claiming delivery. */
@@ -365,35 +367,43 @@ export function tagInboundReplyChain(frame: MeshFrame, deps: InboundDeps): void 
   taggedFrame.__replyChain = replyChain;
 }
 
+/** Retry a rejected active-session host delivery once, without duplicating acceptance. */
+export function deliverWithRetry(
+  deliver: () => void,
+  counters: InboundFailureCounters,
+  onSettled?: () => void,
+  retryMs = INJECTION_RETRY_MS,
+): void {
+  try {
+    deliver();
+  } catch {
+    const timer = setTimeout(() => {
+      try { deliver(); } catch { counters.injectionFailures += 1; }
+      try { onSettled?.(); } catch { /* delivery bookkeeping */ }
+    }, retryMs);
+    timer.unref();
+    return;
+  }
+  try { onSettled?.(); } catch { /* delivery bookkeeping */ }
+}
+
 export function handleInboundFrame(
   pi: Pick<ExtensionAPI, "sendMessage">,
   ctx: SessionContext | null,
   frame: MeshFrame,
   deps: InboundDeps,
+  injection?: () => void,
 ): void {
-  tagInboundReplyChain(frame, deps);
-  const inject = (): void => {
+  if (injection === undefined) tagInboundReplyChain(frame, deps);
+  const inject = injection ?? (() => {
     injectInbound(pi, ctx, frame, {
       ...(deps.format ?? {}),
       replyChain: "__replyChain" in frame && frame.__replyChain === true,
       onInjected: () => recordInboundDelivery(frame, deps),
     });
-  };
-  try {
-    inject();
-  } catch {
-    // One bounded retry for a transient host state. Neither a failed attempt
-    // nor a pending retry is a read: bookkeeping runs only after injection.
-    const delay = deps.retryMs ?? INJECTION_RETRY_MS;
-    const t = setTimeout(() => {
-      try {
-        inject();
-      } catch {
-        deps.counters.injectionFailures += 1;
-      }
-    }, delay);
-    t.unref();
-  }
+  });
+  deliverWithRetry(inject, deps.counters,
+    deps.onSettled === undefined ? undefined : () => deps.onSettled?.(frame), deps.retryMs);
 }
 
 /** Persist hash-only metadata and acknowledge a successfully injected frame. */

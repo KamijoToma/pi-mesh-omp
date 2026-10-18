@@ -53,6 +53,10 @@ export interface MeshRuntime {
     activateAfterReload?: () => void;
     /** Force deliveries deferred until host-idle must finish before handover. */
     isInboundReloadSafe?: () => boolean;
+    /** Foreground control requests remain tracked until their real result settles. */
+    pendingToolOperations?: Set<(reason: string, msgId?: string) => boolean>;
+    /** Shared session/client guard for delayed operation results. */
+    isCurrent?: () => boolean;
     /** Called by the context watchdog when a compaction is detected —
     *  lets attach.ts resync the mesh context block (conventions lost). */
     onCompactionDetected?: () => void;
@@ -69,6 +73,8 @@ export interface MeshRuntime {
     injectionFailures: number;
 }
 export type GetRuntime = () => MeshRuntime | null;
+/** Yield foreground control requests without cancelling their transactions. */
+export declare function interruptToolOperations(rt: MeshRuntime, reason: string, msgId?: string): boolean;
 /** Minimum busy duration before an awaitReply warning (a 30 s bash turn
  *  must not nag — measured incident: 6/6 expired missions toward agents
  *  running 4-10 min GPU renders). */

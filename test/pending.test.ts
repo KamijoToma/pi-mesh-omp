@@ -112,3 +112,26 @@ describe("pending: N3 — no instant reminds at timeout 0", () => {
     assert.equal(p.size, 0);
   });
 });
+
+it("promotes yielded work without changing reply correlation or its original expiry", async () => {
+  const settled: string[] = [];
+  const pending = new PendingReplies(() => {}, undefined, (id) => settled.push(id));
+  const answer = pending.register("m_promote_11111111", Date.now() + 5000);
+  const expiring = pending.register("m_expire_11111111", Date.now() + 80);
+  pending.promoteToLaunch("m_promote_11111111");
+  pending.promoteToLaunch("m_expire_11111111");
+  pending.promoteToLaunch("m_unknown_11111111");
+  assert.equal(pending.isLaunch("m_promote_11111111"), true);
+  assert.equal(pending.isLaunch("m_expire_11111111"), true);
+  assert.equal(pending.size, 2);
+  const frame = buildFrame({
+    type: "reply", from: "bob", to: "alice", replyTo: "m_promote_11111111", body: "real answer",
+  });
+  assert.equal(pending.handleReply(frame), true);
+  assert.equal((await answer).frame, frame);
+  assert.equal(pending.handleReply(frame), false);
+  assert.equal((await withKeepAlive(expiring)).kind, "expired");
+  assert.deepEqual(settled, ["m_promote_11111111", "m_expire_11111111"]);
+  assert.equal(pending.size, 0);
+  assert.equal(pending.isLaunch("m_promote_11111111"), false);
+});

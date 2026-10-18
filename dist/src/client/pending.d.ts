@@ -9,8 +9,8 @@ export interface PendingResolution {
  * - correlation strict: replyTo === msgId (any other reply ignored + counted)
  * - reminds at T/2 and 3T/4 via onRemind hook (client sends `remind`), max 2
  * - expiry terminal at expiresAt; late reply counted, not delivered
- * - launch flag: block:false missions resolve the SAME way, but the client
- *   additionally delivers the answer frame to the session (wake-on-answer)
+ * - launch flag: background missions resolve the SAME way, but the client
+ *   additionally delivers an answer not owned by an active group
  */
 export declare class PendingReplies {
     private readonly onRemind;
@@ -21,9 +21,10 @@ export declare class PendingReplies {
     unmatchedReplyCount: number;
     constructor(onRemind: (msgId: string) => void, onChanged?: (() => void) | undefined, onSettled?: ((msgId: string, resolution: PendingResolution) => void) | undefined);
     register(msgId: string, expiresAtMs: number, launch?: boolean): Promise<PendingResolution>;
-    /** True when msgId is a live LAUNCH mission (awaitReply + block:false).
-     *  Consulted by the client BEFORE handleReply consumes the entry. */
+    /** True for a live background mission; checked before handleReply consumes it. */
     isLaunch(msgId: string): boolean;
+    /** A yielded tool no longer owns its answer; retain deadlines and correlation. */
+    promoteToLaunch(msgId: string): void;
     /** Route an inbound reply frame. Returns true if it resolved a pending. */
     handleReply(frame: MeshFrame): boolean;
     has(msgId: string): boolean;

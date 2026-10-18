@@ -14,9 +14,8 @@ interface PendingEntry {
   remindCount: number;
   timers: NodeJS.Timeout[];
   resolve: (r: PendingResolution) => void;
-  /** LAUNCH mission (awaitReply + block:false): the tool result already
-   *  returned, so the ANSWER must be delivered to the session as an event
-   *  (wake-on-answer) instead of a tool resolution. */
+  /** Background mission (block:false or a yielded foreground send): its
+   *  answer needs session delivery unless an active group owns it. */
   launch: boolean;
 }
 
@@ -25,8 +24,8 @@ interface PendingEntry {
  * - correlation strict: replyTo === msgId (any other reply ignored + counted)
  * - reminds at T/2 and 3T/4 via onRemind hook (client sends `remind`), max 2
  * - expiry terminal at expiresAt; late reply counted, not delivered
- * - launch flag: block:false missions resolve the SAME way, but the client
- *   additionally delivers the answer frame to the session (wake-on-answer)
+ * - launch flag: background missions resolve the SAME way, but the client
+ *   additionally delivers an answer not owned by an active group
  */
 export class PendingReplies {
   private readonly entries = new Map<string, PendingEntry>();
@@ -78,10 +77,15 @@ export class PendingReplies {
     });
   }
 
-  /** True when msgId is a live LAUNCH mission (awaitReply + block:false).
-   *  Consulted by the client BEFORE handleReply consumes the entry. */
+  /** True for a live background mission; checked before handleReply consumes it. */
   isLaunch(msgId: string): boolean {
     return this.entries.get(msgId)?.launch === true;
+  }
+
+  /** A yielded tool no longer owns its answer; retain deadlines and correlation. */
+  promoteToLaunch(msgId: string): void {
+    const entry = this.entries.get(msgId);
+    if (entry !== undefined) entry.launch = true;
   }
 
   /** Route an inbound reply frame. Returns true if it resolved a pending. */

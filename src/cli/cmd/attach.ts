@@ -148,10 +148,10 @@ export async function cmdAttach(opts: AttachOpts): Promise<number> {
     },
     config: resolveCliConfig(),
   });
-  client.on("inbound", (frame: MeshFrame, meta?: { matchedReply?: boolean }) => {
-    if (meta?.matchedReply === true || frame.receipt === true) return;
+  client.on("inbound", (frame: MeshFrame) => {
+    if (frame.receipt === true) return;
     if (frame.type === "reply" && frame.replyTo !== undefined && client.isReplyToReply(frame.replyTo)) return;
-    client.interruptWaitAll("inbound_message", frame.id);
+    client.interruptWaits("inbound_message", frame.id);
   });
 
   let welcome;
@@ -199,6 +199,8 @@ export async function cmdAttach(opts: AttachOpts): Promise<number> {
         return `${r.status} ${r.msgId}${r.deliveredCount !== undefined && r.totalCount !== undefined ? ` ${r.deliveredCount}/${r.totalCount}` : ""}`;
       case "expired":
         return `expired ${r.msgId ?? ""} (late replies still arrive)`;
+      case "interrupted":
+        return `interrupted: ${r.reason}${r.msgId !== undefined ? ` ${r.msgId}` : ""} (delivery=${r.delivery}; ${r.delivery === "not_sent" ? "not sent" : r.tracked ? "mission remains tracked" : "check delivery before resending"})`;
       default:
         return `${r.status}: ${"reason" in r ? r.reason : ""}`;
     }
@@ -408,6 +410,8 @@ function printResultJson(r: SendResult): Record<string, unknown> {
   if ("msgId" in r && r.msgId !== undefined) base.msgId = r.msgId;
   if ("reason" in r && r.reason !== undefined) base.reason = r.reason;
   if ("delivery" in r && r.delivery !== undefined) base.delivery = r.delivery;
+  if ("tracked" in r && r.tracked !== undefined) base.tracked = r.tracked;
+  if ("interruptedBy" in r && r.interruptedBy !== undefined) base.interruptedBy = r.interruptedBy;
   if ("response" in r) base.response = r.response;
   if ("deliveredCount" in r && r.deliveredCount !== undefined) base.deliveredCount = r.deliveredCount;
   if ("totalCount" in r && r.totalCount !== undefined) base.totalCount = r.totalCount;

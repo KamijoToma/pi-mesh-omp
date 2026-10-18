@@ -64,9 +64,10 @@ upstream npm package.
   Expired or failed missions remain listed as missing even if they settle
   before the wait starts; a batch with only terminal missing missions returns
   immediately rather than reporting a false success.
-  Actionable new messages yield the passive wait without aborting the turn;
-  a previously-online target leaving the mission room returns an error without
-  cancelling its task. Initially offline queued tasks still wait for reconnect.
+  Actionable new messages yield both group waits and single `mesh_send`
+  waits without aborting the turn; a previously-online target leaving the
+  mission room returns an error without cancelling its task. Initially offline
+  queued tasks still wait for reconnect.
   A blocking `mesh_send` can be aborted with ESC before/during connection or
   delivery; its reason is `aborted`. After a write, delivery may be unknown:
   a cancellation is not proof of non-delivery, and late replies still arrive.
@@ -251,9 +252,9 @@ sessions, including a compiled host with no plugin-local SDK dependencies.
 
 | tool | params | returns (honest one-liner + `details`) |
 |---|---|---|
-| `mesh_send` | `to?`, `message`, `room?`, `broadcast?`, `priority?`, `reason?`, `awaitReply?`, `block?`, `timeoutMs?`, `refs?`, `replyTo?` | `delivered` / `queued_offline` / `reply: …` / `expired` / `blocked: …` — impossible targets (`"*"`, `"<room>-broadcast"`) refused **locally**; unseen aliases get a soft warning; `awaitReply` toward a peer busy longer than the timeout gets a burst-pattern advisory |
-| `mesh_reply` | `msgId`, `message`, `replyAll?`, `to?`, `refs?` | `delivered` or `blocked: reply_without_target` |
-| `mesh_wait_all` | `timeoutMs?` | `complete` / `timeout` / `error` / `interrupted` / `cancelled`, with complete answers, missing tasks, `reason`, and an optional triggering message ID |
+| `mesh_send` | `to?`, `message`, `room?`, `broadcast?`, `priority?`, `reason?`, `awaitReply?`, `block?`, `timeoutMs?`, `refs?`, `replyTo?` | `delivered` / `queued_offline` / `reply: …` / `expired` / `interrupted` / `blocked` / `error`; interrupted sends report `delivery`, `tracked`, and any written `msgId`, never a false completion |
+| `mesh_reply` | `msgId`, `message`, `replyAll?`, `to?`, `refs?` | `delivered`, refusal, or a foreground `interrupted` with the actual transaction result delivered later |
+| `mesh_wait_all` | `timeoutMs?` | `complete` / `timeout` / `error` / `interrupted` / `cancelled`, with complete answers, missing tasks, `reason`, and an optional triggering message/operation ID |
 | `mesh_alias` | `alias?` (omit = show current name) | current alias / `renamed` / `unchanged` / `blocked: invalid_alias` or `alias_taken`; changes this agent's routing name, preserving rooms and reservations |
 | `mesh_status` | `room?`, `all?` | live broker snapshot — peers, versions, activity, read receipts, missions and counters; query failures return `error` with the actual reason, never a fabricated empty mesh |
 | `mesh_ledger` | `limit?`, `from?`, `to?`, `room?`, `event?` | durable **hash-only** history — bodies never stored, survives restarts |
@@ -269,6 +270,34 @@ machine receipts and reply-to-reply metadata do not wake the wait.
 Errors, interruptions and cancellations do not consume partial answers:
 pending tasks remain reportable on a later wait. Explicit batch clearing
 instead cancels the tasks and returns a final snapshot with `missions_cancelled`.
+
+Single sends can also yield during connection, ACK and reply waits.
+`interrupted.delivery` is `not_sent`, `unknown`, `delivered`, or `queued_offline`;
+`tracked: true` means the reply mission remains alive. Only `not_sent` proves
+that this call did not write a message. Handle the new input, then use
+`mesh_wait_all` or the later answer event; do not redispatch tracked work.
+Replies owned by a wait stay in its result; unrelated answers are not hidden
+behind another wait's snapshot.
+
+`mesh_reply`, `mesh_status`, `mesh_alias`, `mesh_reserve` and `mesh_release`
+also yield foreground network waits. Their `interrupted` result contains
+`operationId` and `pendingOperation: true`: the transaction was **not cancelled**.
+Its actual completion arrives as `mesh-operation-result`, including the
+original operation ID and real result. Do not repeat that operation or reply
+to its completion notice. Late completions can wake a new passive wait;
+reload waits for the actual transaction to settle, and old-session results
+are never injected into a replacement session.
+
+If the provider is unavailable, actionable input still releases passive waits,
+but its body stays held until provider recovery to avoid repeated failed model
+turns. An already-authorized force message bypasses that provider hold;
+authorization and rate limits are unchanged.
+
+Active inbound messages, batches, drop notices and late operation results reuse
+the existing single bounded host-delivery retry. A queued retry remains owned
+until acceptance or final failure, so reload cannot silently discard it; read
+receipts follow actual host acceptance, and final failures increment the
+injection-failure counter.
 
 Broker mailboxes are memory-only. A reboot can make an unconfirmed queued
 delivery uncertain (`broker_state_lost_delivery_unknown`); this does **not**
@@ -298,9 +327,10 @@ not redirect to it.
 and in the bundled skill):
 
 1. Launch the burst: `mesh_send(..., awaitReply: true, block: false)` per
-   mission — each returns `delivered` immediately, the mission stays tracked
-   in the background (reminders, expiry, answer capture). Every answer
-   arrives as a `[mesh]` reply event the moment it lands (the session wakes
+   mission — normally the broker ACK returns `delivered` or `queued_offline`,
+   then the mission stays tracked in the background. If input arrives before
+   the ACK, inspect `interrupted.delivery` and `tracked` before doing anything else.
+   Every answer arrives as a `[mesh]` reply event the moment it lands (the session wakes
    if idle; keep working in the meantime), so `mesh_wait_all` is only needed
    when you must collect the whole batch before continuing.
 2. One `mesh_wait_all` for the group verdict — fast answers that arrived
@@ -532,6 +562,17 @@ implementation. Use the existing mesh history for older frames.
   that can still finish after reconnect.
 - Propagate status query errors through tools, CLI and HUD instead of
   presenting an empty mesh or falsely marking persisted identities offline.
+- Extend cooperative yielding to single sends, including connection/ACK phases,
+  while retaining written missions and their later answer delivery.
+- Track reply ownership per wait snapshot so unrelated answers reach the
+  model immediately instead of being suppressed by another active wait.
+- Yield control-request tools without cancelling their transactions; deliver
+  real late results, guard reset/reload boundaries, and preserve delivery
+  uncertainty in both scripted and interactive CLI output.
+- Wire the existing bounded injection retry into live direct/batch delivery,
+  drop notices and late results rather than silently swallowing host rejection.
+- Release foreground waits even during provider-failure holds, retain ordinary
+  input until recovery, and let authorized force bypass the hold.
 
 ### v0.7.2-omp.3
 

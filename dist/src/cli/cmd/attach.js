@@ -133,12 +133,12 @@ export async function cmdAttach(opts) {
         },
         config: resolveCliConfig(),
     });
-    client.on("inbound", (frame, meta) => {
-        if (meta?.matchedReply === true || frame.receipt === true)
+    client.on("inbound", (frame) => {
+        if (frame.receipt === true)
             return;
         if (frame.type === "reply" && frame.replyTo !== undefined && client.isReplyToReply(frame.replyTo))
             return;
-        client.interruptWaitAll("inbound_message", frame.id);
+        client.interruptWaits("inbound_message", frame.id);
     });
     let welcome;
     try {
@@ -185,6 +185,8 @@ export async function cmdAttach(opts) {
                 return `${r.status} ${r.msgId}${r.deliveredCount !== undefined && r.totalCount !== undefined ? ` ${r.deliveredCount}/${r.totalCount}` : ""}`;
             case "expired":
                 return `expired ${r.msgId ?? ""} (late replies still arrive)`;
+            case "interrupted":
+                return `interrupted: ${r.reason}${r.msgId !== undefined ? ` ${r.msgId}` : ""} (delivery=${r.delivery}; ${r.delivery === "not_sent" ? "not sent" : r.tracked ? "mission remains tracked" : "check delivery before resending"})`;
             default:
                 return `${r.status}: ${"reason" in r ? r.reason : ""}`;
         }
@@ -413,6 +415,10 @@ function printResultJson(r) {
         base.reason = r.reason;
     if ("delivery" in r && r.delivery !== undefined)
         base.delivery = r.delivery;
+    if ("tracked" in r && r.tracked !== undefined)
+        base.tracked = r.tracked;
+    if ("interruptedBy" in r && r.interruptedBy !== undefined)
+        base.interruptedBy = r.interruptedBy;
     if ("response" in r)
         base.response = r.response;
     if ("deliveredCount" in r && r.deliveredCount !== undefined)

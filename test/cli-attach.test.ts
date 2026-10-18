@@ -215,7 +215,7 @@ test("attach --session adopts an explicitly empty room set without rejoining def
   }
 });
 
-test("attach --json: new input interrupts wait without cancelling the awaited send", { timeout: 15_000 }, async () => {
+test("attach --json: new input yields both send and group waits while preserving the task", { timeout: 15_000 }, async () => {
   const dirs = makeTempDirs("cli-attach-wait-");
   const broker = await startTestBroker(dirs.runtimeDir);
   const peer = new MeshClient({ alias: "peer", runtimeDir: dirs.runtimeDir, noReconnect: true });
@@ -236,19 +236,25 @@ test("attach --json: new input interrupts wait without cancelling the awaited se
     proc.child.stdin!.write(JSON.stringify({ ref: "barrier", cmd: "status" }) + "\n");
     await waitFor(() => proc?.out.includes('"ref":"barrier"'));
     const incoming = await peer.send({ to: "wait-node", message: "new directive" });
-    await waitFor(() => proc?.out.includes('"ref":"waiting"'), 2000);
+    await waitFor(() => proc?.out.includes('"ref":"waiting"') && proc.out.includes('"ref":"task"'), 2000);
     const events = proc.out.split("\n").filter(Boolean).map((line) => JSON.parse(line));
     const verdict = events.find((event) => event.ref === "waiting")?.verdict;
     assert.equal(verdict.status, "interrupted");
     assert.equal(verdict.reason, "inbound_message");
     assert.equal(verdict.interruptedBy, incoming.msgId);
     assert.equal(verdict.missing[0]?.msgId, original!.id);
-    assert.equal(events.some((event) => event.ref === "task"), false, "yielding the wait must not cancel the blocking request");
+    const taskResult = events.find((event) => event.ref === "task")?.result;
+    assert.equal(taskResult.status, "interrupted");
+    assert.equal(taskResult.tracked, true);
+    assert.equal(taskResult.interruptedBy, incoming.msgId);
     await peer.reply(original!.id, "task completed");
-    await waitFor(() => proc?.out.includes('"ref":"task"'));
-    const taskLine = proc.out.split("\n").find((line) => line.includes('"ref":"task"'));
-    assert.equal(JSON.parse(taskLine!).result.status, "reply");
-    assert.equal(JSON.parse(taskLine!).result.response, "task completed");
+    await waitFor(() => proc?.out.includes('"body":"task completed"'));
+    proc.child.stdin!.write(JSON.stringify({ ref: "resumed", cmd: "wait", timeoutMs: 5000 }) + "\n");
+    await waitFor(() => proc?.out.includes('"ref":"resumed"'));
+    const resumedLine = proc.out.split("\n").find((line) => line.includes('"ref":"resumed"'));
+    const resumed = JSON.parse(resumedLine!).verdict;
+    assert.equal(resumed.status, "complete");
+    assert.deepEqual(resumed.answers, [{ msgId: original!.id, to: "peer", response: "task completed" }]);
     proc.child.stdin!.write(JSON.stringify({ cmd: "exit" }) + "\n");
     assert.equal(await proc.done, 0);
   } finally {

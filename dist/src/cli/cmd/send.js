@@ -34,6 +34,9 @@ export function printResult(r) {
         case "expired":
             say(`expired ${r.msgId ?? ""}`);
             break;
+        case "interrupted":
+            say(`interrupted: ${r.reason}${r.msgId !== undefined ? ` ${r.msgId}` : ""} (delivery=${r.delivery}; ${r.delivery === "not_sent" ? "not sent" : r.tracked ? "mission remains tracked" : "check delivery before resending"})`);
+            break;
         case "blocked":
             say(`blocked: ${r.reason}`);
             break;
@@ -54,6 +57,8 @@ export function exitCodeFor(r, requireOnline) {
         return EXIT_MESH_FAILURE;
     if (r.status === "expired")
         return EXIT_EXPIRED;
+    if (r.status === "interrupted")
+        return EXIT_PARTIAL;
     if (r.status === "queued_offline")
         return requireOnline ? EXIT_MESH_FAILURE : EXIT_PARTIAL;
     if (r.status === "delivered" && r.totalCount !== undefined && r.deliveredCount !== undefined && r.deliveredCount < r.totalCount) {

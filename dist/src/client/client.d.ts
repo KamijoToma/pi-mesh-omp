@@ -81,10 +81,18 @@ export type SendResult = {
     response: string;
     outputHash: string;
 } | {
+    status: "interrupted";
+    msgId?: string;
+    reason: string;
+    interruptedBy?: string;
+    delivery: "not_sent" | "unknown" | "delivered" | "queued_offline";
+    tracked: boolean;
+} | {
     status: "expired" | "blocked" | "error";
     msgId?: string;
     reason: string;
     delivery?: "delivered" | "queued_offline" | "unknown";
+    tracked?: boolean;
 };
 export declare function isBroadcastResult(res: SendResult): res is Extract<SendResult, {
     deliveredCount?: number;
@@ -194,12 +202,9 @@ export declare class MeshClient extends EventEmitter {
     private readonly inbox;
     private readonly awaitTargets;
     private readonly pending;
-    /** waitAll() calls currently in flight (a counter: two concurrent
-     *  waits must not clear each other's suppression) — while > 0, matched
-     *  LAUNCH answers skip session injection (the verdict carries that
-     *  batch). */
-    private waitAllInFlight;
+    /** Each active verdict owns only the missions in its starting snapshot. */
     private readonly waitAllStops;
+    private readonly foregroundSends;
     private waitStopReason;
     /** Memory-only ring buffer of last frames (bodies included) for mesh_history. */
     readonly transcript: MeshFrame[];
@@ -271,8 +276,9 @@ export declare class MeshClient extends EventEmitter {
     }[];
     /** Cancel pending replies and clear every mission from the previous batch. */
     cancelAllAwaited(): void;
-    /** End active group waits without cancelling missions or the host turn. */
-    interruptWaitAll(reason: string, msgId?: string): boolean;
+    /** Yield passive waits without cancelling missions or aborting the host turn. */
+    interruptWaits(reason: string, msgId?: string): boolean;
+    private stopForegroundSends;
     private stopWaitAll;
     /** bound the awaitedMissions history (oldest dropped first). */
     private pruneAwaitedMissions;

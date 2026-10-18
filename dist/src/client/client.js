@@ -106,12 +106,9 @@ export class MeshClient extends EventEmitter {
     inbox = new Map(); // msgId → inbound msg (mesh_reply target)
     awaitTargets = new Map();
     pending;
-    /** waitAll() calls currently in flight (a counter: two concurrent
-     *  waits must not clear each other's suppression) — while > 0, matched
-     *  LAUNCH answers skip session injection (the verdict carries that
-     *  batch). */
-    waitAllInFlight = 0;
-    waitAllStops = new Set();
+    /** Each active verdict owns only the missions in its starting snapshot. */
+    waitAllStops = new Map();
+    foregroundSends = new Set();
     waitStopReason = "closed";
     /** Memory-only ring buffer of last frames (bodies included) for mesh_history. */
     transcript = [];
@@ -251,14 +248,23 @@ export class MeshClient extends EventEmitter {
         this.awaitedMissions.clear();
         this.reportedMissions.clear();
     }
-    /** End active group waits without cancelling missions or the host turn. */
-    interruptWaitAll(reason, msgId) {
-        const interrupted = this.waitAllStops.size > 0;
+    /** Yield passive waits without cancelling missions or aborting the host turn. */
+    interruptWaits(reason, msgId) {
+        let interrupted = this.waitAllStops.size > 0;
+        for (const send of this.foregroundSends) {
+            interrupted = send.stop("interrupted", reason, msgId) || interrupted;
+        }
         this.stopWaitAll("interrupted", reason, msgId);
         return interrupted;
     }
+    stopForegroundSends(reason, preserveSelection) {
+        for (const send of this.foregroundSends) {
+            if (send.selectionGeneration !== preserveSelection)
+                send.stop("error", reason);
+        }
+    }
     stopWaitAll(status, reason, msgId) {
-        for (const stop of this.waitAllStops)
+        for (const stop of this.waitAllStops.keys())
             stop(status, reason, msgId);
     }
     /** bound the awaitedMissions history (oldest dropped first). */
@@ -322,7 +328,7 @@ export class MeshClient extends EventEmitter {
         if (this.#selection !== null || this.intentionallyClosed) {
             return this.summarize(start, "cancelled", targetList, this.waitStopReason);
         }
-        this.waitAllInFlight += 1;
+        const targetSet = new Set(targetList);
         let resolve;
         const promise = new Promise((settle) => { resolve = settle; });
         let settled = false;
@@ -334,7 +340,6 @@ export class MeshClient extends EventEmitter {
             clearTimeout(timer ?? undefined);
             this.waitAllStops.delete(done);
             this.removeListener("missions", tick);
-            this.waitAllInFlight -= 1;
             signal?.removeEventListener("abort", onAbort);
             // Only normal verdicts consume answers. Interrupted/error/cancelled
             // waits may be retried with their partial answers intact.
@@ -375,7 +380,7 @@ export class MeshClient extends EventEmitter {
             timer = setTimeout(tick, Math.min(200, Math.max(1, deadline - Date.now())));
             timer.unref();
         };
-        this.waitAllStops.add(done);
+        this.waitAllStops.set(done, targetSet);
         this.on("missions", tick);
         if (signal?.aborted)
             onAbort();
@@ -486,7 +491,7 @@ export class MeshClient extends EventEmitter {
     }
     /** A live reply/transport promise belongs to this client until it settles. */
     isReloadSafe() {
-        return this.pending.size === 0 && this.waitAllInFlight === 0 &&
+        return this.pending.size === 0 && this.waitAllStops.size === 0 && this.foregroundSends.size === 0 &&
             this.ackWaiters.size === 0 && this.statusWaiters.size === 0 &&
             this.connecting === null && this.#selection === null && this.#socketClosing === null;
     }
@@ -679,7 +684,7 @@ export class MeshClient extends EventEmitter {
         const selecting = Promise.resolve().then(async () => {
             if (generation !== this.#selectionGeneration)
                 throw new Error("connection_cancelled");
-            await this.#closeConnection("reset");
+            await this.#closeConnection("reset", generation);
             if (generation !== this.#selectionGeneration)
                 throw new Error("connection_cancelled");
             this.config = { ...config, rooms: [...this.joinedRooms.keys()] };
@@ -1007,6 +1012,7 @@ export class MeshClient extends EventEmitter {
         if (wasOnline) {
             this.#connectionError = "connection_lost";
             this.stopWaitAll("error", "connection_lost");
+            this.stopForegroundSends("connection_lost");
         }
         this.stopHeartbeat();
         // in-flight sends: honest error, never delivered)
@@ -1129,11 +1135,33 @@ export class MeshClient extends EventEmitter {
                     this.emit("inbound", frame, { matchedReply: false });
                     break;
                 }
-                // wake-on-answer: consult the launch flag BEFORE handleReply consumes it
-                const wake = replyTo !== undefined && this.pending.isLaunch(replyTo) && this.waitAllInFlight === 0;
+                // Ownership is per snapshot, captured before settlement can finish a verdict.
+                let groupOwnsReply = false;
+                if (replyTo !== undefined) {
+                    for (const targets of this.waitAllStops.values()) {
+                        if (targets.has(replyTo)) {
+                            groupOwnsReply = true;
+                            break;
+                        }
+                    }
+                }
+                const wake = replyTo !== undefined && this.pending.isLaunch(replyTo) && !groupOwnsReply;
                 const matched = replyTo !== undefined ? this.pending.handleReply(frame) : false;
                 if (matched) {
-                    // awaited reply — the send promise already carries the answer
+                    // A result must not remain trapped behind a different passive tool.
+                    // The send/group that actually carries this answer keeps normal ownership.
+                    let interruptedWaits = false;
+                    for (const send of this.foregroundSends) {
+                        if (send.msgId !== replyTo) {
+                            interruptedWaits = send.stop("interrupted", "inbound_message", frame.id) || interruptedWaits;
+                        }
+                    }
+                    for (const [stop, targets] of this.waitAllStops) {
+                        if (replyTo !== undefined && !targets.has(replyTo)) {
+                            stop("interrupted", "inbound_message", frame.id);
+                            interruptedWaits = true;
+                        }
+                    }
                     if (replyTo !== undefined) {
                         this.markReplyHandled(replyTo, body);
                         const m = this.awaitedMissions.get(replyTo);
@@ -1145,16 +1173,12 @@ export class MeshClient extends EventEmitter {
                         }
                     }
                     if (wake) {
-                        // LAUNCH mission, no wait_all in flight: deliver the answer to the
-                        // session like an orphan reply — stored in the inbox (so it can itself
-                        // be replied to) and injected with triggerTurn, waking an idle session.
-                        // While wait_all is active the verdict carries this batch instead (no
-                        // double delivery).
+                        // No active verdict owns this background answer: surface it once.
                         if (frame.id) {
                             this.inbox.set(frame.id, frame);
                             this.pruneInbox();
                         }
-                        this.emit("inbound", frame, { matchedReply: true });
+                        this.emit("inbound", frame, { matchedReply: true, interruptedWaits });
                     }
                     else {
                         this.emit("reply", frame);
@@ -1395,82 +1419,143 @@ export class MeshClient extends EventEmitter {
             return { status: "error", reason: "block_requires_awaitReply" };
         }
         const timeoutMs = Math.min(MAX_AWAIT_REPLY_TIMEOUT_MS, Math.max(MIN_AWAIT_REPLY_TIMEOUT_MS, opts.timeoutMs ?? DEFAULT_AWAIT_REPLY_TIMEOUT_MS));
-        const selectionGeneration = this.#selectionGeneration;
-        if (!this.online || this.#selection !== null) {
-            try {
-                await this.#awaitConnection(this.connect(), opts.signal);
-            }
-            catch (error) {
-                if (opts.signal?.aborted)
-                    return { status: "error", reason: "aborted" };
-                return {
-                    status: "blocked",
-                    reason: error instanceof Error ? error.message : String(error),
-                };
-            }
-        }
-        if (opts.signal?.aborted)
-            return { status: "error", reason: "aborted" };
-        if (selectionGeneration !== this.#selectionGeneration || !this.online) {
-            return { status: "blocked", reason: "connection_cancelled" };
-        }
-        const expiresAt = opts.awaitReply ? new Date(Date.now() + timeoutMs).toISOString() : undefined;
-        const frame = buildFrame({
-            type: "msg",
-            from: this.alias,
-            to,
-            room,
-            priority,
-            body: opts.message,
-            refs: opts.refs,
-            broadcast: broadcast ? true : undefined,
-            replyTargets,
-            reasonHash: priority === "force" ? sha256(opts.reason ?? "") : undefined,
-            interrupt: opts.interrupt === true ? true : undefined,
-            expiresAt,
-        });
-        let encoded;
-        try {
-            encoded = encodeFrame(frame, this.config.maxFrameBytes);
-        }
-        catch (error) {
-            if (error instanceof FrameSizeError)
-                return { status: "error", reason: "oversized" };
-            throw error;
-        }
-        // register pending BEFORE write to avoid a reply/registration race
-        let pendingPromise = null;
-        if (opts.awaitReply) {
-            this.awaitTargets.set(frame.id, { to: to ?? "*", room });
-            this.awaitedMissions.set(frame.id, {
-                to: to ?? "*", room, status: "waiting", answered: false,
-                targetOnline: to !== undefined && this.knownPeerRooms.get(to)?.has(room) === true,
-                brokerBootId: this.#brokerInfo?.bootId,
-            });
-            this.pruneAwaitedMissions();
-            pendingPromise = this.pending.register(frame.id, Date.now() + timeoutMs, launch);
-        }
+        let frame;
         let written = false;
+        let detached = false;
         let confirmedDelivery;
-        const ackPromise = this.waitAck(frame.id);
-        const onAbort = () => {
-            confirmedDelivery = this.awaitedMissions.get(frame.id)?.delivery ?? confirmedDelivery;
-            const waiter = this.ackWaiters.get(frame.id);
-            if (waiter !== undefined) {
-                clearTimeout(waiter.timer);
-                this.ackWaiters.delete(frame.id);
-                waiter.resolve(buildFrame({ type: "error", id: frame.id, code: "internal", status: "aborted" }));
-            }
-            this.pending.cancel(frame.id, "aborted");
-            this.awaitedMissions.delete(frame.id);
+        let resolveForeground;
+        const foregroundResult = new Promise((resolve) => { resolveForeground = resolve; });
+        const deliveryKnowledge = () => written ? (frame === undefined ? undefined : this.awaitedMissions.get(frame.id)?.delivery)
+            ?? confirmedDelivery ?? "unknown" : "not_sent";
+        const detach = () => {
+            detached = true;
+            this.foregroundSends.delete(foreground);
+            this.removeListener("missions", onMissions);
+            opts.signal?.removeEventListener("abort", onAbort);
         };
+        const foreground = {
+            selectionGeneration: this.#selectionGeneration,
+            stop: (status, reason, interruptedBy) => {
+                if (detached || (!launch && frame !== undefined && this.awaitedMissions.get(frame.id)?.answered))
+                    return false;
+                const delivery = deliveryKnowledge();
+                detach();
+                if (frame !== undefined) {
+                    if (written) {
+                        if (status === "interrupted" || reason === "connection_lost" || reason === "target_offline") {
+                            this.pending.promoteToLaunch(frame.id);
+                        }
+                        else {
+                            this.pending.cancel(frame.id, reason);
+                        }
+                    }
+                    else {
+                        this.pending.cancel(frame.id, reason);
+                        this.awaitedMissions.delete(frame.id);
+                    }
+                }
+                const tracked = frame !== undefined && this.pending.has(frame.id);
+                resolveForeground(status === "interrupted"
+                    ? { status, ...(written && frame !== undefined ? { msgId: frame.id } : {}),
+                        reason, ...(interruptedBy !== undefined ? { interruptedBy } : {}), delivery, tracked }
+                    : { status, ...(written && frame !== undefined ? { msgId: frame.id } : {}),
+                        reason, ...(delivery !== "not_sent" ? { delivery } : {}), tracked });
+                return true;
+            },
+        };
+        const onMissions = () => {
+            if (frame === undefined || detached)
+                return;
+            const mission = this.awaitedMissions.get(frame.id);
+            if (mission?.unavailableReason !== undefined)
+                foreground.stop("error", mission.unavailableReason);
+        };
+        const onAbort = () => {
+            if (detached)
+                return;
+            const delivery = deliveryKnowledge();
+            detach();
+            if (frame !== undefined) {
+                const waiter = this.ackWaiters.get(frame.id);
+                if (waiter !== undefined) {
+                    clearTimeout(waiter.timer);
+                    this.ackWaiters.delete(frame.id);
+                    waiter.resolve(buildFrame({ type: "error", id: frame.id, code: "internal", status: "aborted" }));
+                }
+                this.pending.cancel(frame.id, "aborted");
+                this.awaitedMissions.delete(frame.id);
+            }
+            resolveForeground({ status: "error", ...(frame !== undefined ? { msgId: frame.id } : {}),
+                reason: "aborted", ...(delivery !== "not_sent" ? { delivery } : {}) });
+        };
+        this.foregroundSends.add(foreground);
+        this.on("missions", onMissions);
         opts.signal?.addEventListener("abort", onAbort, { once: true });
-        try {
+        const run = async () => {
+            const selectionGeneration = this.#selectionGeneration;
+            if (!this.online || this.#selection !== null) {
+                try {
+                    await this.connect();
+                }
+                catch (error) {
+                    return { status: "blocked", reason: error instanceof Error ? error.message : String(error) };
+                }
+            }
+            // A yielded connection attempt may finish, but must never send later.
+            if (detached)
+                return { status: "error", reason: "not_sent" };
             if (opts.signal?.aborted) {
                 onAbort();
+                return { status: "error", reason: "aborted" };
             }
-            else if (this.online && this.socket !== null && !this.socket.destroyed) {
-                // No unsent send frame may escape through a later outbox flush.
+            if (selectionGeneration !== this.#selectionGeneration || !this.online) {
+                return { status: "blocked", reason: "connection_cancelled" };
+            }
+            frame = buildFrame({
+                type: "msg", from: this.alias, to, room, priority, body: opts.message, refs: opts.refs,
+                broadcast: broadcast ? true : undefined, replyTargets,
+                reasonHash: priority === "force" ? sha256(opts.reason ?? "") : undefined,
+                interrupt: opts.interrupt === true ? true : undefined,
+                expiresAt: opts.awaitReply ? new Date(Date.now() + timeoutMs).toISOString() : undefined,
+            });
+            foreground.msgId = frame.id;
+            let encoded;
+            try {
+                encoded = encodeFrame(frame, this.config.maxFrameBytes);
+            }
+            catch (error) {
+                if (error instanceof FrameSizeError)
+                    return { status: "error", reason: "oversized" };
+                throw error;
+            }
+            // Register before write; yielding during registration cancels the unsent mission.
+            let pendingPromise = null;
+            if (opts.awaitReply) {
+                this.awaitTargets.set(frame.id, { to: to ?? "*", room });
+                this.awaitedMissions.set(frame.id, {
+                    to: to ?? "*", room, status: "waiting", answered: false,
+                    targetOnline: to !== undefined && this.knownPeerRooms.get(to)?.has(room) === true,
+                    brokerBootId: this.#brokerInfo?.bootId,
+                });
+                this.pruneAwaitedMissions();
+                pendingPromise = this.pending.register(frame.id, Date.now() + timeoutMs, launch);
+                if (!launch) {
+                    const msgId = frame.id;
+                    // A real answer already proves completion; a delayed ACK must not
+                    // hold its owning tool hostage. ACK bookkeeping continues below.
+                    void pendingPromise.then((resolution) => {
+                        if (detached || resolution.kind !== "reply" || resolution.frame === undefined)
+                            return;
+                        detach();
+                        resolveForeground({ status: "reply", msgId, response: resolution.frame.body ?? "",
+                            outputHash: resolution.frame.bodyHash ?? "" });
+                    });
+                }
+            }
+            if (detached)
+                return { status: "error", reason: "not_sent" };
+            const ackPromise = this.waitAck(frame.id);
+            if (this.online && this.socket !== null && !this.socket.destroyed) {
                 this.socket.write(encoded);
                 written = true;
                 this.ring(frame);
@@ -1483,42 +1568,50 @@ export class MeshClient extends EventEmitter {
                     waiter.resolve(buildFrame({ type: "error", id: frame.id, code: "internal", status: "connection_lost" }));
                 }
             }
+            // Keep this transaction alive after yielding: its ACK must still update
+            // delivery or settle a genuine refusal, without owning the old tool signal.
             const ack = await ackPromise;
             if (ack.type === "error") {
                 const reason = ack.status ?? ack.code ?? "internal";
-                this.pending.cancel(frame.id, reason);
-                const delivery = written ? confirmedDelivery ?? this.awaitedMissions.get(frame.id)?.delivery ?? "unknown" : undefined;
+                const retain = written && reason === "connection_lost";
+                if (retain)
+                    this.pending.promoteToLaunch(frame.id);
+                else
+                    this.pending.cancel(frame.id, reason);
+                const delivery = deliveryKnowledge();
                 if (BLOCKED_CODES.has(reason))
                     return { status: "blocked", msgId: frame.id, reason };
-                return { status: "error", msgId: frame.id, reason, ...(delivery !== undefined ? { delivery } : {}) };
+                return { status: "error", msgId: frame.id, reason,
+                    ...(delivery !== "not_sent" ? { delivery } : {}), ...(retain ? { tracked: this.pending.has(frame.id) } : {}) };
             }
             const mission = this.awaitedMissions.get(frame.id);
-            const delivery = confirmedDelivery ?? mission?.delivery ?? ack.status;
+            const delivery = mission?.delivery ?? confirmedDelivery ?? ack.status;
             if (delivery !== "delivered" && delivery !== "queued_offline") {
                 const reason = `unexpected_ack_status: ${ack.status ?? "missing"}`;
                 this.pending.cancel(frame.id, reason);
                 return { status: "error", msgId: frame.id, reason, delivery: "unknown" };
             }
             confirmedDelivery = delivery;
-            if (opts.signal?.aborted) {
-                return { status: "error", msgId: frame.id, reason: "aborted", delivery };
-            }
-            if (!opts.awaitReply || pendingPromise === null || launch) {
+            if (!opts.awaitReply || pendingPromise === null || launch || detached) {
                 return { status: delivery, msgId: frame.id, deliveredCount: ack.deliveredCount, totalCount: ack.totalCount };
             }
+            onMissions();
+            if (detached)
+                return { status: delivery, msgId: frame.id };
             const resolution = await pendingPromise;
             if (resolution.kind === "reply" && resolution.frame !== undefined) {
-                return {
-                    status: "reply", msgId: frame.id, response: resolution.frame.body ?? "",
-                    outputHash: resolution.frame.bodyHash ?? "",
-                };
+                return { status: "reply", msgId: frame.id, response: resolution.frame.body ?? "",
+                    outputHash: resolution.frame.bodyHash ?? "" };
             }
             if (resolution.kind === "expired")
                 return { status: "expired", msgId: frame.id, reason: "expired" };
             return { status: "error", msgId: frame.id, reason: resolution.reason ?? "error", delivery };
+        };
+        try {
+            return await Promise.race([foregroundResult, run()]);
         }
         finally {
-            opts.signal?.removeEventListener("abort", onAbort);
+            detach();
         }
     }
     async reply(msgId, body, opts = {}) {
@@ -1806,6 +1899,7 @@ export class MeshClient extends EventEmitter {
         this.stopHeartbeat();
         this.waitStopReason = "renamed";
         this.stopWaitAll("cancelled", "renamed");
+        this.stopForegroundSends("renamed");
         this.pending.cancelAll("renamed");
         for (const [id, waiter] of this.ackWaiters) {
             clearTimeout(waiter.timer);
@@ -1900,7 +1994,7 @@ export class MeshClient extends EventEmitter {
         this.#selectionGeneration += 1;
         return this.#closeConnection();
     }
-    async #closeConnection(reason = "closed") {
+    async #closeConnection(reason = "closed", preserveSelection) {
         this.intentionallyClosed = true;
         this.waitStopReason = reason;
         this.#connectionGeneration += 1;
@@ -1915,6 +2009,7 @@ export class MeshClient extends EventEmitter {
         this.stopWatchdog();
         // Settle snapshots before reset clears their mission maps.
         this.stopWaitAll("cancelled", reason);
+        this.stopForegroundSends(reason, preserveSelection);
         this.pending.cancelAll(reason);
         const socket = this.socket;
         this.socket = null;

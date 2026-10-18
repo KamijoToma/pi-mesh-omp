@@ -351,7 +351,7 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
     reloadApiVersion: 2,
     version: MESH_VERSION,
     isReloadSafe: () => runtime !== null && runtime.client.isReloadSafe() &&
-      runtime.isInboundReloadSafe?.() !== false,
+      runtime.isInboundReloadSafe?.() !== false && (runtime.pendingToolOperations?.size ?? 0) === 0,
     suspend: async () => {
       const rt = runtime;
       if (rt === null || rt.captureInboundForReload === undefined) {

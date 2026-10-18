@@ -58,6 +58,15 @@ duplicates, loops and confusion.
 - `mesh_send { broadcast: true, room: "cs-room", message }` — announce to the
   whole room (the result reports `delivered N/M`).
 - `awaitReply: true` waits for an answer (60 min default and maximum timeout).
+- A blocking send yields on actionable input with `status: interrupted`.
+  Check `delivery` (`not_sent` / `unknown` / `delivered` / `queued_offline`)
+  and `tracked`: written reply missions continue in the background and their
+  later answers still wake the session. Do not resend tracked/uncertain work;
+  process the new message, then wait again if needed.
+- Control tools (`mesh_reply`, `mesh_status`, `mesh_alias`, `mesh_reserve`,
+  `mesh_release`) can yield with `operationId` and `pendingOperation: true`.
+  They are not cancelled: their real completion arrives as
+  `mesh-operation-result`. Do not repeat the operation or reply to its notice.
 - **`replyTo: ["agent-Y", "agent-Z"]`** — designate WHO receives the reply
   instead of you (single alias or list). The recipient's plain `mesh_reply`
   then goes to ALL of them. Include yourself in the list if you also want the
@@ -88,9 +97,10 @@ duplicates, loops and confusion.
 ## Launch a burst, then wait_all (delay-free, general pattern)
 
 1. **Launch** every mission with `awaitReply: true, block: false` — the
-   tool returns `delivered` immediately and the mission stays tracked in
-   the background (reminds, expiry, answers). A burst of N missions costs
-   one turn, not N blocking calls. **Each answer arrives the moment it
+   tool normally returns the broker's `delivered`/`queued_offline` ACK and
+   keeps the mission in the background. If it yields before the ACK, inspect
+   `delivery` and `tracked` rather than assuming success or resending.
+   A burst costs one turn, not N blocking calls. **Each answer
    lands as a `[mesh]` reply event** (an idle session wakes; keep working
    in the meantime) and lands in the inbox, so it can be replied to.
 2. **`mesh_wait_all { timeoutMs }`** — the turn is suspended INSIDE the
@@ -102,9 +112,9 @@ duplicates, loops and confusion.
    a batch containing only terminal missing missions returns immediately.
    While it runs, answers are carried by the verdict, not injected again.
    Reach for it only when you must collect the whole batch before continuing.
-3. **A wait can yield without cancelling its tasks.** Actionable normal or
-   urgent input returns `interrupted` (`reason: inbound_message`); the message
-   reaches the next model call as steer, without force or a host-turn abort.
+3. **Single sends and group waits can yield without cancelling their tasks.**
+   Actionable normal/urgent input returns `interrupted` (`reason: inbound_message`);
+   it reaches the next model call as steer, without force or a host-turn abort.
    Deferred broadcasts, machine receipts and reply-to-reply metadata do not
    wake it. A previously-online target leaving the mission room returns
    `error: target_offline`; initial `queued_offline` tasks still wait normally.
@@ -117,6 +127,9 @@ duplicates, loops and confusion.
    reconnect, then wait again. Broker mailboxes are memory-only:
    `broker_state_lost_delivery_unknown` does not prove non-execution.
    Confirmed-delivered tasks can still finish after the broker restarts.
+- Provider-failure holds still yield foreground waits, but retain ordinary
+  message bodies until recovery to avoid failed model turns. Authorized force
+  bypasses that hold; it does not clear the protection for ordinary input.
 - Never poll with `mesh_history`/`mesh_status` to check who answered.
 - `block: false` without `awaitReply` is refused. ESC on a blocking send
   returns `aborted`; a pre-write abort sends nothing, but after a write

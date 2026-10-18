@@ -7,14 +7,14 @@ import { buildBatchMessage, bypassesBatch, batchDetails, InboundBatcher } from "
 import { DeferredInbox, type DeferredInboxReloadState } from "./deferred-inbox.js";
 import { classifyInbound } from "./inbound-policy.js";
 import type { MeshHud } from "./hud.js";
-import { tagInboundReplyChain, recordInboundDelivery, injectInbound, type FormatOpts, type InjectOpts } from "./inbound.js";
+import { tagInboundReplyChain, recordInboundDelivery, injectInbound, handleInboundFrame, type FormatOpts, type InjectOpts } from "./inbound.js";
 import { ReplyHintTracker, type ReplyHintReloadState } from "./reply-hints.js";
 import type { ExtensionAPI, InboundMessage, SessionContext } from "./pi-types.js";
-import type { MeshRuntime } from "./tools.js";
+import { interruptToolOperations, type MeshRuntime } from "./tools.js";
 
 export interface MeshInboundReloadState {
   deferred: DeferredInboxReloadState;
-  held: { frame: MeshFrame; matchedReply: boolean }[];
+  held: { frame: MeshFrame; matchedReply: boolean; interruptedWaits?: boolean }[];
   batched: MeshFrame[];
   fullContextSent: boolean;
   lastPeersOnline: string[];
@@ -92,6 +92,7 @@ export function attachClientListeners(
   const pendingInjections = new Set<MeshFrame>();
   rt.isInboundReloadSafe = () => pendingInjections.size === 0;
   const active = (): boolean => !detached && isCurrent() && rt.client === client;
+  rt.isCurrent = active;
   const guarded = (fn: () => void): void => {
     if (!active()) return;
     try {
@@ -131,6 +132,7 @@ export function attachClientListeners(
     counters: rt,
     read: (msgId: string, from: string) => client.sendRead(msgId, from),
     isReplyToReply: (replyTo: string) => client.isReplyToReply(replyTo),
+    onSettled: (frame: MeshFrame) => { pendingInjections.delete(frame); },
   };
   // batch inbound messages over a short window → ONE injection (one
   // turn) for a burst; force/remind bypass the batcher (immediate delivery).
@@ -139,22 +141,21 @@ export function attachClientListeners(
     client.inboundBatchMaxHoldMs,
     () => rt.ctx?.isIdle?.() === false, // busy = a turn is running (e.g. sleep)
     (frames: MeshFrame[]) => {
-    if (!active()) return;
-    const batch = buildBatchMessage(frames, (f) =>
-      formatOptsFor(f, client.contextVerbosity === "full", client.homeRoom, hintTracker),
-    );
-    guarded(() => {
-      pi.sendMessage(
-        {
-          customType: "mesh-inbound",
-          content: batch.content,
-          display: true,
-          details: batchDetails(frames),
-        },
-        { triggerTurn: true, deliverAs: batch.deliverAs },
+      if (!active()) return;
+      const first = frames[0];
+      if (first === undefined) return;
+      const batch = buildBatchMessage(frames, (frame) =>
+        formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker),
       );
-      for (const frame of frames) recordInboundDelivery(frame, deps);
-    });
+      const message: InboundMessage = {
+        customType: "mesh-inbound", content: batch.content, display: true, details: batchDetails(frames),
+      };
+      pendingInjections.add(first);
+      handleInboundFrame(deliveryHost, deliveryContext, first, deps, () => {
+        if (!active()) return;
+        deliveryHost.sendMessage(message, { triggerTurn: true, deliverAs: batch.deliverAs });
+        for (const frame of frames) recordInboundDelivery(frame, deps);
+      });
   },
   );
   const deferredInbox = new DeferredInbox(deliveryHost, (frame) =>
@@ -168,21 +169,22 @@ export function attachClientListeners(
   // rate-limited hold: while the provider rejects turns (429), inbound
   // frames are NOT injected — every injection would burn another failed
   // turn. They are queued and delivered when the hold expires.
-  const heldFrames: { frame: MeshFrame; matchedReply: boolean }[] = [...(restored?.held ?? [])];
+  const heldFrames: { frame: MeshFrame; matchedReply: boolean; interruptedWaits?: boolean }[] = [...(restored?.held ?? [])];
   const pausedBatches: MeshFrame[] = [...(restored?.batched ?? [])];
-  const deliver = (frame: MeshFrame, matchedReply: boolean): void => {
+  const wakeForInput = (frame: MeshFrame, interruptedWaits = false): boolean => {
+    if (frame.receipt === true || ("__replyChain" in frame && frame.__replyChain === true)) return false;
+    const operationWoke = interruptToolOperations(rt, "inbound_message", frame.id);
+    const taskWoke = frame.priority !== "force" && client.interruptWaits("inbound_message", frame.id);
+    return interruptedWaits || operationWoke || taskWoke;
+  };
+  const deliver = (frame: MeshFrame, matchedReply: boolean, interruptedWaits = false): void => {
     tagInboundReplyChain(frame, deps);
     getHud()?.refresh();
     if (classifyInbound(frame, client.alias, client.inboundBroadcasts, matchedReply) === "deferred") {
       deferredInbox.push(frame);
       return;
     }
-    const wakeWaiting =
-      !matchedReply &&
-      frame.priority !== "force" &&
-      frame.receipt !== true &&
-      !("__replyChain" in frame && frame.__replyChain === true) &&
-      client.interruptWaitAll("inbound_message", frame.id);
+    const wakeWaiting = wakeForInput(frame, interruptedWaits);
     const opts: FormatOpts = {
       ...formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker),
     };
@@ -219,6 +221,13 @@ export function attachClientListeners(
             });
           }
         };
+      }
+      if (frame.priority !== "force") {
+        pendingInjections.add(frame);
+        handleInboundFrame(deliveryHost, deliveryContext, frame, deps, () => {
+          if (active()) injectInbound(deliveryHost, deliveryContext, frame, injectOpts);
+        });
+        return;
       }
       guarded(() => {
         let completed = false;
@@ -267,15 +276,23 @@ export function attachClientListeners(
   rt.flushHeld = (): void => {
     if (!active() || paused) return;
     const frames = heldFrames.splice(0);
-    for (const { frame, matchedReply } of frames) deliver(frame, matchedReply);
+    for (const { frame, matchedReply, interruptedWaits } of frames) deliver(frame, matchedReply, interruptedWaits);
   };
-  client.on("inbound", (frame: MeshFrame, meta?: { matchedReply?: boolean }) => {
+  client.on("inbound", (frame: MeshFrame, meta?: { matchedReply?: boolean; interruptedWaits?: boolean }) => {
     if (!active()) return;
-    if (paused || (rt.rateLimitedUntil !== undefined && rt.rateLimitedUntil > Date.now())) {
-      heldFrames.push({ frame, matchedReply: meta?.matchedReply === true }); // no injection while the provider rejects turns
+    const matchedReply = meta?.matchedReply === true;
+    if (paused) {
+      heldFrames.push({ frame, matchedReply, interruptedWaits: meta?.interruptedWaits });
       return;
     }
-    deliver(frame, meta?.matchedReply === true);
+    if (frame.priority !== "force" && rt.rateLimitedUntil !== undefined && rt.rateLimitedUntil > Date.now()) {
+      tagInboundReplyChain(frame, deps);
+      const wake = classifyInbound(frame, client.alias, client.inboundBroadcasts, matchedReply) === "deferred"
+        ? false : wakeForInput(frame, meta?.interruptedWaits);
+      heldFrames.push({ frame, matchedReply, interruptedWaits: wake });
+      return;
+    }
+    deliver(frame, matchedReply, meta?.interruptedWaits);
   });
   rt.batcher = batcher;
   rt.clearInbound = () => {
@@ -437,24 +454,28 @@ export function attachClientListeners(
   client.on("pending", () => guarded(() => getHud()?.refresh()));
 
   // async drop receipt: the broker dropped one of OUR messages from the
-  // recipient's offline mailbox (TTL expiry or cap eviction). The client
-  // already settled any live awaitReply mission; the session must LEARN
-  // the message will never arrive so a re-send decision is possible.
+  // recipient's offline mailbox. The client
+  // already settled its mission; wake any other passive wait so the explicit
+  // failure reaches the model without waiting for an unrelated task.
   client.on("dropped_offline", (frame: MeshFrame) => {
     if (!active()) return;
     const target = frame.to ?? "?";
-    guarded(() => {
-      pi.sendMessage(
+    pendingInjections.add(frame);
+    handleInboundFrame(deliveryHost, deliveryContext, frame, deps, () => {
+      if (!active()) return;
+      const operationWoke = interruptToolOperations(rt, "dropped_offline", frame.id);
+      const taskWoke = client.interruptWaits("dropped_offline", frame.id);
+      deliveryHost.sendMessage(
         {
           customType: "mesh-inbound",
           content:
             `[mesh] drop notice: message ${frame.id} to @${target} was dropped from the ` +
-            `offline mailbox (TTL expiry or cap). It will never be delivered — ` +
-            `re-send with mesh_send if still relevant.`,
+            `offline mailbox and is no longer queued. Check whether the work ` +
+            `still needs to be reissued.`,
           display: true,
           details: { kind: "mesh-drop-notice", msgId: frame.id, to: target },
         },
-        { triggerTurn: true, deliverAs: "followUp" },
+        { triggerTurn: true, deliverAs: operationWoke || taskWoke ? "steer" : "followUp" },
       );
     });
     try {
@@ -474,6 +495,7 @@ export function attachClientListeners(
   // instead of reaching the stale pi/ctx.
   rt.markDetached = () => {
     detached = true;
+    interruptToolOperations(rt, "session_closed");
     heldFrames.length = 0;
     pausedBatches.length = 0;
     pendingInjections.clear();

@@ -4,6 +4,7 @@
 import { computePeerStatus } from "../client/client.js";
 import { buildFrame, normalizeAlias } from "../protocol/envelope.js";
 import { sha256 } from "../protocol/frames.js";
+import { deliverWithRetry } from "./inbound.js";
 import { DEFAULT_AWAIT_REPLY_TIMEOUT_MS, DEFAULT_ROOM, DEFAULT_WAIT_ALL_TIMEOUT_MS, MAX_AWAIT_REPLY_TIMEOUT_MS, MAX_BODY_BYTES, MAX_REFS, MAX_REPLY_TARGETS, MIN_AWAIT_REPLY_TIMEOUT_MS, TRANSCRIPT_RING_SIZE, } from "../shared/config.js";
 import { MESH_VERSION } from "../shared/version.js";
 import { LOOP_GUARD_WARNING, REPLY_REPEAT_WARNING } from "./guards.js";
@@ -17,6 +18,99 @@ function brokerUnavailableResult(error, details) {
     const message = error instanceof Error ? error.message : String(error);
     details.error = message;
     return textResult(`blocked: broker_unavailable: ${message}`, details);
+}
+/** Yield foreground control requests without cancelling their transactions. */
+export function interruptToolOperations(rt, reason, msgId) {
+    const operations = rt.pendingToolOperations;
+    if (operations === undefined)
+        return false;
+    let interrupted = false;
+    for (const interrupt of operations) {
+        if (interrupt(reason, msgId))
+            interrupted = true;
+    }
+    return interrupted;
+}
+function runForegroundOperation(pi, getRuntime, ctx, name, operationId, signal, operation) {
+    const rt = getRuntime();
+    if (rt === null)
+        return operation();
+    if (signal?.aborted === true) {
+        return Promise.resolve(textResult("error: aborted (operation not started)", {
+            status: "error", reason: "aborted", operationId, pendingOperation: false,
+        }));
+    }
+    const client = rt.client;
+    const sessionId = rt.sessionId;
+    const operations = rt.pendingToolOperations ??= new Set();
+    return new Promise((resolve, reject) => {
+        let foreground = true;
+        const current = () => {
+            try {
+                return getRuntime() === rt && rt.client === client && rt.sessionId === sessionId &&
+                    rt.isCurrent?.() !== false &&
+                    (ctx.sessionManager?.getSessionId() ?? sessionId) === sessionId;
+            }
+            catch {
+                return false;
+            }
+        };
+        const interrupt = (reason, msgId) => {
+            if (!foreground)
+                return false;
+            foreground = false;
+            signal?.removeEventListener("abort", onAbort);
+            resolve(textResult(`interrupted: ${reason} — ${name} (${operationId}) was not cancelled; its final result will arrive separately. Do not repeat the operation.`, { schema: "mesh.operation.v1", status: "interrupted", reason, interruptedBy: msgId, operationId, tool: name, pendingOperation: true }));
+            return true;
+        };
+        const onAbort = () => { interrupt("aborted"); };
+        const cleanup = () => {
+            operations.delete(interrupt);
+            signal?.removeEventListener("abort", onAbort);
+        };
+        const deliver = (result) => {
+            if (!current())
+                return;
+            const message = {
+                customType: "mesh-operation-result",
+                content: `[mesh] ${name} (${operationId}) completed after yielding:\n${result.content.map((part) => part.text).join("\n")}\nThis is an operation result; do not repeat the operation or reply to this notice.`,
+                display: true,
+                details: { kind: "mesh-operation-result", operationId, tool: name, result: result.details },
+            };
+            operations.add(interrupt);
+            deliverWithRetry(() => {
+                if (!current())
+                    return;
+                const taskWoke = client.interruptWaits("operation_completed", operationId);
+                const operationWoke = interruptToolOperations(rt, "operation_completed", operationId);
+                pi.sendMessage(message, {
+                    triggerTurn: true, deliverAs: taskWoke || operationWoke || signal?.aborted !== true ? "steer" : "followUp",
+                });
+            }, rt, cleanup);
+        };
+        operations.add(interrupt);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        void operation().then((result) => {
+            cleanup();
+            if (foreground) {
+                foreground = false;
+                resolve(result);
+            }
+            else {
+                deliver(result);
+            }
+        }, (error) => {
+            cleanup();
+            if (foreground) {
+                foreground = false;
+                reject(error);
+            }
+            else {
+                const reason = error instanceof Error ? error.message : String(error);
+                deliver(textResult(`error: ${reason}`, { status: "error", reason }));
+            }
+        });
+    });
 }
 function str(v) {
     return typeof v === "string" && v.trim() !== "" ? v : undefined;
@@ -37,6 +131,8 @@ function resultText(res) {
             return `reply ${res.msgId}: ${res.response}`;
         case "expired":
             return `expired ${res.msgId ?? ""} (late replies are still delivered and injected)`;
+        case "interrupted":
+            return `interrupted: ${res.reason}${res.msgId !== undefined ? ` ${res.msgId}` : ""} (delivery=${res.delivery}; ${res.delivery === "not_sent" ? "not sent" : res.tracked ? "mission remains tracked; do not resend" : "do not resend without checking delivery"})`;
         case "blocked":
             return `blocked: ${res.reason}`;
         case "error":
@@ -274,6 +370,9 @@ async function execMeshSend(getRuntime, params, signal) {
         case "blocked":
             safeLedger(rt, { event: "blocked", id: res.msgId, from: rt.client.alias, to, room, priority, bodyHash, refs, code: res.reason });
             break;
+        case "interrupted":
+            safeLedger(rt, { event: "interrupted", id: res.msgId, from: rt.client.alias, to, room, priority, bodyHash, refs, code: res.reason });
+            break;
         case "error":
             safeLedger(rt, { event: "error", id: res.msgId, from: rt.client.alias, to, room, priority, bodyHash, refs, code: res.reason });
             break;
@@ -287,6 +386,8 @@ async function execMeshSend(getRuntime, params, signal) {
         totalCount: "totalCount" in res ? res.totalCount : undefined,
         reason: "reason" in res ? res.reason : undefined,
         delivery: "delivery" in res ? res.delivery : undefined,
+        tracked: "tracked" in res ? res.tracked : undefined,
+        interruptedBy: "interruptedBy" in res ? res.interruptedBy : undefined,
     });
     if (guard.warnings.includes(LOOP_GUARD_WARNING))
         details.loopGuard = "matched";
@@ -727,7 +828,7 @@ const MESH_LEDGER_PARAMETERS = {
         room: { type: "string", description: "Filter: room." },
         event: {
             type: "string",
-            description: "Filter: sent | delivered | queued_offline | reply | expired | blocked | error | inbound | reserved | released",
+            description: "Filter: sent | delivered | queued_offline | reply | expired | interrupted | blocked | error | inbound | reserved | released",
         },
     },
 };
@@ -824,7 +925,11 @@ async function execMeshReserve(getRuntime, params) {
     const autoReleaseMs = typeof params.autoReleaseMs === "number" && params.autoReleaseMs >= 1_000
         ? Math.min(86_400_000, Math.floor(params.autoReleaseMs))
         : undefined;
-    const res = await rt.client.reserve(rawPaths, reason);
+    const client = rt.client;
+    const res = await client.reserve(rawPaths, reason);
+    if (getRuntime() !== rt || rt.client !== client || rt.isCurrent?.() === false) {
+        return textResult("error: operation_superseded", sendDetails({ status: "error", reason: "operation_superseded" }));
+    }
     if (res.status === "delivered") {
         safeLedger(rt, { event: "reserved", id: res.msgId, from: rt.client.alias, refs: rawPaths, code: reason });
         if (autoReleaseMs !== undefined)
@@ -856,7 +961,11 @@ async function execMeshRelease(getRuntime, params) {
     const rawPaths = Array.isArray(params.paths)
         ? params.paths.filter((p) => typeof p === "string")
         : undefined;
-    const res = await rt.client.release(rawPaths);
+    const client = rt.client;
+    const res = await client.release(rawPaths);
+    if (getRuntime() !== rt || rt.client !== client || rt.isCurrent?.() === false) {
+        return textResult("error: operation_superseded", sendDetails({ status: "error", reason: "operation_superseded" }));
+    }
     clearReserveTimers(rt, rawPaths); // release cancels pending auto-releases
     if (res.status === "delivered") {
         safeLedger(rt, { event: "released", from: rt.client.alias, refs: res.released.length > 0 ? res.released : undefined });
@@ -877,7 +986,7 @@ export function registerTools(pi, getRuntime) {
         description: "Send a message to another local agent via the mesh broker. " +
             "Statuses are honest: delivered = written on the recipient socket (or " +
             "queued_offline in its mailbox), never read/answered. awaitReply waits " +
-            "for an explicit mesh_reply; otherwise expired after timeoutMs.",
+            "for an explicit mesh_reply, but yields on actionable input with interrupted; the mission stays tracked and its answer arrives later.",
         promptSnippet: "Message another local agent over mesh (delivered ≠ read ≠ answered).",
         promptGuidelines: "Use mesh_reply(msgId) to answer an inbound [mesh] message. " +
             "priority=force requires reason and aborts the recipient turn. " +
@@ -908,7 +1017,7 @@ export function registerTools(pi, getRuntime) {
             "the sender designated with replyTo (shown as 'reply goes to @X' on the " +
             "inbound message). Override with to: (single) or replyAll: true (room).",
         parameters: MESH_REPLY_PARAMETERS,
-        execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshReply(getRuntime, params),
+        execute: (id, params, signal, _onUpdate, ctx) => runForegroundOperation(pi, getRuntime, ctx, "mesh_reply", id, signal, () => execMeshReply(getRuntime, params)),
     });
     pi.registerTool({
         name: "mesh_alias",
@@ -921,7 +1030,7 @@ export function registerTools(pi, getRuntime) {
         promptGuidelines: "Name yourself before dispatching missions: rename cancels in-flight requests. " +
             "Tell collaborators the new alias; old aliases do not redirect to it.",
         parameters: MESH_ALIAS_PARAMETERS,
-        execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshAlias(getRuntime, params),
+        execute: (id, params, signal, _onUpdate, ctx) => runForegroundOperation(pi, getRuntime, ctx, "mesh_alias", id, signal, () => execMeshAlias(getRuntime, params)),
     });
     pi.registerTool({
         name: "mesh_status",
@@ -930,7 +1039,7 @@ export function registerTools(pi, getRuntime) {
             "Presence is observed (live sockets), never a file registry.",
         promptSnippet: "Show online mesh peers and rooms.",
         parameters: MESH_STATUS_PARAMETERS,
-        execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshStatus(getRuntime, params),
+        execute: (id, params, signal, _onUpdate, ctx) => runForegroundOperation(pi, getRuntime, ctx, "mesh_status", id, signal, () => execMeshStatus(getRuntime, params)),
     });
     pi.registerTool({
         name: "mesh_history",
@@ -974,7 +1083,7 @@ export function registerTools(pi, getRuntime) {
             "mesh_release({}) releases everything. Long run (>4 h)? Re-reserve " +
             "periodically or set autoReleaseMs.",
         parameters: MESH_RESERVE_PARAMETERS,
-        execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshReserve(getRuntime, params),
+        execute: (id, params, signal, _onUpdate, ctx) => runForegroundOperation(pi, getRuntime, ctx, "mesh_reserve", id, signal, () => execMeshReserve(getRuntime, params)),
     });
     pi.registerTool({
         name: "mesh_release",
@@ -983,7 +1092,7 @@ export function registerTools(pi, getRuntime) {
             "Peers are notified immediately.",
         promptSnippet: "Release claimed files.",
         parameters: MESH_RELEASE_PARAMETERS,
-        execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshRelease(getRuntime, params),
+        execute: (id, params, signal, _onUpdate, ctx) => runForegroundOperation(pi, getRuntime, ctx, "mesh_release", id, signal, () => execMeshRelease(getRuntime, params)),
     });
 }
 export { MAX_BODY_BYTES };

@@ -534,7 +534,7 @@ describe("client: broker reboot delivery knowledge", () => {
     assert.notEqual(alice.brokerInfo!.bootId, oldBoot);
     const blocked = await blocking;
     assert.equal(blocked.status, "error");
-    if (blocked.status === "error") assert.equal(blocked.reason, "broker_state_lost_delivery_unknown");
+    if (blocked.status === "error") assert.equal(blocked.reason, "connection_lost");
     const result = await alice.waitAll(1000);
     assert.equal(result.status, "error");
     assert.equal(result.reason, "broker_state_lost_delivery_unknown");
@@ -608,3 +608,362 @@ it("launch detaches its tool abort signal after delivery and retains the backgro
   assert.equal(result.status, "complete");
   assert.deepEqual(result.answers, [{ msgId: launched.msgId, to: "bob", response: "background mission survived" }]);
 });
+
+describe("client: cooperative foreground send waits", () => {
+  for (const priority of ["normal", "urgent"] as const) {
+    it(`yields to ${priority} input without cancelling the mission or retaining its tool signal`, { timeout: 5000 }, async (t) => {
+      const { alice, bob } = await fixture(t);
+      const abort = new AbortController();
+      const events: MeshFrame[] = [];
+      alice.on("inbound", (frame: MeshFrame) => {
+        events.push(frame);
+        if (frame.type === "msg") alice.interruptWaits("inbound_message", frame.id);
+      });
+      const sending = alice.send({ to: "bob", message: "work continues", awaitReply: true, signal: abort.signal });
+      await waitFor(() => bob.transcript.some((frame) => frame.body === "work continues"));
+      const incoming = await bob.send({ to: "alice", message: "new actionable input", priority });
+      assert.ok(incoming.msgId);
+      const result = await sending;
+      assert.equal(result.status, "interrupted");
+      if (result.status !== "interrupted") return;
+      assert.equal(result.reason, "inbound_message");
+      assert.equal(result.interruptedBy, incoming.msgId);
+      assert.equal(result.delivery, "delivered");
+      assert.equal(result.tracked, true);
+      assert.ok(result.msgId);
+      abort.abort();
+      assert.equal(alice.pendingCount, 1);
+      await bob.reply(result.msgId, "completed after yield");
+      await waitFor(() => events.some((frame) => frame.body === "completed after yield"));
+      assert.equal(events.filter((frame) => frame.body === "completed after yield").length, 1);
+      assert.equal(alice.pendingCount, 0);
+      const verdict = await alice.waitAll(1000);
+      assert.equal(verdict.status, "complete");
+      assert.deepEqual(verdict.answers, [{ msgId: result.msgId, to: "bob", response: "completed after yield" }]);
+      assert.equal(alice.interruptWaits("nothing_waiting"), false);
+    });
+  }
+
+  it("yields before handshake completion and never sends that request after connecting", { timeout: 5000 }, async (t) => {
+    let releaseWelcome: (() => void) | undefined;
+    const { alice, frames } = await rawLifecycleFixture(t, (frame, socket) => {
+      if (frame.type === "hello") releaseWelcome = () => socket.write(encodeFrame(buildFrame({
+        type: "welcome", id: frame.id, rooms: ["default"], peers: [],
+      }), DEFAULT_MAX_FRAME_BYTES));
+      if (frame.type === "msg") socket.write(encodeFrame(buildFrame({
+        type: "ack", id: frame.id, status: "delivered",
+      }), DEFAULT_MAX_FRAME_BYTES));
+    }, false);
+    const connection = alice.connect();
+    const sending = alice.send({ to: "bob", message: "unsent yielded work", awaitReply: true });
+    await waitFor(() => releaseWelcome !== undefined);
+    assert.equal(alice.interruptWaits("inbound_message", "incoming"), true);
+    const result = await sending;
+    assert.equal(result.status, "interrupted");
+    if (result.status === "interrupted") {
+      assert.equal(result.delivery, "not_sent");
+      assert.equal(result.tracked, false);
+      assert.equal(result.msgId, undefined);
+    }
+    releaseWelcome!();
+    await connection;
+    await alice.send({ to: "bob", message: "only live request" });
+    assert.deepEqual(frames.filter((frame) => frame.type === "msg").map((frame) => frame.body), ["only live request"]);
+    assert.equal(alice.pendingCount, 0);
+    assert.deepEqual(alice.missionStatus(), []);
+  });
+
+  it("does not write a request interrupted during pending registration", { timeout: 5000 }, async (t) => {
+    const { alice, bob } = await fixture(t);
+    alice.once("pending", () => alice.interruptWaits("inbound_message"));
+    const result = await alice.send({ to: "bob", message: "interrupted before write", awaitReply: true });
+    assert.equal(result.status, "interrupted");
+    if (result.status === "interrupted") {
+      assert.equal(result.delivery, "not_sent");
+      assert.equal(result.tracked, false);
+    }
+    await alice.send({ to: "bob", message: "following live request" });
+    await waitFor(() => bob.transcript.some((frame) => frame.body === "following live request"));
+    assert.ok(!bob.transcript.some((frame) => frame.body === "interrupted before write"));
+    assert.equal(alice.pendingCount, 0);
+    assert.deepEqual(alice.missionStatus(), []);
+  });
+
+  it("retains the pre-ACK transaction, processes asynchronous delivery and injects its late answer once", { timeout: 5000 }, async (t) => {
+    let held: { frame: MeshFrame; socket: net.Socket } | undefined;
+    const { alice } = await rawLifecycleFixture(t, (frame, socket) => {
+      if (frame.type === "msg") held = { frame, socket };
+    });
+    const abort = new AbortController();
+    let deliveryConfirmed = false;
+    alice.on("frame", (frame: MeshFrame) => {
+      if (frame.type === "ack" && frame.id === held?.frame.id && frame.status === "delivered") deliveryConfirmed = true;
+    });
+    const inbound: MeshFrame[] = [];
+    alice.on("inbound", (frame: MeshFrame) => inbound.push(frame));
+    const sending = alice.send({ to: "bob", message: "hold ACK", awaitReply: true, signal: abort.signal });
+    await waitFor(() => held !== undefined);
+    alice.interruptWaits("inbound_message", "incoming");
+    const result = await sending;
+    assert.equal(result.status, "interrupted");
+    if (result.status !== "interrupted") return;
+    assert.equal(result.msgId, held!.frame.id);
+    assert.equal(result.delivery, "unknown");
+    assert.equal(result.tracked, true);
+    abort.abort();
+    assert.equal(alice.pendingCount, 1);
+    held!.socket.write(Buffer.concat([
+      encodeFrame(buildFrame({ type: "ack", id: held!.frame.id, status: "queued_offline" }), DEFAULT_MAX_FRAME_BYTES),
+      encodeFrame(buildFrame({ type: "ack", id: held!.frame.id, status: "delivered" }), DEFAULT_MAX_FRAME_BYTES),
+    ]));
+    await waitFor(() => deliveryConfirmed);
+    const answer = buildFrame({
+      type: "reply", from: "bob", to: "alice", room: "default", replyTo: held!.frame.id, body: "late real answer",
+    });
+    held!.socket.write(Buffer.concat([
+      encodeFrame(answer, DEFAULT_MAX_FRAME_BYTES), encodeFrame(answer, DEFAULT_MAX_FRAME_BYTES),
+    ]));
+    await waitFor(() => inbound.length === 1);
+    assert.equal(inbound[0]!.body, "late real answer");
+    assert.equal(alice.pendingCount, 0);
+    assert.equal(alice.isReloadSafe(), true);
+    const complete = await alice.waitAll(1000);
+    assert.equal(complete.status, "complete");
+    assert.equal(complete.answered, 1);
+  });
+
+  it("settles a retained mission honestly when its delayed ACK refuses it", { timeout: 5000 }, async (t) => {
+    let held: { frame: MeshFrame; socket: net.Socket } | undefined;
+    const { alice } = await rawLifecycleFixture(t, (frame, socket) => {
+      if (frame.type === "msg") held = { frame, socket };
+    });
+    const sending = alice.send({ to: "bob", message: "refused later", awaitReply: true });
+    await waitFor(() => held !== undefined);
+    alice.interruptWaits("inbound_message");
+    assert.equal((await sending).status, "interrupted");
+    held!.socket.write(encodeFrame(buildFrame({
+      type: "error", id: held!.frame.id, code: "policy_denied",
+    }), DEFAULT_MAX_FRAME_BYTES));
+    await waitFor(() => alice.pendingCount === 0);
+    const verdict = await alice.waitAll(1000);
+    assert.equal(verdict.status, "error");
+    assert.equal(verdict.reason, "policy_denied");
+    assert.equal(verdict.answered, 0);
+    assert.equal(alice.isReloadSafe(), true);
+  });
+
+  it("keeps an own matched answer in the send result rather than injecting or interrupting it", { timeout: 5000 }, async (t) => {
+    const { alice, bob } = await fixture(t);
+    const inbound: MeshFrame[] = [];
+    alice.on("inbound", (frame: MeshFrame) => inbound.push(frame));
+    const sending = alice.send({ to: "bob", message: "own answer", awaitReply: true });
+    await waitFor(() => bob.transcript.some((frame) => frame.body === "own answer"));
+    const id = alice.missionStatus()[0]!.msgId;
+    await bob.reply(id, "normal result");
+    const result = await sending;
+    assert.equal(result.status, "reply");
+    if (result.status === "reply") assert.equal(result.response, "normal result");
+    assert.deepEqual(inbound, []);
+  });
+
+  it("does not hide a launch answer behind an unrelated single-task wait", { timeout: 5000 }, async (t) => {
+    const { alice, bob } = await fixture(t);
+    const launch = await alice.send({ to: "bob", message: "launched", awaitReply: true, block: false });
+    assert.ok(launch.msgId);
+    const inbound: MeshFrame[] = [];
+    alice.on("inbound", (frame: MeshFrame) => inbound.push(frame));
+    const sending = alice.send({ to: "bob", message: "different task", awaitReply: true });
+    await waitFor(() => alice.pendingCount === 2);
+    await bob.reply(launch.msgId, "launch result");
+    const result = await sending;
+    assert.equal(result.status, "interrupted");
+    await waitFor(() => inbound.length === 1);
+    assert.equal(inbound[0]!.body, "launch result");
+    assert.equal(alice.pendingCount, 1);
+    if (result.status !== "interrupted") return;
+    assert.ok(result.msgId);
+    const aggregate = alice.waitAll(1000);
+    await waitFor(() => bob.peekInbox(result.msgId!) !== undefined);
+    await bob.reply(result.msgId, "second result");
+    assert.equal((await aggregate).answered, 2);
+    assert.equal(inbound.length, 1);
+  });
+
+  it("releases a single foreground wait on mission-room departure and recovers without resending", { timeout: 5000 }, async (t) => {
+    const { alice, bob } = await fixture(t);
+    await alice.join("work");
+    await bob.join("work");
+    const sending = alice.send({ to: "bob", room: "work", message: "room work", awaitReply: true });
+    await waitFor(() => bob.transcript.some((frame) => frame.body === "room work"));
+    await bob.leave("work");
+    const result = await sending;
+    assert.equal(result.status, "error");
+    if (result.status !== "error") return;
+    assert.equal(result.reason, "target_offline");
+    assert.equal(result.delivery, "delivered");
+    assert.equal(result.tracked, true);
+    assert.equal(alice.pendingCount, 1);
+    assert.equal(alice.knowsPeer("bob"), true);
+    await bob.join("work");
+    await waitFor(() => alice.missionStatus()[0]?.reason === undefined);
+    const aggregate = alice.waitAll(1000);
+    assert.ok(result.msgId);
+    await bob.reply(result.msgId, "recovered room answer");
+    assert.equal((await aggregate).status, "complete");
+  });
+
+  it("keeps initial queued-offline work and unrelated-room departures waiting normally", { timeout: 5000 }, async (t) => {
+    const { alice, bob } = await fixture(t);
+    let queued = false;
+    alice.on("frame", (frame: MeshFrame) => {
+      if (frame.type === "ack" && frame.status === "queued_offline") queued = true;
+    });
+    await bob.close();
+    await waitFor(() => !alice.knowsPeer("bob"));
+    const sending = alice.send({ to: "bob", message: "queued work", awaitReply: true });
+    await waitFor(() => queued);
+    const id = alice.missionStatus()[0]!.msgId;
+    await bob.connect();
+    await waitFor(() => bob.peekInbox(id) !== undefined);
+    await alice.join("unrelated");
+    await bob.join("unrelated");
+    await bob.leave("unrelated");
+    await bob.reply(id, "queued work finished");
+    const result = await sending;
+    assert.equal(result.status, "reply");
+    if (result.status === "reply") assert.equal(result.response, "queued work finished");
+  });
+
+  it("reports own connection loss before ACK while retaining the possibly delivered mission", { timeout: 5000 }, async (t) => {
+    let held: { frame: MeshFrame; socket: net.Socket } | undefined;
+    const { alice, sockets } = await rawLifecycleFixture(t, (frame, socket) => {
+      if (frame.type === "msg") held = { frame, socket };
+    });
+    const sending = alice.send({ to: "bob", message: "written without ACK", awaitReply: true });
+    await waitFor(() => held !== undefined);
+    held!.socket.destroy();
+    const result = await sending;
+    assert.equal(result.status, "error");
+    if (result.status === "error") {
+      assert.equal(result.reason, "connection_lost");
+      assert.equal(result.delivery, "unknown");
+      assert.equal(result.tracked, true);
+    }
+    assert.equal(alice.pendingCount, 1);
+    await alice.connect();
+    const events: MeshFrame[] = [];
+    alice.on("inbound", (frame: MeshFrame) => events.push(frame));
+    const socket = sockets.values().next().value!;
+    socket.write(encodeFrame(buildFrame({
+      type: "reply", from: "bob", to: "alice", room: "default",
+      replyTo: held!.frame.id, body: "completed across reconnect",
+    }), DEFAULT_MAX_FRAME_BYTES));
+    await waitFor(() => events.length === 1);
+    assert.equal(events[0]!.body, "completed across reconnect");
+    assert.equal((await alice.waitAll(1000)).status, "complete");
+  });
+});
+
+it("preserves expiry after a foreground send yields instead of inventing an answer", { timeout: 5000 }, async (t) => {
+  const { alice, bob } = await fixture(t);
+  const sending = alice.send({ to: "bob", message: "expires after yielding", awaitReply: true, timeoutMs: 250 });
+  await waitFor(() => bob.transcript.some((frame) => frame.body === "expires after yielding"));
+  alice.interruptWaits("inbound_message");
+  const result = await sending;
+  assert.equal(result.status, "interrupted");
+  const verdict = await alice.waitAll(1000);
+  assert.equal(verdict.status, "timeout");
+  assert.equal(verdict.answered, 0);
+  assert.equal(verdict.missing.length, 1);
+  assert.equal(alice.pendingCount, 0);
+  assert.equal(alice.missionStatus()[0]!.status, "expired");
+});
+
+it("detects target loss before the ACK continuation and accepts its later real answer", { timeout: 5000 }, async (t) => {
+  let held: { frame: MeshFrame; socket: net.Socket } | undefined;
+  const { alice } = await rawLifecycleFixture(t, (frame, socket) => {
+    if (frame.type !== "msg") return;
+    held = { frame, socket };
+    socket.write(Buffer.concat([
+      encodeFrame(buildFrame({ type: "ack", id: frame.id, status: "delivered" }), DEFAULT_MAX_FRAME_BYTES),
+      encodeFrame(buildFrame({ type: "presence", from: "bob", room: "default", status: "offline" }), DEFAULT_MAX_FRAME_BYTES),
+    ]));
+  });
+  const result = await alice.send({ to: "bob", message: "target left immediately", awaitReply: true });
+  assert.equal(result.status, "error");
+  if (result.status === "error") {
+    assert.equal(result.reason, "target_offline");
+    assert.equal(result.delivery, "delivered");
+    assert.equal(result.tracked, true);
+  }
+  assert.equal(alice.pendingCount, 1);
+  assert.equal((await alice.waitAll(1000)).status, "error");
+  const inbound: MeshFrame[] = [];
+  alice.on("inbound", (frame: MeshFrame) => inbound.push(frame));
+  held!.socket.write(encodeFrame(buildFrame({
+    type: "reply", from: "bob", to: "alice", room: "default",
+    replyTo: held!.frame.id, body: "finished despite presence loss",
+  }), DEFAULT_MAX_FRAME_BYTES));
+  await waitFor(() => inbound.length === 1);
+  assert.equal(alice.missionStatus()[0]!.reason, undefined);
+  assert.equal((await alice.waitAll(1000)).status, "complete");
+});
+
+it("returns an own answer before a delayed ACK without double-injection or abandoning the ACK", { timeout: 5000 }, async (t) => {
+  let held: { frame: MeshFrame; socket: net.Socket } | undefined;
+  const { alice } = await rawLifecycleFixture(t, (frame, socket) => {
+    if (frame.type !== "msg") return;
+    held = { frame, socket };
+    socket.write(encodeFrame(buildFrame({
+      type: "reply", from: "bob", to: "alice", room: "default", replyTo: frame.id, body: "answer before ACK",
+    }), DEFAULT_MAX_FRAME_BYTES));
+  });
+  const inbound: MeshFrame[] = [];
+  alice.on("inbound", (frame: MeshFrame) => inbound.push(frame));
+  const result = await alice.send({ to: "bob", message: "early answer", awaitReply: true });
+  assert.equal(result.status, "reply");
+  if (result.status === "reply") assert.equal(result.response, "answer before ACK");
+  assert.deepEqual(inbound, []);
+  assert.equal(alice.isReloadSafe(), false, "the real ACK transaction is still active");
+  held!.socket.write(encodeFrame(buildFrame({
+    type: "ack", id: held!.frame.id, status: "delivered",
+  }), DEFAULT_MAX_FRAME_BYTES));
+  await waitFor(() => alice.isReloadSafe());
+  assert.equal((await alice.waitAll(1000)).status, "complete");
+});
+
+for (const mode of ["launch", "unawaited"] as const) {
+  it(`yields the foreground ${mode} ACK phase without pretending the written request was cancelled`, { timeout: 5000 }, async (t) => {
+    let held: { frame: MeshFrame; socket: net.Socket } | undefined;
+    const { alice } = await rawLifecycleFixture(t, (frame, socket) => {
+      if (frame.type === "msg") held = { frame, socket };
+    });
+    let acknowledged = false;
+    alice.on("frame", (frame: MeshFrame) => {
+      if (frame.type === "ack" && frame.id === held?.frame.id) acknowledged = true;
+    });
+    const sending = alice.send({ to: "bob", message: "foreground ACK",
+      ...(mode === "launch" ? { awaitReply: true, block: false } : {}) });
+    await waitFor(() => held !== undefined);
+    assert.equal(alice.interruptWaits("inbound_message"), true);
+    const result = await sending;
+    assert.equal(result.status, "interrupted");
+    if (result.status === "interrupted") {
+      assert.equal(result.delivery, "unknown");
+      assert.equal(result.tracked, mode === "launch");
+      assert.equal(result.msgId, held!.frame.id);
+    }
+    held!.socket.write(encodeFrame(buildFrame({
+      type: "ack", id: held!.frame.id, status: "delivered",
+    }), DEFAULT_MAX_FRAME_BYTES));
+    await waitFor(() => acknowledged);
+    const inbound: MeshFrame[] = [];
+    alice.on("inbound", (frame: MeshFrame) => inbound.push(frame));
+    held!.socket.write(encodeFrame(buildFrame({
+      type: "reply", from: "bob", to: "alice", room: "default", replyTo: held!.frame.id, body: "real late outcome",
+    }), DEFAULT_MAX_FRAME_BYTES));
+    await waitFor(() => inbound.length === 1);
+    assert.equal(inbound[0]!.body, "real late outcome");
+    assert.equal(alice.pendingCount, 0);
+  });
+}
