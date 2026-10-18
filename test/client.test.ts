@@ -967,3 +967,77 @@ for (const mode of ["launch", "unawaited"] as const) {
     assert.equal(alice.pendingCount, 0);
   });
 }
+
+for (const mode of ["blocking", "launch"] as const) {
+  it(`an offline event before the initial queued ACK does not reject a ${mode} mission`, { timeout: 5000 }, async (t) => {
+    let held: { frame: MeshFrame; socket: net.Socket } | undefined;
+    const { alice, frames } = await rawLifecycleFixture(t, (frame, socket) => {
+      if (frame.type === "hello") {
+        socket.write(encodeFrame(buildFrame({ type: "presence", from: "bob", room: "default", status: "online" }), DEFAULT_MAX_FRAME_BYTES));
+      } else if (frame.type === "msg") {
+        held = { frame, socket };
+        socket.write(encodeFrame(buildFrame({ type: "presence", from: "bob", room: "default", status: "offline" }), DEFAULT_MAX_FRAME_BYTES));
+      }
+    });
+    await alice.connect();
+    await waitFor(() => alice.knowsPeer("bob"));
+    let settled = false;
+    let acknowledged = false;
+    alice.on("frame", (frame: MeshFrame) => {
+      if (frame.type === "ack" && frame.id === held?.frame.id) acknowledged = true;
+    });
+    const sending = alice.send({
+      to: "bob", message: "queued during departure", awaitReply: true,
+      block: mode !== "launch", timeoutMs: 3000,
+    }).then((result) => { settled = true; return result; });
+    await waitFor(() => held !== undefined && !alice.knowsPeer("bob"));
+    assert.equal(settled, false, "availability must not overtake the delivery acknowledgment");
+    const waiting = alice.waitAll(2000);
+    held!.socket.write(encodeFrame(buildFrame({ type: "ack", id: held!.frame.id, status: "queued_offline" }), DEFAULT_MAX_FRAME_BYTES));
+    await waitFor(() => acknowledged);
+    if (mode === "blocking") assert.equal(settled, false);
+    else assert.equal((await sending).status, "queued_offline");
+    held!.socket.write(encodeFrame(buildFrame({
+      type: "reply", from: "bob", to: "alice", room: "default", replyTo: held!.frame.id, body: "queued task finished",
+    }), DEFAULT_MAX_FRAME_BYTES));
+    const verdict = await waiting;
+    assert.equal(verdict.status, "complete");
+    assert.equal(verdict.answers[0]?.response, "queued task finished");
+    if (mode === "blocking") assert.equal((await sending).status, "reply");
+    assert.equal(frames.filter((frame) => frame.type === "msg").length, 1);
+  });
+}
+
+it("a delivered ACK does not erase a departure observed while awaiting that ACK", { timeout: 5000 }, async (t) => {
+  let held: { frame: MeshFrame; socket: net.Socket } | undefined;
+  const { alice } = await rawLifecycleFixture(t, (frame, socket) => {
+    if (frame.type === "hello") {
+      socket.write(encodeFrame(buildFrame({ type: "presence", from: "bob", room: "default", status: "online" }), DEFAULT_MAX_FRAME_BYTES));
+    } else if (frame.type === "msg") {
+      held = { frame, socket };
+      socket.write(encodeFrame(buildFrame({ type: "presence", from: "bob", room: "default", status: "offline" }), DEFAULT_MAX_FRAME_BYTES));
+    }
+  });
+  await alice.connect();
+  await waitFor(() => alice.knowsPeer("bob"));
+  const sending = alice.send({ to: "bob", message: "delivered before departure", awaitReply: true, timeoutMs: 3000 });
+  await waitFor(() => held !== undefined && !alice.knowsPeer("bob"));
+  const waiting = alice.waitAll(2000);
+  held!.socket.write(encodeFrame(buildFrame({ type: "ack", id: held!.frame.id, status: "delivered" }), DEFAULT_MAX_FRAME_BYTES));
+  const result = await sending;
+  assert.equal(result.status, "error");
+  if (result.status === "error") {
+    assert.equal(result.reason, "target_offline");
+    assert.equal(result.delivery, "delivered");
+    assert.equal(result.tracked, true);
+  }
+  assert.equal((await waiting).reason, "target_offline");
+  assert.equal(alice.pendingCount, 1);
+  held!.socket.write(encodeFrame(buildFrame({ type: "presence", from: "bob", room: "default", status: "online" }), DEFAULT_MAX_FRAME_BYTES));
+  await waitFor(() => alice.knowsPeer("bob"));
+  const resumed = alice.waitAll(1000);
+  held!.socket.write(encodeFrame(buildFrame({
+    type: "reply", from: "bob", to: "alice", room: "default", replyTo: held!.frame.id, body: "answer after recovery",
+  }), DEFAULT_MAX_FRAME_BYTES));
+  assert.equal((await resumed).status, "complete");
+});

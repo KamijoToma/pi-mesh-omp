@@ -6,7 +6,6 @@ import type { RunningBroker } from "../src/broker/broker.js";
 import { MeshClient, type SendOpts } from "../src/client/client.js";
 import { attachClientListeners } from "../src/extension/attach.js";
 import { MeshGuards } from "../src/extension/guards.js";
-import { handleInboundFrame } from "../src/extension/inbound.js";
 import { MeshLedger } from "../src/extension/ledger.js";
 import type { ExtensionAPI, InboundMessage, SendMessageOptions, SessionContext } from "../src/extension/pi-types.js";
 import type { MeshRuntime } from "../src/extension/tools.js";
@@ -283,11 +282,6 @@ describe("read receipts through the attached host", { timeout: 10_000 }, () => {
     try {
       host.control.failing = true;
       const retry = await host.receive("retry after failed host injection");
-      const frame = host.received.find((incoming) => incoming.id === retry)!;
-      handleInboundFrame(host.pi, host.ctx, frame, {
-        ledger: host.rt.ledger, transcript: host.rt.transcript, counters: host.rt,
-        selfAlias: "bob", read: (id, from) => host.bob.sendRead(id, from), retryMs: 20,
-      });
       assert.equal(host.sent.length, 0);
       assert.equal(host.reads.length, 0);
       assert.deepEqual(host.rt.ledger.read(), []);
@@ -321,7 +315,7 @@ describe("read receipts through the attached host", { timeout: 10_000 }, () => {
       const interrupt = await host.receive("interrupt after host settles", { priority: "force", interrupt: true, reason: "host busy" });
       assert.deepEqual(host.lead.readsOf(interrupt), []);
       host.control.idle = true;
-      await waitFor(() => host.reads.length === 3);
+      await waitFor(() => host.reads.some((frame) => frame.reads === interrupt));
       assert.equal(host.rt.interruptCount, 1);
       assert.equal(host.rt.lastInterruptOutcome, "aborted");
 

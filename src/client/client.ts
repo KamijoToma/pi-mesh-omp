@@ -573,8 +573,15 @@ export class MeshClient extends EventEmitter {
       const missing = targetList.filter((id) => this.awaitedMissions.get(id)?.answered !== true);
       if (missing.length === 0) return done("complete");
       if (!this.online) return done("error", this.#connectionError ?? "connection_lost");
-      const failure = missing.map((id) => this.awaitedMissions.get(id))
-        .find((mission) => mission?.status === "failed" || mission?.unavailableReason !== undefined);
+      let failure: AwaitedMission | undefined;
+      for (const id of missing) {
+        const mission = this.awaitedMissions.get(id);
+        if (mission?.status === "failed" ||
+          (mission?.unavailableReason !== undefined && !this.ackWaiters.has(id))) {
+          failure = mission;
+          break;
+        }
+      }
       if (failure !== undefined) return done("error", failure.reason ?? failure.unavailableReason ?? "error");
       if (missing.every((id) => this.awaitedMissions.get(id)?.status === "expired") || Date.now() >= deadline) {
         return done("timeout");
@@ -1265,7 +1272,6 @@ export class MeshClient extends EventEmitter {
         if (mission !== undefined && frame.status === "delivered") {
           mission.delivery = "delivered";
           mission.targetOnline = true;
-          delete mission.unavailableReason;
         } else if (mission !== undefined && frame.status === "queued_offline" && mission.delivery !== "delivered") {
           mission.delivery = "queued_offline";
           mission.targetOnline = false;
@@ -1275,6 +1281,11 @@ export class MeshClient extends EventEmitter {
         if (w) {
           this.ackWaiters.delete(frame.id);
           clearTimeout(w.timer);
+        }
+        if (mission !== undefined && (frame.status === "delivered" || frame.status === "queued_offline")) {
+          this.emit("missions");
+        }
+        if (w) {
           w.resolve(frame);
           break;
         }
@@ -1664,9 +1675,11 @@ export class MeshClient extends EventEmitter {
       },
     };
     const onMissions = (): void => {
-      if (frame === undefined || detached) return;
+      if (frame === undefined || detached || launch || this.ackWaiters.has(frame.id)) return;
       const mission = this.awaitedMissions.get(frame.id);
-      if (mission?.unavailableReason !== undefined) foreground.stop("error", mission.unavailableReason);
+      if (mission?.status === "waiting" && mission.unavailableReason !== undefined) {
+        foreground.stop("error", mission.unavailableReason);
+      }
     };
     const onAbort = (): void => {
       if (detached) return;

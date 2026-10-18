@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { rmSync } from "node:fs";
+import type { Socket } from "node:net";
 import { MeshClient } from "../src/client/client.js";
 import type { MeshFrame } from "../src/protocol/envelope.js";
 import { registerTools, type MeshRuntime } from "../src/extension/tools.js";
@@ -416,14 +417,24 @@ describe("actionable inbound messages during passive waits", () => {
   it("queued input during rename yields the alias tool without losing its final identity", { timeout: 10_000 }, async () => {
     const f = await fixture();
     const future = new MeshClient({ alias: "renamed", runtimeDir: f.dirs.runtimeDir, noReconnect: true });
+    let heldSocket: Socket | undefined;
     try {
       await future.connect();
       await future.close();
       await waitFor(() => !f.carol.knowsPeer("renamed"));
       const queued = await f.carol.send({ to: "renamed", message: "input during alias handover" });
       assert.equal(queued.status, "queued_offline");
+      await f.lead.join("readonly", "observer");
+      // Pause reads after the new hello: mailbox delivery is independent of
+      // packet coalescing while member-role restoration still awaits its ACK.
+      f.broker.server.once("connection", (socket) => {
+        heldSocket = socket;
+        socket.prependOnceListener("data", () => socket.pause());
+      });
       const result = await f.tools.get("mesh_alias")!.execute("rename-operation", { alias: "renamed" }, undefined, undefined, f.ctx);
       assert.equal(result.details?.status, "interrupted");
+      assert.equal(f.rt.pendingToolOperations?.size, 1);
+      heldSocket!.resume();
       await waitFor(() => f.injected.some((item) => item.message.customType === "mesh-operation-result"));
       const completion = f.injected.find((item) => item.message.customType === "mesh-operation-result")!;
       assert.equal((completion.message.details?.result as Record<string, unknown>).alias, "renamed");
@@ -431,6 +442,7 @@ describe("actionable inbound messages during passive waits", () => {
       assert.equal(f.injected.find((item) => item.message.content.includes("input during alias handover"))?.options?.deliverAs, "steer");
       assert.equal(f.abortCount(), 0);
     } finally {
+      heldSocket?.resume();
       await future.close();
       await f.cleanup();
     }

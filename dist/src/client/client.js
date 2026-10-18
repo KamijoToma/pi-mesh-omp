@@ -370,8 +370,15 @@ export class MeshClient extends EventEmitter {
                 return done("complete");
             if (!this.online)
                 return done("error", this.#connectionError ?? "connection_lost");
-            const failure = missing.map((id) => this.awaitedMissions.get(id))
-                .find((mission) => mission?.status === "failed" || mission?.unavailableReason !== undefined);
+            let failure;
+            for (const id of missing) {
+                const mission = this.awaitedMissions.get(id);
+                if (mission?.status === "failed" ||
+                    (mission?.unavailableReason !== undefined && !this.ackWaiters.has(id))) {
+                    failure = mission;
+                    break;
+                }
+            }
             if (failure !== undefined)
                 return done("error", failure.reason ?? failure.unavailableReason ?? "error");
             if (missing.every((id) => this.awaitedMissions.get(id)?.status === "expired") || Date.now() >= deadline) {
@@ -1061,7 +1068,6 @@ export class MeshClient extends EventEmitter {
                 if (mission !== undefined && frame.status === "delivered") {
                     mission.delivery = "delivered";
                     mission.targetOnline = true;
-                    delete mission.unavailableReason;
                 }
                 else if (mission !== undefined && frame.status === "queued_offline" && mission.delivery !== "delivered") {
                     mission.delivery = "queued_offline";
@@ -1072,6 +1078,11 @@ export class MeshClient extends EventEmitter {
                 if (w) {
                     this.ackWaiters.delete(frame.id);
                     clearTimeout(w.timer);
+                }
+                if (mission !== undefined && (frame.status === "delivered" || frame.status === "queued_offline")) {
+                    this.emit("missions");
+                }
+                if (w) {
                     w.resolve(frame);
                     break;
                 }
@@ -1464,11 +1475,12 @@ export class MeshClient extends EventEmitter {
             },
         };
         const onMissions = () => {
-            if (frame === undefined || detached)
+            if (frame === undefined || detached || launch || this.ackWaiters.has(frame.id))
                 return;
             const mission = this.awaitedMissions.get(frame.id);
-            if (mission?.unavailableReason !== undefined)
+            if (mission?.status === "waiting" && mission.unavailableReason !== undefined) {
                 foreground.stop("error", mission.unavailableReason);
+            }
         };
         const onAbort = () => {
             if (detached)

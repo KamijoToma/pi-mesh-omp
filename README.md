@@ -573,6 +573,8 @@ implementation. Use the existing mesh history for older frames.
   drop notices and late results rather than silently swallowing host rejection.
 - Release foreground waits even during provider-failure holds, retain ordinary
   input until recovery, and let authorized force bypass the hold.
+- Preserve initial ACK truth when offline presence arrives first; a delivered
+  ACK no longer erases a departure already observed during that transaction.
 
 ### v0.7.2-omp.3
 
