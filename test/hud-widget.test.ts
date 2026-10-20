@@ -14,12 +14,12 @@ import { makeTempDirs, startTestBroker, waitFor } from "./helpers.js";
 configureHostTui(Tui);
 
 function surface(rt: MeshRuntime) {
-  let widget: Parameters<SessionContext["ui"]["setWidget"]>[1];
+  const state: { widget?: Parameters<SessionContext["ui"]["setWidget"]>[1] } = {};
   const ctx: SessionContext = {
     cwd: "/tmp", mode: "tui",
     ui: {
       notify: () => {},
-      setWidget: (_id, content) => { widget = content; },
+      setWidget: (_id, content) => { state.widget = content; },
       setStatus: () => {},
       theme: { fg: (_color, text) => `\u001b[32m${text}\u001b[0m` },
     },
@@ -28,11 +28,11 @@ function surface(rt: MeshRuntime) {
   hud.attach(ctx);
   const render = (width: number): string[] => {
     const container = new Container();
-    if (typeof widget !== "function") throw new Error("Expected an interactive component");
-    container.addChild(widget());
+    if (typeof state.widget !== "function") throw new Error("Expected an interactive component");
+    container.addChild(state.widget());
     return container.render(width);
   };
-  return { ctx, hud, render };
+  return { ctx, hud, render, state };
 }
 
 describe("compact HUD component", () => {
@@ -59,6 +59,32 @@ describe("compact HUD component", () => {
       const wide = render(180)[0]!;
       assert.ok(wide.includes(rt.client.alias));
       assert.ok(wide.includes("@ops+1"));
+    } finally {
+      hud.detach();
+    }
+  });
+
+  it("hides the row while the session joins no room", () => {
+    let rooms: string[] = [];
+    const rt = {
+      client: {
+        alias: "self",
+        get rooms() { return rooms; },
+        isOnline: () => true,
+        pendingCount: 0,
+      },
+      deferredInbox: { count: 0 }, transcript: { isEnabled: () => false },
+      ledgerFailures: 0, transcriptFailures: 0, injectionFailures: 0,
+    } as unknown as MeshRuntime;
+    const { hud, state } = surface(rt);
+    try {
+      assert.equal(state.widget, undefined);
+      rooms = ["default"];
+      hud.onLocalChange();
+      assert.equal(typeof state.widget, "function");
+      rooms = [];
+      hud.onLocalChange();
+      assert.equal(state.widget, undefined);
     } finally {
       hud.detach();
     }

@@ -79,9 +79,7 @@ export function renderHudLines(state: HudState, theme?: UiTheme): [string] {
   if (state.pending > 0) line += ` · wait:${state.pending}`;
   if (state.inbox > 0) line += ` · inbox:${state.inbox}`;
   line += ` · ${theme?.fg(agentColor(state.alias), state.alias) ?? state.alias}`;
-  if (state.rooms.length === 0) {
-    line += " · no-room";
-  } else if (state.rooms.length !== 1 || state.rooms[0] !== DEFAULT_ROOM) {
+  if (state.rooms.length !== 1 || state.rooms[0] !== DEFAULT_ROOM) {
     const room = state.rooms.find((r) => r !== DEFAULT_ROOM) ?? state.rooms[0];
     line += ` · @${room}${state.rooms.length > 1 ? `+${state.rooms.length - 1}` : ""}`;
   }
@@ -178,6 +176,11 @@ export class MeshHud {
     const ctx = this.ctx;
     if (ctx === null) return;
     const state = this.buildState();
+    // No room membership → no mesh row at all (not even "offline"/"no-room").
+    if (state.rooms.length === 0) {
+      ctx.ui.setWidget(HUD_WIDGET_ID, undefined);
+      return;
+    }
     const lines = renderHudLines(state, ctx.ui.theme);
     if (ctx.mode !== undefined && ctx.mode !== "tui") {
       ctx.ui.setWidget(HUD_WIDGET_ID, lines);

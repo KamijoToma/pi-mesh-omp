@@ -47,8 +47,7 @@ describe("compact HUD", () => {
     assert.ok(line.indexOf("inbox:4") < line.indexOf("alice"));
   });
 
-  it("distinguishes no-room from default and summarizes additional rooms", () => {
-    assert.ok(renderHudLines(base({ rooms: [] }))[0].includes("no-room"));
+  it("omits the default room and summarizes additional rooms", () => {
     assert.ok(!renderHudLines(base())[0].includes("@default"));
     assert.ok(renderHudLines(base({ rooms: ["default", "ops", "review"] }))[0].includes("@ops+2"));
   });

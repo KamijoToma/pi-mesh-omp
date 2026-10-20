@@ -745,9 +745,10 @@ new [--history] · reset · log [on|off] · ping <alias> · broker · help`.
   other peers sharing a room with this session. Alerts (`!err:N`), live waits
   (`wait:N`) and deferred messages (`inbox:N`) precede the full alias so narrow
   terminals truncate details first. The sole `default` room and disabled transcript
-  are omitted; other memberships show `@ops+N`, zero rooms show `no-room`, and an
-  enabled transcript shows `log:on`. There is no mesh footer entry or activity
-  preview row. `/mesh status [room]` lists full aliases, rooms, activity and origins;
+  are omitted; other memberships show `@ops+N`, and an enabled transcript shows
+  `log:on`. The row is hidden entirely while the session has no room membership —
+  `/mesh join` reveals it and `/mesh leave` of the last room removes it. There is
+  no mesh footer entry or activity preview row. `/mesh status [room]` lists full aliases, rooms, activity and origins;
   `/mesh broker` retains failure counts by category, `/mesh inbox` lists held
   messages, and `/mesh log` reports the transcript setting.
 - `/mesh broker` reports the version, session file size and compaction
