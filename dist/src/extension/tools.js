@@ -5,9 +5,13 @@ import { computePeerStatus } from "../client/client.js";
 import { buildFrame, normalizeAlias } from "../protocol/envelope.js";
 import { sha256 } from "../protocol/frames.js";
 import { deliverWithRetry } from "./inbound.js";
-import { DEFAULT_AWAIT_REPLY_TIMEOUT_MS, DEFAULT_ROOM, DEFAULT_WAIT_ALL_TIMEOUT_MS, MAX_AWAIT_REPLY_TIMEOUT_MS, MAX_BODY_BYTES, MAX_REFS, MAX_REPLY_TARGETS, MIN_AWAIT_REPLY_TIMEOUT_MS, TRANSCRIPT_RING_SIZE, } from "../shared/config.js";
+import { DEFAULT_AWAIT_REPLY_TIMEOUT_MS, DEFAULT_ROOM, DEFAULT_WAIT_ALL_TIMEOUT_MS, FILE_SERVE_DEFAULT_TTL_MS, FILE_SERVE_MAX_CONCURRENT, FILE_SERVE_MAX_TTL_MS, FILE_SERVE_MIN_TTL_MS, MAX_AWAIT_REPLY_TIMEOUT_MS, MAX_BODY_BYTES, MAX_REFS, MAX_REPLY_TARGETS, MIN_AWAIT_REPLY_TIMEOUT_MS, TRANSCRIPT_RING_SIZE, loadConfig, } from "../shared/config.js";
 import { MESH_VERSION } from "../shared/version.js";
 import { LOOP_GUARD_WARNING, REPLY_REPEAT_WARNING } from "./guards.js";
+import { isFileServeError, serveFileOnce } from "../fileserve/serve.js";
+import { readTailnetStatus } from "../tailscale/adapter.js";
+import os from "node:os";
+import { resolve } from "node:path";
 import { identityFromClient } from "../shared/identity-store.js";
 import { textResult } from "./pi-types.js";
 const SEND_RESULT_SCHEMA = "mesh.send-result.v1";
@@ -930,6 +934,13 @@ export function clearReserveTimers(rt, patterns) {
         }
     }
 }
+/** Close every live file offer (session_shutdown / cmdReset / detach).
+ *  Late downloaders get an honest refused socket, never a hung one. */
+export function closeServeHandles(rt) {
+    for (const handle of rt.serveHandles ?? [])
+        handle.close();
+    rt.serveHandles = [];
+}
 async function execMeshReserve(getRuntime, params) {
     const rt = getRuntime();
     if (rt === null)
@@ -963,6 +974,152 @@ async function execMeshReserve(getRuntime, params) {
     const resReason = "reason" in res ? res.reason : "error";
     safeLedger(rt, { event: "blocked", from: rt.client.alias, refs: rawPaths, code: resReason });
     return textResult(`blocked: ${resReason}`, sendDetails({ status: "blocked", reason: resReason }));
+}
+// ---------------------------------------------------------------- mesh_file_serve
+/**
+ * Bind/offer candidates for a file offer, best first. Tailscale self
+ * addresses (100.x CGNAT) lead on a tailnet — peers on other machines can
+ * always reach them; loopback follows for same-machine handoff; the LAN
+ * address is offered when no tailnet is configured.
+ */
+export function serveHostCandidates(status, family) {
+    const candidates = [];
+    const push = (host) => {
+        if (!candidates.includes(host))
+            candidates.push(host);
+    };
+    for (const addr of status?.self?.addresses ?? []) {
+        // Tailnet addresses: CGNAT 100.64/10 (IPv4) or the fd7a:115c:a1e0::/48 ULA (IPv6).
+        if (family === "IPv4" && addr.startsWith("100."))
+            push(addr);
+        if (family === "IPv6" && addr.startsWith("fd7a:115c:a1e0::"))
+            push(addr);
+    }
+    for (const net of Object.values(os.networkInterfaces())) {
+        for (const iface of net ?? []) {
+            // Exclude internal and link-local (169.254./fe80::): a peer cannot dial
+            // those across machines.
+            if (iface.internal)
+                continue;
+            if (iface.address.startsWith("169.254.") || iface.address.startsWith("fe80:"))
+                continue;
+            if (family === "IPv4" && iface.family === "IPv4")
+                push(iface.address);
+        }
+    }
+    return candidates;
+}
+const MESH_FILE_SERVE_PARAMETERS = {
+    type: "object",
+    properties: {
+        path: {
+            type: "string",
+            description: "Local path of the file to offer (absolute, or relative to the session cwd). " +
+                "The peer receives only the basename. Hard cap: FILE_SERVE_MAX_BYTES (8 MiB).",
+        },
+        to: {
+            type: "string",
+            description: "Alias of the intended recipient. Omit to broadcast the offer to the room.",
+        },
+        room: { type: "string", description: "Room for the announcement (default: your first joined room)." },
+        ttlMs: {
+            type: "number",
+            minimum: FILE_SERVE_MIN_TTL_MS,
+            maximum: FILE_SERVE_MAX_TTL_MS,
+            description: `Offer lifetime in ms (default ${FILE_SERVE_DEFAULT_TTL_MS}). The listener closes at the deadline.`,
+        },
+        note: { type: "string", description: "One line of context for the recipient (what this artifact is)." },
+    },
+    required: ["path"],
+};
+async function execMeshFileServe(getRuntime, params) {
+    const rt = getRuntime();
+    if (rt === null)
+        return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
+    if (rt.client.roomRoles.size === 0)
+        return notJoinedResult();
+    const path = str(params.path);
+    if (path === undefined) {
+        return textResult("error: invalid_params (path is required)", sendDetails({ status: "error", reason: "invalid_params" }));
+    }
+    const absolute = resolve(path);
+    const broadcast = str(params.to) === undefined;
+    const to = broadcast ? undefined : normalizeAlias(str(params.to));
+    const room = str(params.room) ??
+        (rt.client.rooms.includes(DEFAULT_ROOM) ? DEFAULT_ROOM : rt.client.rooms[0]);
+    // One live offer per session: a new offer supersedes the old one
+    // (its listener closes and late downloaders get an honest refused socket).
+    rt.serveHandles ??= [];
+    while (rt.serveHandles.length >= FILE_SERVE_MAX_CONCURRENT) {
+        rt.serveHandles.shift().close();
+    }
+    const config = loadConfig(rt.stateDir);
+    let tailnetStatus;
+    if (config.tailscale !== undefined && config.tailscale.mode !== "off") {
+        try {
+            tailnetStatus = await readTailnetStatus(config.tailscale);
+        }
+        catch {
+            // No daemon reachable — LAN/loopback candidates still work.
+        }
+    }
+    let handle;
+    try {
+        handle = await serveFileOnce({
+            path: absolute,
+            hostCandidates: serveHostCandidates(tailnetStatus, "IPv4"),
+            ttlMs: typeof params.ttlMs === "number" ? params.ttlMs : undefined,
+        });
+    }
+    catch (error) {
+        const code = isFileServeError(error) ? error.code : "serve_failed";
+        const message = error instanceof Error ? error.message : String(error);
+        return textResult(`error: ${code} — ${message}`, sendDetails({ status: "error", reason: code }));
+    }
+    rt.serveHandles.push(handle);
+    safeLedger(rt, {
+        event: "sent", from: rt.client.alias, to, room, refs: [handle.fields.name],
+        code: `file_offer:${handle.fields.sha256.slice(0, 12)}`,
+    });
+    const note = str(params.note);
+    const message = (note !== undefined ? `${note}\n` : "") + handle.announcement;
+    if (Buffer.byteLength(message, "utf8") > MAX_BODY_BYTES) {
+        // The offer text itself can never hit this; a huge note is the only way.
+        handle.close();
+        rt.serveHandles.pop();
+        return textResult("error: invalid_params (note too long)", sendDetails({ status: "error", reason: "invalid_params" }));
+    }
+    // The offer travels as an ORDINARY mesh message: reuse the full send path
+    // (room resolution, guards, ledger, honest statuses) instead of a parallel one.
+    const res = await rt.client.send({ to, message, room });
+    if (res.status !== "delivered" && res.status !== "queued_offline") {
+        // Nobody was told about the offer → nobody will ever download it → close now.
+        handle.close();
+        rt.serveHandles.pop();
+        const reason = "reason" in res ? res.reason : res.status;
+        return textResult(`error: offer_not_sent (${reason})`, sendDetails({ status: "error", reason, offer: handle.fields }));
+    }
+    // Fine to race the download: the result is already honest (offered + served
+    // states), and a download after the tool returns still settles cleanly.
+    void handle.onceServed.then((state) => {
+        const current = rt.serveHandles?.indexOf(handle) ?? -1;
+        if (current >= 0)
+            rt.serveHandles?.splice(current, 1);
+        safeLedger(rt, {
+            event: state === "downloaded" ? "delivered" : "expired",
+            from: rt.client.alias, to, room, code: `file_offer:${state}`,
+        });
+    });
+    const summary = `offered ${handle.fields.name} (${handle.fields.size} B) → ` +
+        (broadcast ? `room ${room} (broadcast)` : `@${to}`) +
+        ` — expires in ${Math.round(handle.fields.ttlMs / 1000)}s`;
+    return textResult(summary, {
+        schema: "mesh.file-offer.v1",
+        status: res.status,
+        ...handle.fields,
+        announcedTo: broadcast ? `room:${room}` : to,
+        msgId: "msgId" in res ? res.msgId : undefined,
+    });
 }
 // ---------------------------------------------------------------- mesh_release
 const MESH_RELEASE_PARAMETERS = {
@@ -1107,6 +1264,24 @@ export function registerTools(pi, getRuntime) {
             "periodically or set autoReleaseMs.",
         parameters: MESH_RESERVE_PARAMETERS,
         execute: (id, params, signal, _onUpdate, ctx) => runForegroundOperation(pi, getRuntime, ctx, "mesh_reserve", id, signal, () => execMeshReserve(getRuntime, params)),
+    });
+    pi.registerTool({
+        name: "mesh_file_serve",
+        label: "Mesh File Serve",
+        description: "Offer a local file to a peer over the mesh (cross-machine artifact " +
+            "handoff). Starts a one-shot token-guarded HTTP listener on THIS " +
+            "machine and announces it (name, size, sha256, URL) as an ordinary " +
+            "mesh message. The peer downloads once with curl and verifies the " +
+            "hash. Requires the peer to reach this machine's address (same " +
+            "tailnet or LAN); refuses files above 8 MiB.",
+        promptSnippet: "Offer a local file to a mesh peer (cross-machine).",
+        promptGuidelines: "Use for ad-hoc artifacts a peer cannot get from git (logs, " +
+            "screenshots, built binaries). Bigger files: push a commit or use " +
+            "rsync/scp/Taildrop. One offer at a time — a new offer closes the " +
+            "previous listener. The recipient MUST verify the sha256 from the " +
+            "offer before using the file.",
+        parameters: MESH_FILE_SERVE_PARAMETERS,
+        execute: (id, params, signal, _onUpdate, ctx) => runForegroundOperation(pi, getRuntime, ctx, "mesh_file_serve", id, signal, () => execMeshFileServe(getRuntime, params)),
     });
     pi.registerTool({
         name: "mesh_release",

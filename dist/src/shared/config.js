@@ -124,6 +124,22 @@ export const DEFAULT_RESERVATION_TTL_MS = 21_600_000; // 6 h
 /** Hard cap for `mesh reserve --hold`: at/above the system TTL a hold would
  * silently expire mid-hold and the countdown would misrepresent it. */
 export const CLI_HOLD_MAX_MS = DEFAULT_RESERVATION_TTL_MS;
+// ---- File serve (mesh_file_serve) ----
+/** Announced max file size. Big enough for logs/patches/small binaries;
+ *  bigger artifacts belong in git (rsync/scp/Taildrop for the rest). */
+export const FILE_SERVE_MAX_BYTES = 8_388_608; // 8 MiB
+/** Every served download must finish inside this window; the listener
+ *  closes at the deadline even mid-download (TTL IS the auto-shutdown). */
+export const FILE_SERVE_DEFAULT_TTL_MS = 600_000; // 10 min
+export const FILE_SERVE_MAX_TTL_MS = 3_600_000; // 1 h
+export const FILE_SERVE_MIN_TTL_MS = 5_000;
+/** Streaming download cap: a request claiming a bigger Content-Length (or
+ *  a socket sending more bytes than announced) is aborted — never spooled. */
+export const FILE_SERVE_HTTP_TIMEOUT_MS = 30_000;
+/** announcement must fit ONE ordinary mesh message (prefix + fields). */
+export const FILE_SERVE_MAX_NAME_CHARS = 255;
+/** one served file per session — a second offer replaces the first. */
+export const FILE_SERVE_MAX_CONCURRENT = 1;
 // ---- Context watchdog ----
 /** notify when ONE turn grows the session file by this much (bytes). */
 export const DEFAULT_WATCHDOG_SPIKE_BYTES = 2_097_152; // 2 MiB

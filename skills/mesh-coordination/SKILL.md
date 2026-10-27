@@ -171,6 +171,33 @@ Rules below apply after joining; do not call tools to opt the user in.
   `mesh_send` the owner to coordinate, do not force it.
 - Reservations disappear on disconnect (and after the configured TTL).
 
+## Cross-machine artifacts (files between agents on DIFFERENT machines)
+
+Peers on other machines share the broker, NOT a filesystem. `refs` assumes a
+common repo checkout and message bodies cap at 32 KiB — neither moves a file
+across machines. Rules:
+
+1. **Code → git first.** If both machines hold the same repo, push the branch
+   and `mesh_send` the ref. This is the default; do not invent alternatives.
+2. **Ad-hoc artifacts (log, screenshot, small binary) → `mesh_file_serve`.**
+   The sender's offer message carries name, size, sha256 and a one-time URL;
+   the recipient downloads ONCE (e.g. `curl -fsSL -o <name> <url>`), then
+   **verifies `sha256sum` against the offer before using the file** — an
+   unverified download is not a delivery. The URL dies at its expiry or at
+   the sender's session end (reload/shutdown): a download that fails with a
+   refused socket is re-offered by the sender, never retried blindly.
+3. **No `mesh_file_serve` (e.g. older peer) → shell conventions.** The
+   receiver fetches from a URL the sender provides (tailscale serve/funnel,
+   an object store, a gist); or use `scp`/`rsync`/`tailscale file copy`
+   directly — they already work over the tailnet.
+4. **Oversize (> 8 MiB) or bulk (many files) → git LFS, rsync, or
+   `tailscale file copy`.** Do not paste file contents into messages: a
+   32 KiB body limit rejects them and inlined blobs burn both contexts.
+5. Announce ANY out-of-band transfer via `mesh_send` (where the file is +
+   sha256 + how to fetch it) so peers and late joiners have a ledger trail.
+   Never assume a peer can see your filesystem: shared-path reasoning
+   (`mesh_reserve`, `refs`) only holds on ONE machine.
+
 ## Honest statuses
 
 `delivered` = written on the recipient's socket (≠ read ≠ answered).

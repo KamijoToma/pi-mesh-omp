@@ -103,6 +103,21 @@ export declare const DEFAULT_RESERVATION_TTL_MS = 21600000;
 /** Hard cap for `mesh reserve --hold`: at/above the system TTL a hold would
  * silently expire mid-hold and the countdown would misrepresent it. */
 export declare const CLI_HOLD_MAX_MS = 21600000;
+/** Announced max file size. Big enough for logs/patches/small binaries;
+ *  bigger artifacts belong in git (rsync/scp/Taildrop for the rest). */
+export declare const FILE_SERVE_MAX_BYTES = 8388608;
+/** Every served download must finish inside this window; the listener
+ *  closes at the deadline even mid-download (TTL IS the auto-shutdown). */
+export declare const FILE_SERVE_DEFAULT_TTL_MS = 600000;
+export declare const FILE_SERVE_MAX_TTL_MS = 3600000;
+export declare const FILE_SERVE_MIN_TTL_MS = 5000;
+/** Streaming download cap: a request claiming a bigger Content-Length (or
+ *  a socket sending more bytes than announced) is aborted — never spooled. */
+export declare const FILE_SERVE_HTTP_TIMEOUT_MS = 30000;
+/** announcement must fit ONE ordinary mesh message (prefix + fields). */
+export declare const FILE_SERVE_MAX_NAME_CHARS = 255;
+/** one served file per session — a second offer replaces the first. */
+export declare const FILE_SERVE_MAX_CONCURRENT = 1;
 /** notify when ONE turn grows the session file by this much (bytes). */
 export declare const DEFAULT_WATCHDOG_SPIKE_BYTES = 2097152;
 /** notify when ONE assistant message carries more tool calls than this. */

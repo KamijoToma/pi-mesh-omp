@@ -14,7 +14,7 @@ import { identityFromClient, MeshIdentity } from "../shared/identity-store.js";
 import { MeshLedger } from "./ledger.js";
 import type { ExtensionAPI } from "./pi-types.js";
 import { findToolConflict } from "../shared/reservations.js";
-import { armReserveTimers, registerTools, type MeshRuntime } from "./tools.js";
+import { armReserveTimers, closeServeHandles, registerTools, type MeshRuntime } from "./tools.js";
 import { providerErrorState, providerErrorStateFromMessage } from "./provider-errors.js";
 import { MeshTranscript } from "./transcript.js";
 import { analyzeTurn, countRejected, countToolCalls, renderVerdict, type TurnSample } from "./watchdog.js";
@@ -146,6 +146,7 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
     if (rt === null) return;
     rt.markDetached?.();
     rt.stopHold?.();
+    closeServeHandles(rt);
     if (rt.reserveTimers !== undefined) {
       for (const entry of rt.reserveTimers.values()) clearTimeout(entry.timer);
       rt.reserveTimers.clear();
@@ -366,6 +367,10 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
         clearTimeout(entry.timer);
       }
       rt.reserveTimers?.clear();
+      // Offers do NOT survive reload: the URL points at a listener in the
+      // outgoing module graph. Close them so peers get refused sockets
+      // instead of a URL that outlives its server.
+      closeServeHandles(rt);
       // Keep paused listeners alive until the old socket has drained.
       await rt.client.close();
       if (runtime !== rt || generation !== currentGeneration) {

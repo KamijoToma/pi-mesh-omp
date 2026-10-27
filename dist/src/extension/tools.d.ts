@@ -2,6 +2,7 @@ import { MeshClient } from "../client/client.js";
 import { MAX_BODY_BYTES, type MeshConfig } from "../shared/config.js";
 import type { DeferredInbox } from "./deferred-inbox.js";
 import type { MeshGuards } from "./guards.js";
+import { type FileServeHandle } from "../fileserve/serve.js";
 import { type MeshIdentity } from "../shared/identity-store.js";
 import type { MeshLedger } from "./ledger.js";
 import type { ExtensionAPI, SessionContext } from "./pi-types.js";
@@ -40,6 +41,11 @@ export interface MeshRuntime {
         timer: NodeJS.Timeout;
         expiresAt: number;
     }>;
+    /** Live file offers (mesh_file_serve). At most FILE_SERVE_MAX_CONCURRENT:
+    *  a new offer replaces the previous one. Closed at session_shutdown and
+    *  NOT transferred across /reload — the offer URL points at a listener in
+    *  the old module graph, so it dies with it and peers get honest 404s. */
+    serveHandles?: FileServeHandle[];
     /** While set (ms epoch), inbound frames are HELD, not injected — the
      *  provider is rejecting turns (429) and every injection burns one. */
     rateLimitedUntil?: number;
@@ -138,5 +144,19 @@ export declare function formatPeerActivity(peer: {
 export declare function armReserveTimers(rt: MeshRuntime, patterns: string[], ms: number): void;
 /** Clear auto-release timers (release/shutdown). */
 export declare function clearReserveTimers(rt: MeshRuntime, patterns?: string[]): void;
+/** Close every live file offer (session_shutdown / cmdReset / detach).
+ *  Late downloaders get an honest refused socket, never a hung one. */
+export declare function closeServeHandles(rt: MeshRuntime): void;
+/**
+ * Bind/offer candidates for a file offer, best first. Tailscale self
+ * addresses (100.x CGNAT) lead on a tailnet — peers on other machines can
+ * always reach them; loopback follows for same-machine handoff; the LAN
+ * address is offered when no tailnet is configured.
+ */
+export declare function serveHostCandidates(status: {
+    self: {
+        addresses: string[];
+    } | null;
+} | undefined, family: "IPv4" | "IPv6"): string[];
 export declare function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void;
 export { MAX_BODY_BYTES };
