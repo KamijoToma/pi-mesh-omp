@@ -83,6 +83,13 @@ upstream npm package.
 - **File reservations** — claim repo paths before editing; other agents'
   `edit`/`write` calls on those paths are blocked with the holder's name.
   Reservations live with the connection and expire via TTL.
+- **Cross-machine file handoff** — `mesh_file_serve` offers an ad-hoc
+  artifact (log, screenshot, small binary) to a peer on another machine: a
+  one-shot token-guarded HTTP listener streams the file while the offer
+  (name, size, sha256, URL) travels as an ordinary mesh message. The broker
+  never touches the bytes; nothing is persisted; offers > 8 MiB are refused
+  (use git/rsync/Taildrop for those). Requires direct reachability
+  (tailnet or LAN) and one download per offer.
 - **Identity persistence** — alias, room membership/roles and reservations
   survive resume and `/reload` (one file per pi session); `/mesh new` and pi
   `fork` hand the identity over; `/mesh reset` factory-resets in place.
@@ -277,6 +284,7 @@ sessions, including a compiled host with no plugin-local SDK dependencies.
 | `mesh_history` | `limit?`, `withBodies?` | local **memory ring** (debug — never the ledger) |
 | `mesh_reserve` | `paths`, `reason?`, `autoReleaseMs?` | reserve files/dirs — peers' `edit`/`write` get blocked on them; claims expire for conflict checks after `reservationTtlMs` (default 6 h, re-reserve to renew) and can self-release (`autoReleaseMs`) |
 | `mesh_release` | `paths?` (omit = all) | release reservations, peers notified immediately |
+| `mesh_file_serve` | `path`, `to?`, `room?`, `ttlMs?`, `note?` | cross-machine file handoff: starts a one-shot token-guarded HTTP listener on THIS machine and announces it (name, size, sha256, URL) as an ordinary mesh message; the peer downloads once and verifies the hash. Refuses > 8 MiB; requires the peer to reach this machine (tailnet/LAN). The offer dies at `ttlMs` (default 10 min, max 1 h) or session end — a superseding offer closes the previous listener. `offered` ≠ `downloaded` |
 
 Wait errors distinguish `target_offline`, `connection_lost`, and terminal
 mission failures. New actionable input returns `interrupted` with
@@ -295,7 +303,8 @@ that this call did not write a message. Handle the new input, then use
 Replies owned by a wait stay in its result; unrelated answers are not hidden
 behind another wait's snapshot.
 
-`mesh_reply`, `mesh_status`, `mesh_alias`, `mesh_reserve` and `mesh_release`
+`mesh_reply`, `mesh_status`, `mesh_alias`, `mesh_reserve`, `mesh_release` and
+`mesh_file_serve`
 also yield foreground network waits. Their `interrupted` result contains
 `operationId` and `pendingOperation: true`: the transaction was **not cancelled**.
 Its actual completion arrives as `mesh-operation-result`, including the
