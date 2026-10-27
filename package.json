@@ -1,6 +1,6 @@
 {
   "name": "pi-mesh-extension",
-  "version": "0.7.2-omp.4",
+  "version": "0.7.2-omp.5",
   "description": "Pi and omp agent mesh with compiled-host broker startup, session-safe messaging, and file reservations. GitHub-distributed compatibility fork of pi-mesh-extension.",
   "type": "module",
   "license": "MIT",
