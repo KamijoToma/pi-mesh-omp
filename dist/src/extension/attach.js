@@ -388,7 +388,8 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
             // the general orchestrator pattern — launch bursts, wait_all once
             `Mission bursts: mesh_send(..., awaitReply: true, block: false) then ` +
             `mesh_wait_all for the group verdict — never mesh_history to check. ` +
-            `ESC cancels a pending mesh_wait_all (verdict CANCELLED, missions stay reportable). ` +
+            `ESC cancels a pending mesh_wait_all (verdict CANCELLED, missions stay reportable); ` +
+            `new user input yields it too (verdict INTERRUPTED, reason user_input). ` +
             `mesh_send replyTo: [aliases] designates who receives the reply instead of you.`;
         // a /mesh new handoff may carry the previous session's history —
         // inject it as context so the fresh conversation keeps the thread.

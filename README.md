@@ -291,6 +291,10 @@ mission failures. New actionable input returns `interrupted` with
 `reason: inbound_message` and `interruptedBy`; it reaches the next model call
 as `steer`, without using force or aborting the turn. Deferred broadcasts,
 machine receipts and reply-to-reply metadata do not wake the wait.
+So does a submission from the human — `interrupted` with
+`reason: user_input` and no `interruptedBy` — so the request is seen at the
+next model call rather than behind a wait that can run an hour; slash and
+bang commands are local host actions and do not yield a wait.
 Errors, interruptions and cancellations do not consume partial answers:
 pending tasks remain reportable on a later wait. Explicit batch clearing
 instead cancels the tasks and returns a final snapshot with `missions_cancelled`.

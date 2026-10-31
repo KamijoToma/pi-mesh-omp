@@ -265,13 +265,24 @@ export default function createMeshExtension(pi, host) {
                 rt.identity.savePending(identityFromClient(rt.sessionId, rt.client));
         },
     });
-    pi.on("input", (_event, ctx) => {
+    pi.on("input", (event, ctx) => {
         const rt = current(ctx);
         if (rt === null)
             return;
         activity?.checkModel();
-        if (ctx.isIdle?.() !== false)
+        if (ctx.isIdle?.() !== false) {
             rt.deferredInbox?.queueForPrompt();
+            return;
+        }
+        // A human submission while a passive mesh wait is in flight yields the wait
+        // (status interrupted, reason user_input) instead of queueing behind it for
+        // up to an hour; the turn is not aborted and missions keep their answers.
+        // Slash and bang submissions are local host actions, not steering input.
+        const text = event !== null && typeof event === "object" && "text" in event &&
+            typeof event.text === "string" ? event.text.trim() : "";
+        if (text.startsWith("/") || text.startsWith("!"))
+            return;
+        rt.client.interruptWaits("user_input");
     });
     pi.on("before_agent_start", (_event, ctx) => {
         const rt = current(ctx);

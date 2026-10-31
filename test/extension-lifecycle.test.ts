@@ -10,7 +10,7 @@ import createMeshExtension from "../src/extension/implementation.js";
 import { installReloadableMesh } from "../src/extension/reload.js";
 import { MESH_VERSION } from "../src/shared/version.js";
 import { MeshClient } from "../src/client/client.js";
-import type { ExtensionAPI, CommandDefinition, InboundMessage, SessionContext, ToolDefinition } from "../src/extension/pi-types.js";
+import type { ExtensionAPI, CommandDefinition, InboundMessage, SessionContext, ToolDefinition, ToolResult } from "../src/extension/pi-types.js";
 import { IDENTITY_PENDING_NAME, MeshIdentity } from "../src/shared/identity-store.js";
 import { makeTempDirs, sleep, startTestBroker, waitFor } from "./helpers.js";
 
@@ -786,6 +786,61 @@ describe("mesh built-version hot reload", { concurrency: false, timeout: 15_000 
       assert.equal(fixture.sessionId(), "original");
     } finally { await fixture.close(); }
   });
+  for (const text of ["stop waiting and do X", "follow this instead"]) {
+    it(`user input (${text.slice(0, 19)}…) yields a passive wait without cancelling its missions`, { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
+      const fixture = await lifecycleFixture(true, {});
+      try {
+        fixture.running();
+        const request = once(fixture.observer, "inbound");
+        const launch = await fixture.tool("mesh_send", {
+          to: "observer", message: "wait-then-input", awaitReply: true, block: false, timeoutMs: 5000,
+        });
+        assert.equal(launch.details?.status, "delivered");
+        const [frame] = await request;
+        let verdict: ToolResult | undefined;
+        const waiting = fixture.tool("mesh_wait_all", { timeoutMs: 5000 })
+          .then((value) => { verdict = value; return value; });
+        await fixture.emit("input", { type: "input", text, source: "interactive" });
+        await waitFor(() => verdict !== undefined, 2000);
+        const interrupted = await waiting;
+        assert.equal(interrupted.details?.status, "interrupted");
+        assert.equal(interrupted.details?.reason, "user_input");
+        assert.equal(interrupted.details?.total, 1);
+        assert.equal(interrupted.details?.answered, 0);
+        // The mission outlives the yield: the next wait still reports its answer.
+        const resumed = fixture.tool("mesh_wait_all", { timeoutMs: 5000 });
+        await fixture.observer.reply(frame.id, "answered after user input");
+        const complete = await resumed;
+        assert.equal(complete.details?.status, "complete");
+        assert.equal(complete.details?.answered, 1);
+      } finally { await fixture.close(); }
+    });
+  }
+
+  for (const text of ["/model gpt-5.2", "!git status"]) {
+    it(`a local command (${text.split(" ")[0]}) does not end a passive wait`, { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
+      const fixture = await lifecycleFixture(true, {});
+      try {
+        fixture.running();
+        const request = once(fixture.observer, "inbound");
+        await fixture.tool("mesh_send", {
+          to: "observer", message: "wait-through-command", awaitReply: true, block: false, timeoutMs: 5000,
+        });
+        const [frame] = await request;
+        let verdict: ToolResult | undefined;
+        const waiting = fixture.tool("mesh_wait_all", { timeoutMs: 5000 })
+          .then((value) => { verdict = value; return value; });
+        await fixture.emit("input", { type: "input", text, source: "interactive" });
+        await sleep(150);
+        assert.equal(verdict, undefined, "the wait must survive a local command");
+        await fixture.observer.reply(frame.id, "answered during command");
+        const complete = await waiting;
+        assert.equal(complete.details?.status, "complete");
+        assert.equal(complete.details?.answered, 1);
+      } finally { await fixture.close(); }
+    });
+  }
+
 
   it("retains both deferred and already-queued broadcasts without reinjecting queued messages", async () => {
     const fixture = await lifecycleFixture(true, { reload: true, deferred: true });

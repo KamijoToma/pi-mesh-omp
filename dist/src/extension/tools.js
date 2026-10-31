@@ -809,6 +809,9 @@ async function execMeshWaitAll(getRuntime, params, signal) {
     if (res.interruptedBy !== undefined) {
         lines.push(`  interrupted by inbound ${res.interruptedBy}; missions remain tracked for the next wait`);
     }
+    else if (res.status === "interrupted" && res.reason === "user_input") {
+        lines.push("  interrupted by new user input; missions remain tracked for the next wait");
+    }
     if (res.total === 0 && res.status === "complete")
         lines.push("  (no awaited missions — send with awaitReply: true first)");
     // display the colored verdict entry (agent colors + agent-color backgrounds)
@@ -1234,7 +1237,8 @@ export function registerTools(pi, getRuntime) {
         name: "mesh_wait_all",
         label: "Mesh Wait All",
         description: "Wait for missions sent with awaitReply:true and return complete answers and missing tasks. " +
-            "Returns early on peer/connection errors, cancellation, or a new actionable inbound message. " +
+            "Returns early on peer/connection errors, cancellation, a new actionable inbound message, " +
+            "or new input from the user (reason user_input). " +
             "Interruption preserves tasks and partial answers for a later wait; it does not abort the turn.",
         promptSnippet: "Wait for all pending mission replies and get the summary.",
         parameters: MESH_WAIT_ALL_PARAMETERS,

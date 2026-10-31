@@ -121,7 +121,11 @@ Rules below apply after joining; do not call tools to opt the user in.
    Actionable normal/urgent input returns `interrupted` (`reason: inbound_message`);
    it reaches the next model call as steer, without force or a host-turn abort.
    Deferred broadcasts, machine receipts and reply-to-reply metadata do not
-   wake it. A previously-online target leaving the mission room returns
+   wake it. A submission from the human yields both with `interrupted`
+   (`reason: user_input`, no `interruptedBy`): the tool returns so the next
+   model call sees the request instead of waiting out the timeout. Slash and
+   bang commands do not yield a wait. A previously-online target leaving the
+   mission room returns
    `error: target_offline`; initial `queued_offline` tasks still wait normally.
    Own connection loss reports `connection_lost`, not a remote task failure.
 4. **ESC cancels a pending wait**, with `status: cancelled` and `reason: aborted`.
