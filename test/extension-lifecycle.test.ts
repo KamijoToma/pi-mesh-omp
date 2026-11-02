@@ -10,14 +10,14 @@ import createMeshExtension from "../src/extension/implementation.js";
 import { installReloadableMesh } from "../src/extension/reload.js";
 import { MESH_VERSION } from "../src/shared/version.js";
 import { MeshClient } from "../src/client/client.js";
-import type { ExtensionAPI, CommandDefinition, InboundMessage, SessionContext, ToolDefinition, ToolResult } from "../src/extension/pi-types.js";
+import type { ExtensionAPI, CommandDefinition, InboundMessage, SendMessageOptions, SessionContext, ToolDefinition, ToolResult } from "../src/extension/pi-types.js";
 import { IDENTITY_PENDING_NAME, MeshIdentity } from "../src/shared/identity-store.js";
 import { makeTempDirs, sleep, startTestBroker, waitFor } from "./helpers.js";
 
 type Hook = (event: unknown, ctx: SessionContext) => unknown;
 type ManagedTimer = Parameters<NonNullable<SessionContext["clearTimer"]>>[0];
 
-async function lifecycleFixture(omp: boolean, options: { reload?: boolean; deferred?: boolean; join?: boolean } = {}) {
+async function lifecycleFixture(omp: boolean, options: { reload?: boolean; deferred?: boolean; join?: boolean; inboundBatchMs?: number; inboundBatchMaxHoldMs?: number } = {}) {
   const dirs = makeTempDirs("mesh-lifecycle-");
   const savedEnvironment: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -28,7 +28,10 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
   }
   process.env.MESH_RUNTIME_DIR = dirs.runtimeDir;
   process.env.MESH_STATE_DIR = dirs.stateDir;
-  process.env.MESH_INBOUND_BATCH_MS = "0";
+  process.env.MESH_INBOUND_BATCH_MS = String(options.inboundBatchMs ?? 0);
+  if (options.inboundBatchMaxHoldMs !== undefined) {
+    process.env.MESH_INBOUND_BATCH_MAX_HOLD_MS = String(options.inboundBatchMaxHoldMs);
+  }
   if (options.deferred) process.env.MESH_INBOUND_BROADCASTS = "deferred";
   const packageRoot = path.join(dirs.root, "package");
   if (options.reload) {
@@ -48,6 +51,10 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
   let cancelNew = false;
   let modelId = "quota-model";
   let idle = true;
+  let pendingMessages = false;
+  let backgroundRunning = false;
+  let deliveryPending = false;
+  let abortCalls = 0;
   let alias = "";
   const names = new Map<string, string>();
   const hooks = new Map<string, Hook[]>();
@@ -67,7 +74,11 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
     },
     registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
     registerCommand: (name: string, command: CommandDefinition) => commands.set(name, command),
-    sendMessage: (message: InboundMessage) => { sent.push(message); events.emit("sent", message); },
+    sendMessage: (message: InboundMessage, options?: SendMessageOptions) => {
+      sent.push(message);
+      if (options?.triggerTurn === true) pendingMessages = true;
+      events.emit("sent", message);
+    },
     appendEntry: (type: string, data: unknown) => entries.push({ type, data }),
     events: {
       emit: (name: string, data: unknown) => {
@@ -83,6 +94,7 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
   } as unknown as ExtensionAPI;
 
   const emit = async (name: string, event: unknown = {}, ctx = context()): Promise<unknown> => {
+    if (name === "agent_start") pendingMessages = false;
     let result: unknown;
     for (const handler of hooks.get(name) ?? []) {
       const value = await handler(event, ctx);
@@ -102,6 +114,19 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
         setWidget: () => ensureFresh(), setStatus: () => ensureFresh(),
       },
       isIdle: () => idle,
+      getAsyncJobSnapshot: omp ? () => ({
+        running: backgroundRunning
+          ? [{ id: "test-job", type: "bash" as const, status: "running" as const, label: "test job", startTime: 0 }]
+          : [],
+        recent: [],
+        delivery: {
+          queued: deliveryPending ? 1 : 0,
+          delivering: false,
+          pendingJobIds: deliveryPending ? ["test-job"] : [],
+        },
+      }) : undefined,
+      hasPendingMessages: omp ? () => pendingMessages : undefined,
+      abort: () => { abortCalls++; },
       models: omp ? { current: () => ({ provider: "test", id: modelId }) as never, list: () => [], resolve: () => undefined, family: () => "test" } : undefined,
       setTimeout: omp ? (callback, ms = 0) => {
         const timer = {} as ManagedTimer;
@@ -138,6 +163,7 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
     identity,
     ready: () => once(events, "mesh:alias"),
     alias: () => alias, sessionId: () => sessionId, emit, context,
+    meshLoopCommand: async (args: string, ctx: SessionContext = context()) => { await commands.get("mesh-loop")!.handler(args, ctx); },
     command: async (args: string) => { await commands.get("mesh")!.handler(args, context()); },
     tool: async (name: string, params: Record<string, unknown>) => tools.get(name)!.execute("test-call", params, undefined, undefined, context()),
     cancel: () => { cancelNew = true; },
@@ -147,6 +173,18 @@ async function lifecycleFixture(omp: boolean, options: { reload?: boolean; defer
     fireNextTimer: () => {
       const next = [...timers.entries()].sort((left, right) => left[1].ms - right[1].ms)[0];
       assert.ok(next);
+      timers.delete(next[0]);
+      next[1].callback();
+    },
+    setPendingMessages: (value: boolean) => { pendingMessages = value; },
+    setAsyncJobs: (runningJobs: boolean, queuedDelivery: boolean) => {
+      backgroundRunning = runningJobs;
+      deliveryPending = queuedDelivery;
+    },
+    abortCalls: () => abortCalls,
+    fireTimer: (ms: number) => {
+      const next = [...timers.entries()].find(([, timer]) => timer.ms === ms);
+      assert.ok(next, `no managed timer scheduled for ${ms}ms`);
       timers.delete(next[0]);
       next[1].callback();
     },
@@ -700,6 +738,320 @@ describe("mesh extension session lifecycle", { concurrency: false }, () => {
     }
   });
 });
+
+describe("mesh-loop extension", { concurrency: false, timeout: LIFECYCLE_TEST_TIMEOUT_MS }, () => {
+  interface LoopFixture {
+    sent: InboundMessage[];
+    running(): void;
+    idle(): void;
+    emit(name: string, event?: unknown, ctx?: SessionContext): Promise<unknown>;
+  }
+  const loopPrompts = (fixture: LoopFixture): InboundMessage[] =>
+    fixture.sent.filter((message) => message.customType === "mesh-loop");
+  const startLoopTurn = async (fixture: LoopFixture): Promise<void> => {
+    fixture.running();
+    await fixture.emit("agent_start");
+  };
+  const settleLoopTurn = async (fixture: LoopFixture): Promise<void> => {
+    await fixture.emit("agent_end", { willContinue: false });
+    fixture.idle();
+  };
+
+  it("starts with one hidden prompt and stops exactly at the max-run bound", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      await fixture.meshLoopCommand("2 finish the assigned task");
+      assert.equal(loopPrompts(fixture).length, 1);
+      assert.equal(loopPrompts(fixture)[0]?.display, false);
+      assert.match(loopPrompts(fixture)[0]?.content ?? "", /Never ask the end user/);
+      assert.match(loopPrompts(fixture)[0]?.content ?? "", /mesh_wait_all/);
+      assert.match(loopPrompts(fixture)[0]?.content ?? "", /OMP wait/);
+      assert.match(loopPrompts(fixture)[0]?.content ?? "", /Assigned task: finish the assigned task/);
+
+      await startLoopTurn(fixture);
+      await settleLoopTurn(fixture);
+      assert.equal(loopPrompts(fixture).length, 1);
+      fixture.fireTimer(800);
+      assert.equal(loopPrompts(fixture).length, 2);
+
+      await startLoopTurn(fixture);
+      await settleLoopTurn(fixture);
+      assert.equal(loopPrompts(fixture).length, 2);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), false);
+      const inactive = await fixture.tool("mesh_loop_stop", { reason: "task complete" });
+      assert.equal(inactive.details?.status, "not_active");
+    } finally {
+      await fixture.close();
+    }
+  });
+  it("arms during an existing turn without counting that turn against the loop", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      await startLoopTurn(fixture);
+      await fixture.meshLoopCommand("1 finish after this turn");
+      assert.equal(loopPrompts(fixture).length, 0);
+
+      await settleLoopTurn(fixture);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), true);
+      fixture.fireTimer(800);
+      assert.equal(loopPrompts(fixture).length, 1);
+
+      await startLoopTurn(fixture);
+      await settleLoopTurn(fixture);
+      assert.equal(loopPrompts(fixture).length, 1);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), false);
+      assert.equal((await fixture.tool("mesh_loop_stop", { reason: "limit check" })).details?.status, "not_active");
+    } finally {
+      await fixture.close();
+    }
+  });
+  it("does not start the first prompt while OMP background work is pending", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      fixture.setAsyncJobs(true, false);
+      await fixture.meshLoopCommand("2 continue after the job");
+      assert.equal(loopPrompts(fixture).length, 0);
+      assert.ok(fixture.notifications.some((notification) => notification.message.includes("waiting for pending work")));
+
+      fixture.setAsyncJobs(false, false);
+      await startLoopTurn(fixture);
+      await settleLoopTurn(fixture);
+      fixture.fireTimer(800);
+      assert.equal(loopPrompts(fixture).length, 1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+
+  it("stops future prompts with the model tool without aborting the current turn", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      await fixture.meshLoopCommand("4 continue");
+      await startLoopTurn(fixture);
+      const result = await fixture.tool("mesh_loop_stop", { reason: "task complete" });
+      assert.equal(result.details?.status, "stopped");
+      assert.match(result.content[0]?.text ?? "", /future automatic prompts are stopped/);
+      assert.equal(fixture.abortCalls(), 0);
+      await settleLoopTurn(fixture);
+      assert.equal(loopPrompts(fixture).length, 1);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), false);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("parks for awaited replies and does not continue before the answer is injected", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      await fixture.meshLoopCommand("3 coordinate with the other agent");
+      await startLoopTurn(fixture);
+      const request = once(fixture.observer, "inbound");
+      const launched = await fixture.tool("mesh_send", {
+        to: "observer", message: "need a decision", awaitReply: true, block: false, timeoutMs: 5_000,
+      });
+      assert.equal(launched.details?.status, "delivered");
+      const [frame] = await request;
+      await settleLoopTurn(fixture);
+      assert.equal(loopPrompts(fixture).length, 1);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), false);
+
+      await fixture.observer.reply(frame.id, "use the existing interface");
+      await waitFor(() => fixture.sent.some((message) =>
+        message.customType === "mesh-inbound" && message.content.includes("use the existing interface")));
+      assert.equal(loopPrompts(fixture).length, 1);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), false);
+
+      await startLoopTurn(fixture);
+      await settleLoopTurn(fixture);
+      fixture.fireTimer(800);
+      assert.equal(loopPrompts(fixture).length, 2);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("waits for OMP jobs, queued deliveries and host messages before continuing", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      await fixture.meshLoopCommand("5 finish after the background result");
+      await startLoopTurn(fixture);
+      fixture.setAsyncJobs(true, false);
+      await settleLoopTurn(fixture);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), false);
+
+      fixture.setAsyncJobs(false, true);
+      await startLoopTurn(fixture);
+      await settleLoopTurn(fixture);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), false);
+
+      fixture.setAsyncJobs(false, false);
+      await startLoopTurn(fixture);
+      fixture.setPendingMessages(true);
+      await settleLoopTurn(fixture);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), false);
+
+      fixture.setPendingMessages(false);
+      await startLoopTurn(fixture);
+      await settleLoopTurn(fixture);
+      fixture.fireTimer(800);
+      assert.equal(loopPrompts(fixture).length, 2);
+    } finally {
+      await fixture.close();
+    }
+  });
+  it("blocks continuation while a matched reply is still held in the inbound batcher", { timeout: LIFECYCLE_TEST_TIMEOUT_MS }, async () => {
+    const fixture = await lifecycleFixture(true, { inboundBatchMs: 5, inboundBatchMaxHoldMs: 100 });
+    try {
+      await fixture.meshLoopCommand("3 use the coordinator answer");
+      await startLoopTurn(fixture);
+      const request = once(fixture.observer, "inbound");
+      const launched = await fixture.tool("mesh_send", {
+        to: "observer", message: "choose an interface", awaitReply: true, block: false, timeoutMs: 5_000,
+      });
+      assert.equal(launched.details?.status, "delivered");
+      const [frame] = await request;
+      await fixture.observer.reply(frame.id, "use the existing interface");
+      await sleep(25); // let the short batch window observe the still-busy host
+
+      await settleLoopTurn(fixture);
+      assert.equal(loopPrompts(fixture).length, 1);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), false);
+
+      await waitFor(() => fixture.sent.some((message) =>
+        message.customType === "mesh-inbound" && message.content.includes("use the existing interface")));
+      assert.equal(loopPrompts(fixture).length, 1);
+      await startLoopTurn(fixture);
+      await settleLoopTurn(fixture);
+      fixture.fireTimer(800);
+      assert.equal(loopPrompts(fixture).length, 2);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("resumes from expiry of the last awaited mesh reply", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      await fixture.meshLoopCommand("2 continue after expiry");
+      await startLoopTurn(fixture);
+      const request = once(fixture.observer, "inbound");
+      const launched = await fixture.tool("mesh_send", {
+        to: "observer", message: "answer if available", awaitReply: true, block: false, timeoutMs: 1_000,
+      });
+      assert.equal(launched.details?.status, "delivered");
+      await request;
+      await settleLoopTurn(fixture);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), false);
+
+      await waitFor(() => [...fixture.timers.values()].some((timer) => timer.ms === 800), 4_000);
+      fixture.fireTimer(800);
+      assert.equal(loopPrompts(fixture).length, 2);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("user input cancels the loop, while /mesh-loop input does not", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      await fixture.meshLoopCommand("2 task");
+      await fixture.emit("input", { text: "/mesh-loop stop" });
+      await fixture.meshLoopCommand("stop");
+      assert.ok(fixture.notifications.some((notification) => notification.message.includes("future automatic prompts are stopped")));
+      const stopped = await fixture.tool("mesh_loop_stop", { reason: "test" });
+      assert.equal(stopped.details?.status, "not_active");
+
+      await fixture.meshLoopCommand("2 task");
+      await fixture.emit("input", { text: "please change direction" });
+      const cancelled = await fixture.tool("mesh_loop_stop", { reason: "test" });
+      assert.equal(cancelled.details?.status, "not_active");
+    } finally {
+      await fixture.close();
+    }
+  });
+  it("aborts a hidden loop prompt cancelled before agent start", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      await fixture.meshLoopCommand("3 task");
+      const prompt = loopPrompts(fixture)[0];
+      assert.ok(prompt);
+
+      await fixture.emit("input", { text: "switch to a new task" });
+      assert.equal((await fixture.tool("mesh_loop_stop", { reason: "cancellation check" })).details?.status, "not_active");
+      await fixture.emit("before_agent_start", { prompt: prompt.content });
+      assert.equal(fixture.abortCalls(), 1);
+      assert.equal(loopPrompts(fixture).length, 1);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("rejects safely on Pi, where async-job state cannot be observed", async () => {
+    const fixture = await lifecycleFixture(false);
+    try {
+      await fixture.meshLoopCommand("2 task");
+      assert.ok(fixture.notifications.some((notification) => notification.message.includes("requires OMP")));
+      assert.equal(loopPrompts(fixture).length, 0);
+    } finally {
+      await fixture.close();
+    }
+  });
+  it("rejects RPC/ACP contexts that defer agent-initiated turns", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      const ctx = fixture.context();
+      ctx.mode = "rpc";
+      await fixture.meshLoopCommand("2 task", ctx);
+      assert.ok(fixture.notifications.some((notification) => notification.message.includes("interactive OMP TUI")));
+      assert.equal(loopPrompts(fixture).length, 0);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("clears a scheduled continuation on session switch", async () => {
+    const fixture = await lifecycleFixture(true);
+    try {
+      await fixture.meshLoopCommand("3 task");
+      await startLoopTurn(fixture);
+      await settleLoopTurn(fixture);
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), true);
+      await fixture.switchTo("mesh-loop-next-session", "new");
+      assert.equal([...fixture.timers.values()].some((timer) => timer.ms === 800), false);
+      const result = await fixture.tool("mesh_loop_stop", { reason: "check session state" });
+      assert.equal(result.details?.status, "not_active");
+      assert.equal(loopPrompts(fixture).length, 1);
+    } finally {
+      await fixture.close();
+    }
+  });
+  it("keeps reload unsafe while active and does not transfer loop state", async () => {
+    const fixture = await lifecycleFixture(true, { reload: true });
+    try {
+      const version = `${MESH_VERSION}-mesh-loop-test`;
+      fixture.updateVersion(version);
+      await fixture.meshLoopCommand("3 task");
+      await fixture.command("reload");
+      await sleep(200);
+      assert.equal(fixture.notifications.some((notification) => notification.message.includes(version)), false);
+
+      const stopped = await fixture.tool("mesh_loop_stop", { reason: "test" });
+      assert.equal(stopped.details?.status, "stopped");
+      const stoppedPrompt = loopPrompts(fixture)[0];
+      assert.ok(stoppedPrompt);
+      await fixture.emit("before_agent_start", { prompt: stoppedPrompt.content });
+      assert.equal(fixture.abortCalls(), 1);
+      await waitFor(() => fixture.notifications.some((notification) => notification.message.includes(version)), 5_000);
+      const afterReload = await fixture.tool("mesh_loop_stop", { reason: "test" });
+      assert.equal(afterReload.details?.status, "not_active");
+      assert.equal(loopPrompts(fixture).length, 1);
+    } finally {
+      await fixture.close();
+    }
+  });
+});
+
 
 describe("mesh built-version hot reload", { concurrency: false, timeout: 15_000 }, () => {
   it("does not connect an unjoined identity during built-version replacement", async () => {

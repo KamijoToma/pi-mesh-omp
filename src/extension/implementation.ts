@@ -23,6 +23,7 @@ import { MeshActivity, type MeshActivityReloadState } from "./activity.js";
 import { isOmpHost, registerHostLifecycle, reportConnectionError } from "./host.js";
 import { MESH_VERSION } from "../shared/version.js";
 import type { MeshExtensionInstance } from "./reload.js";
+import { MeshLoopController } from "./mesh-loop.js";
 import { configureHostTui, type MeshHostTui } from "./tui.js";
 
 interface MeshReloadState {
@@ -46,6 +47,7 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
   let runtime: MeshRuntime | null = null;
   let hud: MeshHud | null = null;
   const getRuntime = (): MeshRuntime | null => runtime;
+  const meshLoop = new MeshLoopController(pi, getRuntime);
   let activity: MeshActivity | null = null;
   let runWatchdog: ((message: unknown, toolResults: readonly unknown[]) => void) | undefined;
   let generation = 0;
@@ -132,6 +134,7 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
   const detachSession = async (socketClosed = false): Promise<void> => {
     const rt = runtime;
     runtime = null;
+    meshLoop.discard();
     generation++;
     activity?.dispose();
     activity = null;
@@ -201,6 +204,7 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
       ledgerFailures: 0,
       transcriptFailures: 0,
       injectionFailures: 0,
+      meshLoop,
       appendEntry: (type, data) => pi.appendEntry(type, data),
       interruptReceipts: config.interruptReceipts !== false,
       interruptCount: 0,
@@ -279,7 +283,13 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
   pi.on("session_start", (_event, ctx) => startSession(ctx));
   registerHostLifecycle(pi, {
     switchSession: startSession,
-    settled: (ctx) => { if (current(ctx) !== null) activity?.settled(); },
+    settled: (ctx) => {
+      const rt = current(ctx);
+      if (rt !== null) {
+        activity?.settled();
+        rt.meshLoop?.onSettled(rt, ctx);
+      }
+    },
     modelSelected: (ctx) => { if (current(ctx) !== null) activity?.recovered(); },
     beforeFork: () => {
       const rt = runtime;
@@ -290,6 +300,9 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
     const rt = current(ctx);
     if (rt === null) return;
     activity?.checkModel();
+    const text = event !== null && typeof event === "object" && "text" in event &&
+      typeof event.text === "string" ? event.text.trim() : "";
+    if (!/^\/mesh-loop(?:\s|$)/.test(text)) rt.meshLoop?.clear();
     if (ctx.isIdle?.() !== false) {
       rt.deferredInbox?.queueForPrompt();
       return;
@@ -298,14 +311,13 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
     // (status interrupted, reason user_input) instead of queueing behind it for
     // up to an hour; the turn is not aborted and missions keep their answers.
     // Slash and bang submissions are local host actions, not steering input.
-    const text = event !== null && typeof event === "object" && "text" in event &&
-      typeof event.text === "string" ? event.text.trim() : "";
     if (text.startsWith("/") || text.startsWith("!")) return;
     rt.client.interruptWaits("user_input");
   });
-  pi.on("before_agent_start", (_event, ctx) => {
+  pi.on("before_agent_start", (event, ctx) => {
     const rt = current(ctx);
     if (rt === null) return;
+    rt.meshLoop?.onBeforeAgentStart(rt, event, ctx);
     activity?.checkModel();
     rt.deferredInbox?.promptStarting();
   });
@@ -313,6 +325,7 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
     const rt = current(ctx);
     if (rt === null) return;
     activity?.beginRun();
+    rt.meshLoop?.onAgentStart(rt, ctx);
     rt.deferredInbox?.agentStarting();
   });
   pi.on("turn_end", (event, ctx) => {
@@ -361,13 +374,20 @@ export default function createMeshExtension(pi: ExtensionAPI, host: MeshHostTui)
     reloadApiVersion: 2,
     version: MESH_VERSION,
     isReloadSafe: () => runtime !== null && runtime.client.isReloadSafe() &&
-      runtime.isInboundReloadSafe?.() !== false && (runtime.pendingToolOperations?.size ?? 0) === 0,
+      runtime.isInboundReloadSafe?.() !== false && (runtime.pendingToolOperations?.size ?? 0) === 0 &&
+      !meshLoop.isActive() && !meshLoop.hasPendingPromptCancellation(),
     suspend: async () => {
       const rt = runtime;
       if (rt === null || rt.captureInboundForReload === undefined) {
         throw new Error("mesh: no initialized runtime to transfer");
       }
       const currentGeneration = generation;
+      if (meshLoop.isActive()) {
+        throw new Error("mesh: cannot reload while mesh-loop is active; stop it first");
+      }
+      if (meshLoop.hasPendingPromptCancellation()) {
+        throw new Error("mesh: cannot reload until a stopped mesh-loop prompt is discarded");
+      }
       rt.pauseForReload?.();
       hud?.detach();
       const activityState = activity?.snapshotForReload();

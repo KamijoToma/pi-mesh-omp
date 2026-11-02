@@ -14,6 +14,7 @@ import type { ExtensionAPI, SessionContext } from "./pi-types.js";
 import { clearReserveTimers, closeServeHandles, formatPeerActivity, type GetRuntime, type MeshRuntime } from "./tools.js";
 import { isOmpHost, reportConnectionError } from "./host.js";
 import { executeTailnetCommand } from "../tailscale/commands.js";
+import { DEFAULT_MESH_LOOP_MAX_RUNS, MAX_MESH_LOOP_RUNS } from "./mesh-loop.js";
 
 const HELP_TEXT = [
   "/mesh status [room]   — broker snapshot (peers, activity, rooms)",
@@ -32,6 +33,8 @@ const HELP_TEXT = [
   "/mesh inbox [flush]   — list deferred broadcasts, or deliver them now",
   "/mesh tailscale status|discover|doctor",
   "/mesh tailscale join <mesh-id> [--service svc:NAME | --host HOST | --tag tag:NAME] [--port PORT]",
+  `/mesh-loop [max-runs] [task text] — interactive OMP TUI loop (default ${DEFAULT_MESH_LOOP_MAX_RUNS}, max ${MAX_MESH_LOOP_RUNS})`,
+  "/mesh-loop stop       — stop future automatic loop prompts",
   "/mesh reload          — load the built version without restarting the host (waits for idle)",
   "/mesh help",
 ].join("\n");
@@ -618,6 +621,50 @@ export function registerCommands(
         default:
           notify(ctx, `mesh: unknown subcommand '${sub}'\n${HELP_TEXT}`);
       }
+    },
+  });
+
+  pi.registerCommand("mesh-loop", {
+    description: "Continue the current assigned task in the interactive OMP TUI until complete, blocked or the run limit.",
+    handler: (args, ctx) => {
+      const value = args.trim();
+      if (value.toLowerCase() === "stop") {
+        const rt = getRuntime();
+        if (rt !== null && (ctx.sessionManager?.getSessionId() ?? rt.sessionId) !== rt.sessionId) {
+          ctx.ui.notify("mesh: not_active — this stop request belongs to another session.", "warning");
+          return;
+        }
+        const result = rt?.meshLoop?.stop("stopped by /mesh-loop stop") ??
+          { active: false, message: "not_active: no mesh loop is active." };
+        ctx.ui.notify(`mesh: ${result.message}`, result.active ? "info" : "warning");
+        return;
+      }
+      const rt = getRuntime();
+      if (rt === null) {
+        ctx.ui.notify("mesh-loop: session not started.", "warning");
+        return;
+      }
+      rt.ctx = ctx;
+      let maxRuns = DEFAULT_MESH_LOOP_MAX_RUNS;
+      let taskText = value;
+      const first = value.split(/\s+/, 1)[0] ?? "";
+      if (/^\d+$/.test(first)) {
+        maxRuns = Number(first);
+        taskText = value.slice(first.length).trim();
+      } else if (/^[+-]?\d/.test(first)) {
+        ctx.ui.notify(`usage: /mesh-loop [max-runs] [task text] | /mesh-loop stop (max-runs 1–${MAX_MESH_LOOP_RUNS})`, "warning");
+        return;
+      }
+      if (!Number.isInteger(maxRuns) || maxRuns < 1 || maxRuns > MAX_MESH_LOOP_RUNS) {
+        ctx.ui.notify(`mesh-loop max-runs must be an integer from 1 to ${MAX_MESH_LOOP_RUNS}.`, "warning");
+        return;
+      }
+      if (rt.meshLoop === undefined) {
+        ctx.ui.notify("mesh-loop is unavailable in this session.", "warning");
+        return;
+      }
+      const result = rt.meshLoop.start(rt, ctx, maxRuns, taskText);
+      ctx.ui.notify(`mesh: ${result.message}`, result.ok ? "info" : "warning");
     },
   });
 }

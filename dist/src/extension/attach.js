@@ -125,6 +125,7 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
             deliveryHost.sendMessage(message, { triggerTurn: true, deliverAs: batch.deliverAs });
             for (const frame of frames)
                 recordInboundDelivery(frame, deps);
+            rt.meshLoop?.onInboundInjected(rt);
         });
     });
     const deferredInbox = new DeferredInbox(deliveryHost, (frame) => formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom, hintTracker), () => guarded(() => getHud()?.refresh()), (frames) => {
@@ -140,6 +141,7 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
     // turn. They are queued and delivered when the hold expires.
     const heldFrames = [...(restored?.held ?? [])];
     const pausedBatches = [...(restored?.batched ?? [])];
+    rt.hasPendingInboundDelivery = () => pendingInjections.size > 0 || batcher.pending > 0 || heldFrames.length > 0 || pausedBatches.length > 0;
     const wakeForInput = (frame, interruptedWaits = false) => {
         if (frame.receipt === true || ("__replyChain" in frame && frame.__replyChain === true))
             return false;
@@ -164,7 +166,10 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
                 ...opts,
                 wakeWaiting,
                 replyChain: "__replyChain" in frame && frame.__replyChain === true,
-                onInjected: () => recordInboundDelivery(frame, deps),
+                onInjected: () => {
+                    recordInboundDelivery(frame, deps);
+                    rt.meshLoop?.onInboundInjected(rt);
+                },
             };
             // force+interrupt: wire the honest report (receipt + local notify +
             // memory-only counters) before injection runs its repeater path
@@ -424,6 +429,10 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
     client.on("closed", () => { if (active())
         getHud()?.onClosed(); });
     client.on("pending", () => guarded(() => getHud()?.refresh()));
+    client.on("missions", () => {
+        if (active())
+            rt.meshLoop?.onMissionsChanged(rt);
+    });
     // async drop receipt: the broker dropped one of OUR messages from the
     // recipient's offline mailbox. The client
     // already settled its mission; wake any other passive wait so the explicit
@@ -446,6 +455,7 @@ liveCooldownMs = LIVE_COOLDOWN_MS, isCurrent = () => (rt.ctx?.sessionManager?.ge
                 display: true,
                 details: { kind: "mesh-drop-notice", msgId: frame.id, to: target },
             }, { triggerTurn: true, deliverAs: operationWoke || taskWoke ? "steer" : "followUp" });
+            rt.meshLoop?.onInboundInjected(rt);
         });
         try {
             rt.ledger.append({

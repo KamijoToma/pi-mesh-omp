@@ -52,6 +52,9 @@ export interface SessionContext {
     agent?: OmpExtensionContext["agent"];
     setTimeout?: OmpExtensionContext["setTimeout"];
     clearTimer?: OmpExtensionContext["clearTimer"];
+    /** OMP queue/background-job observation; absent on Pi. */
+    getAsyncJobSnapshot?: OmpExtensionContext["getAsyncJobSnapshot"];
+    hasPendingMessages?: OmpExtensionContext["hasPendingMessages"];
     /** Pi exposes the current model directly. */
     model?: {
         provider: string;

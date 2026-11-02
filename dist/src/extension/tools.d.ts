@@ -61,8 +61,12 @@ export interface MeshRuntime {
     activateAfterReload?: () => void;
     /** Force deliveries deferred until host-idle must finish before handover. */
     isInboundReloadSafe?: () => boolean;
+    /** True while received mesh frames are still held, batched, or being injected. */
+    hasPendingInboundDelivery?: () => boolean;
     /** Foreground control requests remain tracked until their real result settles. */
     pendingToolOperations?: Set<(reason: string, msgId?: string) => boolean>;
+    /** Non-persistent continuation loop for this session. */
+    meshLoop?: MeshLoopControl;
     /** Shared session/client guard for delayed operation results. */
     isCurrent?: () => boolean;
     /** Called by the context watchdog when a compaction is detected —
@@ -79,6 +83,24 @@ export interface MeshRuntime {
     ledgerFailures: number;
     transcriptFailures: number;
     injectionFailures: number;
+}
+export interface MeshLoopControl {
+    start(rt: MeshRuntime, ctx: SessionContext, maxRuns?: number, taskText?: string): {
+        ok: boolean;
+        message: string;
+    };
+    stop(reason: string): {
+        active: boolean;
+        message: string;
+    };
+    clear(): boolean;
+    discard(): void;
+    hasPendingPromptCancellation(): boolean;
+    onAgentStart(rt: MeshRuntime, ctx: SessionContext): void;
+    onSettled(rt: MeshRuntime, ctx: SessionContext): void;
+    onInboundInjected(rt: MeshRuntime): void;
+    onBeforeAgentStart(rt: MeshRuntime, event: unknown, ctx: SessionContext): void;
+    onMissionsChanged(rt: MeshRuntime): void;
 }
 export type GetRuntime = () => MeshRuntime | null;
 /** Yield foreground control requests without cancelling their transactions. */

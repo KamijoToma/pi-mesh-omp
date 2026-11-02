@@ -87,8 +87,12 @@ export interface MeshRuntime {
   activateAfterReload?: () => void;
   /** Force deliveries deferred until host-idle must finish before handover. */
   isInboundReloadSafe?: () => boolean;
+  /** True while received mesh frames are still held, batched, or being injected. */
+  hasPendingInboundDelivery?: () => boolean;
   /** Foreground control requests remain tracked until their real result settles. */
   pendingToolOperations?: Set<(reason: string, msgId?: string) => boolean>;
+  /** Non-persistent continuation loop for this session. */
+  meshLoop?: MeshLoopControl;
   /** Shared session/client guard for delayed operation results. */
   isCurrent?: () => boolean;
   /** Called by the context watchdog when a compaction is detected —
@@ -105,6 +109,19 @@ export interface MeshRuntime {
   ledgerFailures: number;
   transcriptFailures: number;
   injectionFailures: number;
+}
+
+export interface MeshLoopControl {
+  start(rt: MeshRuntime, ctx: SessionContext, maxRuns?: number, taskText?: string): { ok: boolean; message: string };
+  stop(reason: string): { active: boolean; message: string };
+  clear(): boolean;
+  discard(): void;
+  hasPendingPromptCancellation(): boolean;
+  onAgentStart(rt: MeshRuntime, ctx: SessionContext): void;
+  onSettled(rt: MeshRuntime, ctx: SessionContext): void;
+  onInboundInjected(rt: MeshRuntime): void;
+  onBeforeAgentStart(rt: MeshRuntime, event: unknown, ctx: SessionContext): void;
+  onMissionsChanged(rt: MeshRuntime): void;
 }
 
 export type GetRuntime = () => MeshRuntime | null;
@@ -1568,6 +1585,46 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
     parameters: MESH_RELEASE_PARAMETERS,
     execute: (id, params, signal, _onUpdate, ctx) =>
       runForegroundOperation(pi, getRuntime, ctx, "mesh_release", id, signal, () => execMeshRelease(getRuntime, params)),
+  });
+
+  pi.registerTool({
+    name: "mesh_loop_stop",
+    label: "Mesh Loop Stop",
+    description:
+      "Stop future automatic mesh-loop prompts and cancel any prompt that has not started, " +
+      "without aborting the current agent turn. " +
+      "Call only when the assigned task is genuinely complete or irrecoverably blocked, never while waiting for a reply or background job.",
+    promptSnippet: "Stop future automatic mesh-loop prompts when the task is complete or irrecoverably blocked.",
+    promptGuidelines:
+      "Do not call mesh_loop_stop while waiting for mesh replies or OMP background jobs. " +
+      "Use it only when the task is genuinely complete or irrecoverably blocked.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        reason: { type: "string", minLength: 1, description: "Why the loop is genuinely complete or irrecoverably blocked." },
+      },
+      required: ["reason"],
+    },
+    execute: (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const reason = params.reason;
+      if (typeof reason !== "string" || reason.trim() === "") {
+        return Promise.resolve(textResult("error: reason is required.", { status: "error", reason: "invalid_reason" }));
+      }
+      const rt = getRuntime();
+      if (rt !== null && (ctx.sessionManager?.getSessionId() ?? rt.sessionId) !== rt.sessionId) {
+        return Promise.resolve(textResult("blocked: session changed; this stop request is stale.", {
+          status: "blocked", reason: "session_changed",
+        }));
+      }
+      const result = rt?.meshLoop?.stop(reason) ??
+        { active: false, message: "not_active: no mesh loop is active." };
+      return Promise.resolve(textResult(result.message, {
+        status: result.active ? "stopped" : "not_active",
+        reason,
+        futurePromptsStopped: result.active,
+      }));
+    },
   });
 }
 

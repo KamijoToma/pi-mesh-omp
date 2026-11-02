@@ -98,8 +98,13 @@ upstream npm package.
 - **Tailnet discovery** — opt-in Tailscale Services or exact
   device/tag discovery, authenticated mesh selection, and restart-aware reconnects.
 - **Hash-only ledger** — durable history with bodies never stored, plus an
-  opt-in redacted transcript. Zero loops: rate caps, anti-duplicate window,
-  self-send block, reply dedup, ack-of-ack protection.
+  opt-in redacted transcript.
+- **Loop prevention** — rate caps, anti-duplicate window, self-send block,
+  reply dedup, ack-of-ack protection.
+- **Bounded OMP TUI task loops** — `/mesh-loop [max-runs] [task text]` issues
+  hidden follow-ups after settled turns, up to 8 runs by default and 50 maximum.
+  It waits for mesh replies and OMP background-job work instead of polling,
+  never asks the end user, and can be stopped with `mesh_loop_stop`.
 
 ## Install
 
@@ -271,6 +276,20 @@ does not restart the daemon or make incompatible protocol versions compatible.
 Hot reload was exercised in real compiled omp 18.10.3/18.10.4 and Pi 1.2.0
 sessions, including a compiled host with no plugin-local SDK dependencies.
 
+## Commands (Pi/omp extension)
+
+| command | behavior |
+|---|---|
+| `/mesh-loop [max-runs] [task text]` | Interactive OMP TUI-only bounded continuation loop; default 8 runs, hard maximum 50. The first hidden continuation counts as run 1. Each settled run continues only when mesh replies, tool operations, OMP jobs/deliveries, queued messages, inbound deliveries and host activity are clear. Workers must consult their designated coordinator through mesh, use `mesh_wait_all` for launch-mode replies and OMP `wait` for their own background jobs, and never sleep/poll or ask the end user. |
+| `/mesh-loop stop` | Stop future automatic prompts, cancel any not-yet-started loop prompt, and leave the current turn uninterrupted. |
+
+Any user input other than `/mesh-loop...` stops an active loop. Loop state is
+session-local and cleared on session switch. A user `/mesh reload` stops the
+loop first; host-driven extension reloads wait for active loops and any
+pending prompt-cancellation guard to settle. The command is rejected on Pi,
+RPC/ACP, and headless sessions because they cannot provide the interactive
+turn scheduling needed for hidden continuations.
+
 ## Tools (Pi/omp extension)
 
 | tool | params | returns (honest one-liner + `details`) |
@@ -285,6 +304,7 @@ sessions, including a compiled host with no plugin-local SDK dependencies.
 | `mesh_reserve` | `paths`, `reason?`, `autoReleaseMs?` | reserve files/dirs — peers' `edit`/`write` get blocked on them; claims expire for conflict checks after `reservationTtlMs` (default 6 h, re-reserve to renew) and can self-release (`autoReleaseMs`) |
 | `mesh_release` | `paths?` (omit = all) | release reservations, peers notified immediately |
 | `mesh_file_serve` | `path`, `to?`, `room?`, `ttlMs?`, `note?` | cross-machine file handoff: starts a one-shot token-guarded HTTP listener on THIS machine and announces it (name, size, sha256, URL) as an ordinary mesh message; the peer downloads once and verifies the hash. Refuses > 8 MiB; requires the peer to reach this machine (tailnet/LAN). The offer dies at `ttlMs` (default 10 min, max 1 h) or session end — a superseding offer closes the previous listener. `offered` ≠ `downloaded` |
+| `mesh_loop_stop` | `reason` | stop future automatic prompts and cancel any not-yet-started loop prompt, without aborting the current turn; only call when genuinely complete or irrecoverably blocked, never while waiting |
 
 Wait errors distinguish `target_offline`, `connection_lost`, and terminal
 mission failures. New actionable input returns `interrupted` with

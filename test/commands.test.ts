@@ -81,15 +81,15 @@ async function commandFixture() {
     sessionId: "commands",
     ctx,
   };
-  let command!: CommandDefinition;
+  const commands = new Map<string, CommandDefinition>();
   const pi = {
-    registerCommand: (_name: string, definition: CommandDefinition) => { command = definition; },
+    registerCommand: (name: string, definition: CommandDefinition) => { commands.set(name, definition); },
     events: { emit: () => {} },
   } as unknown as ExtensionAPI;
   registerCommands(pi, () => rt);
   return {
     rt, messages, broker,
-    command: (args: string) => command.handler(args, ctx),
+    command: (args: string) => commands.get("mesh")!.handler(args, ctx),
     presence: async () => (await observer.status()).peers.filter((peer) => peer.alias !== observer.alias),
     close: async () => {
       rt.markDetached?.();

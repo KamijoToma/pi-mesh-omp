@@ -155,6 +155,7 @@ export function attachClientListeners(
         if (!active()) return;
         deliveryHost.sendMessage(message, { triggerTurn: true, deliverAs: batch.deliverAs });
         for (const frame of frames) recordInboundDelivery(frame, deps);
+        rt.meshLoop?.onInboundInjected(rt);
       });
   },
   );
@@ -171,6 +172,8 @@ export function attachClientListeners(
   // turn. They are queued and delivered when the hold expires.
   const heldFrames: { frame: MeshFrame; matchedReply: boolean; interruptedWaits?: boolean }[] = [...(restored?.held ?? [])];
   const pausedBatches: MeshFrame[] = [...(restored?.batched ?? [])];
+  rt.hasPendingInboundDelivery = () =>
+    pendingInjections.size > 0 || batcher.pending > 0 || heldFrames.length > 0 || pausedBatches.length > 0;
   const wakeForInput = (frame: MeshFrame, interruptedWaits = false): boolean => {
     if (frame.receipt === true || ("__replyChain" in frame && frame.__replyChain === true)) return false;
     const operationWoke = interruptToolOperations(rt, "inbound_message", frame.id);
@@ -194,7 +197,10 @@ export function attachClientListeners(
         ...opts,
         wakeWaiting,
         replyChain: "__replyChain" in frame && frame.__replyChain === true,
-        onInjected: () => recordInboundDelivery(frame, deps),
+        onInjected: () => {
+          recordInboundDelivery(frame, deps);
+          rt.meshLoop?.onInboundInjected(rt);
+        },
       };
       // force+interrupt: wire the honest report (receipt + local notify +
       // memory-only counters) before injection runs its repeater path
@@ -453,6 +459,9 @@ export function attachClientListeners(
   });
   client.on("closed", () => { if (active()) getHud()?.onClosed(); });
   client.on("pending", () => guarded(() => getHud()?.refresh()));
+  client.on("missions", () => {
+    if (active()) rt.meshLoop?.onMissionsChanged(rt);
+  });
 
   // async drop receipt: the broker dropped one of OUR messages from the
   // recipient's offline mailbox. The client
@@ -478,6 +487,7 @@ export function attachClientListeners(
         },
         { triggerTurn: true, deliverAs: operationWoke || taskWoke ? "steer" : "followUp" },
       );
+      rt.meshLoop?.onInboundInjected(rt);
     });
     try {
       rt.ledger.append({
