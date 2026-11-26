@@ -41,7 +41,7 @@
   },
   "omp": {
     "extensions": [
-      "./dist/src/extension/index.js"
+      "./dist/src/extension/omp.js"
     ],
     "skills": [
       "./skills"
@@ -73,6 +73,7 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.2.0",
     "@oh-my-pi/pi-coding-agent": "18.10.3",
+    "@oh-my-pi/pi-tui": "18.10.3",
     "@typescript/native-preview": "7.0.0-dev.20260707.2",
     "@mariozechner/pi-tui": "^0.73.1",
     "@types/node": "^22.10.0"

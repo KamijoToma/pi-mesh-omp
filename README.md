@@ -168,13 +168,16 @@ This compatibility fork preserves modern Pi's native lifecycle and
 uses omp's public session, model and managed-timer APIs. It does not import
 omp's private IRC/mesh implementation or change the `mesh.v1` protocol.
 
+The omp manifest loads `dist/src/extension/omp.js` with omp's public TUI
+helpers, including on omp 19. Pi continues to use its own manifest entry.
+
 Build the checkout, then load its entry explicitly:
 
 ```bash
 npm install
 bun check
 npm run build
-omp --no-extensions -e /absolute/path/to/pi-mesh-omp/index.ts
+omp --no-extensions -e /absolute/path/to/pi-mesh-omp/dist/src/extension/omp.js
 ```
 
 This explicit-only command avoids loading an already-installed upstream copy
@@ -194,7 +197,7 @@ Override selection when required:
 
 ```bash
 MESH_BROKER_EXEC_PATH=/absolute/path/to/node \
-  omp --no-extensions -e /absolute/path/to/pi-mesh-omp/index.ts
+  omp --no-extensions -e /absolute/path/to/pi-mesh-omp/dist/src/extension/omp.js
 ```
 
 `MESH_BROKER_EXEC_PATH` selects the executable; `MESH_BROKER_ENTRY` selects
